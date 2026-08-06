@@ -8,6 +8,8 @@ import os
 import logging
 from typing import Dict, Any, List, Optional
 
+from .node_adapters import get_adapter, get_adapter_by_id
+
 
 def convert_to_relative_path(absolute_path: str, category: str, base_directory: str = None) -> str:
     """
@@ -117,7 +119,9 @@ def update_model_path(
     resolved_model: Dict[str, Any] = None,
     subgraph_id: str = None,
     is_top_level: bool = None,
-    nested_key: str = None
+    nested_key: str = None,
+    list_index: int = None,
+    adapter_id: str = None
 ) -> bool:
     """
     Update a single model path in a workflow node, supporting both top-level and subgraph nodes.
@@ -193,7 +197,24 @@ def update_model_path(
         location = f"subgraph {subgraph_id}" if subgraph_id else "top-level"
         logging.warning(f"Node {node_id} not found in {location}")
         return False
-    
+
+    # A node pack that stores references in its own shape writes them back
+    # itself, in whatever format its own lookup expects.
+    adapter = get_adapter_by_id(adapter_id) or get_adapter(node.get('type'))
+    if adapter is not None:
+        effective_category = category
+        if resolved_model:
+            effective_category = resolved_model.get('category', category)
+        value = resolved_path
+        if os.path.isabs(resolved_path):
+            value = convert_to_relative_path(resolved_path, effective_category, base_directory)
+        updated = adapter.update(
+            node, {'widget_index': widget_index, 'list_index': list_index}, value
+        )
+        if updated:
+            logging.debug(f"Updated node {node_id} via {adapter.adapter_id} adapter to: {value}")
+        return updated
+
     widgets_values = node.get('widgets_values', [])
 
     # Handle both array and dict format for widgets_values
@@ -284,6 +305,8 @@ def update_workflow_nodes(
         subgraph_id = mapping.get('subgraph_id')
         is_top_level = mapping.get('is_top_level')  # True for top-level nodes, False for nodes in subgraph definitions
         nested_key = mapping.get('nested_key')  # For dict-type widgets (e.g. Power Lora Loader)
+        list_index = mapping.get('list_index')  # Position within an adapter's list of entries
+        adapter_id = mapping.get('adapter_id')  # Node pack that owns this reference
 
         success = update_model_path(
             workflow,
@@ -295,7 +318,9 @@ def update_workflow_nodes(
             resolved_model,
             subgraph_id,
             is_top_level,
-            nested_key
+            nested_key,
+            list_index,
+            adapter_id
         )
         
         if success:

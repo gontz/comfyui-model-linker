@@ -42,6 +42,8 @@ Frontend → POST /model_linker/resolve → core/linker.py
 | `core/matcher.py` | Banded, model-family-aware matching (rapidfuzz when available) |
 | `core/categories.py` | Canonical category names — many aliases reach one model folder |
 | `core/workflow_analyzer.py` | Extracts model references from workflow JSON, handles subgraph definitions |
+| `core/node_schema.py` | Asks installed node classes which folder each widget loads from |
+| `core/node_adapters.py` | Per-node-pack readers for references stored in non-standard shapes |
 | `core/workflow_updater.py` | Patches `widgets_values` in workflow nodes, supports subgraph nodes |
 | `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections |
 | `web/linker.js` | Full frontend: modal dialog, floating button, model search/dropdown, overrides manager |
@@ -122,6 +124,40 @@ One folder of models is reachable under several category names: core registers
 `canonical_category()` / `categories_match()`. Selection still prefers the exact name when
 present, falling back to any alias. The canonical name is sent to the frontend as
 `canonical_category` so the picker's scoping agrees with the backend.
+
+### Node Introspection (`core/node_schema.py`)
+`NODE_TYPE_TO_CATEGORY_HINTS` is a **fallback**, not the source of truth. It lists ~20 node
+types; this install has **526** with model widgets. Categories are instead learned by
+standing in for `folder_paths.get_filename_list` while a node declares its inputs, then
+seeing which widget caught the sentinel — this works for custom nodes we've never heard of
+and resolves ~75% of them.
+
+- Patch both `folder_paths.get_filename_list` **and** the binding in the node's own module
+  globals — many packs do `from folder_paths import get_filename_list`
+- Only `BOOLEAN/COMBO/FLOAT/INT/STRING` occupy `widgets_values` slots; typed inputs are
+  links. An INT with `control_after_generate` occupies **two** slots
+- V1 and V3 nodes share one path: V3 exposes `INPUT_TYPES()` over `define_schema()`
+- Results are cached per node type; the patch window is lock-guarded and restored in `finally`
+- **Limit:** packs that build their choice list without `get_filename_list` (their own
+  `os.listdir`) are invisible to this. That is the bulk of the unresolved 25%
+
+### Custom Node Adapters (`core/node_adapters.py`)
+One adapter per node pack that stores references in its own shape. Add a pack here rather
+than scattering special cases through the analyzer and updater.
+
+- **rgthree Power Lora Loader needs no adapter** — it stores objects directly in widget
+  slots (`{"on":…, "lora":"x.safetensors"}`), which `NESTED_MODEL_KEYS` already reads
+- **Lora Manager does**: a *list of objects* in one slot, with **extension-less** names
+  (`[{"name":"some_lora","strength":"0.80"}]`). Neither looks like a filename to the
+  generic scan. Locate the list **by shape, not a fixed index** — the position differs
+  between node types and across releases
+- Extension-less values resolve via `resolve_model_reference(..., extension_less=True)`,
+  which matches the pack's own lookup (basename, extensions stripped, `/` separators)
+- Write back in the pack's format: no extension, forward slashes, and keep the companion
+  `<lora:name:strength>` text token in sync
+- A reference is identified by `(node_id, widget_index, list_index, subgraph_id)`. In the
+  frontend **always** build element ids and pending-selection keys via `refSlot()`/`refKey()`
+  — several loras share one node and widget index, and ignoring `list_index` collides them
 
 ### Workflow Metadata (`properties.models`)
 Recent frontends attach `[{name, url, directory, hash?, hash_type?}]` to nodes referencing

@@ -296,6 +296,8 @@ def apply_resolution(
             'subgraph_id': resolution.get('subgraph_id'),  # Include subgraph_id for subgraph nodes
             'is_top_level': resolution.get('is_top_level'),  # True for top-level nodes, False for nodes in subgraph definitions
             'nested_key': resolution.get('nested_key'),  # For dict-type widgets (e.g. Power Lora Loader)
+            'list_index': resolution.get('list_index'),  # Position within an adapter's list of entries
+            'adapter_id': resolution.get('adapter_id'),  # Node pack that owns this reference
         }
         
         # If resolved_model provided, extract path if needed

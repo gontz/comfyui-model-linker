@@ -8,6 +8,9 @@ import os
 import logging
 from typing import List, Dict, Any, Optional
 
+from .node_adapters import get_adapter
+from .node_schema import get_model_widget_categories, get_widget_category
+
 # Import folder_paths lazily - it may not be available until ComfyUI is initialized
 try:
     import folder_paths
@@ -164,6 +167,59 @@ def try_resolve_model_path(value: str, categories: List[str] = None) -> Optional
     return None
 
 
+def resolve_model_reference(
+    value: str,
+    category: Optional[str],
+    extension_less: bool = False
+) -> Optional[tuple]:
+    """
+    Resolve a stored reference to a file on disk.
+
+    Args:
+        value: the reference as the workflow stores it
+        category: folder category to search, when known
+        extension_less: the reference omits the file extension, as the Lora
+            Manager pack stores it. Such a value cannot be handed to
+            folder_paths directly, so the extension is put back by matching
+            against the category's listing.
+
+    Returns:
+        (category, full_path) when found, None otherwise.
+    """
+    if not extension_less:
+        return try_resolve_model_path(value, [category] if category else None)
+
+    global folder_paths
+    if folder_paths is None:
+        try:
+            import folder_paths as fp
+            folder_paths = fp
+        except ImportError:
+            return None
+
+    wanted = value.strip().replace('\\', '/').lower()
+    wanted_base = wanted.rsplit('/', 1)[-1]
+
+    for candidate_category in ([category] if category else list(folder_paths.folder_names_and_paths.keys())):
+        try:
+            listing = folder_paths.get_filename_list(candidate_category)
+        except Exception:
+            continue
+        for entry in listing:
+            normalized = entry.replace('\\', '/').lower()
+            stem = os.path.splitext(normalized)[0]
+            # Accept either the full relative path or just the filename, which
+            # is how the pack's own lookup behaves
+            if stem == wanted or os.path.basename(stem) == wanted_base:
+                try:
+                    full_path = folder_paths.get_full_path(candidate_category, entry)
+                except Exception:
+                    continue
+                if full_path and os.path.exists(full_path):
+                    return (candidate_category, full_path)
+    return None
+
+
 def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Extract model references from a single node.
@@ -202,8 +258,28 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not widgets_values:
         return model_refs
 
-    # Get category hints for this node type
+    # Node packs that store references in their own shape are read by an adapter
+    adapter = get_adapter(node_type)
+    if adapter is not None:
+        for ref in adapter.extract(node):
+            ref['adapter_id'] = adapter.adapter_id
+            resolved = resolve_model_reference(
+                ref['original_path'], ref.get('category'), ref.get('extension_less', False)
+            )
+            if resolved:
+                ref['category'], ref['full_path'] = resolved
+                ref['exists'] = True
+            model_refs.append(ref)
+        return model_refs
+
+    # Category hint for this node type. The hand-written table is only a
+    # fallback now - node_schema asks the installed node class which folder each
+    # widget loads from, which covers custom nodes the table has never seen.
     category_hint = NODE_TYPE_TO_CATEGORY_HINTS.get(node_type)
+    schema_categories = get_model_widget_categories(node_type)
+    if not category_hint and len(schema_categories) == 1:
+        # A loader with a single model widget: unambiguous whatever the layout
+        category_hint = next(iter(schema_categories.values()))
 
     # Build a lookup from properties.models, which recent frontends attach to
     # nodes that reference models. Entries look like:
@@ -240,12 +316,18 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
             metadata = _lookup_model_metadata(model_metadata, value)
             declared_category = (metadata or {}).get('directory') or None
 
+            # What the node class says this particular widget loads from. More
+            # precise than the node-level hint on nodes with several model
+            # widgets, e.g. DualCLIPLoader's clip_name1/clip_name2.
+            widget_category = get_widget_category(node_type, idx)
+
             has_model_ext = is_model_filename(value)
-            is_declared_model = metadata is not None
+            is_declared_model = metadata is not None or widget_category is not None
 
             if has_model_ext or is_declared_model:
-                # Determine best category: properties.models > node type hint > all
-                value_category = declared_category or category_hint
+                # Best category: workflow metadata > this widget's declared
+                # folder > node type hint > search everything
+                value_category = declared_category or widget_category or category_hint
                 categories_to_try = [value_category] if value_category else None
 
                 # Try to resolve the model path

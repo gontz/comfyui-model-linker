@@ -1185,7 +1185,7 @@ class LinkerManagerDialog {
 
             // Attach listener for all displayed matches so the user can pick explicitly
             sortedMatches.forEach((match, matchIndex) => {
-                const buttonId = `resolve-${missing.node_id}-${missing.widget_index}-${matchIndex}`;
+                const buttonId = `resolve-${refSlot(missing)}-${matchIndex}`;
                 const resolveButton = container.querySelector(`#${buttonId}`);
                 if (resolveButton) {
                     resolveButton.addEventListener('click', () => {
@@ -1210,7 +1210,7 @@ class LinkerManagerDialog {
             this.updateSelectedBarForMissing(missing);
 
             // Wire Locate button (only available for top-level items)
-            const locateId = `locate-${missing.node_id}-${missing.widget_index}`;
+            const locateId = `locate-${refSlot(missing)}`;
             const locateBtn = container.querySelector(`#${locateId}`);
             if (locateBtn && missing.is_top_level !== false) {
                 locateBtn.addEventListener('click', () => this.locateNodeInGraph(missing.node_id));
@@ -1230,13 +1230,13 @@ class LinkerManagerDialog {
         const filteredMatches = allMatches.filter(m => m.confidence >= 70);
         const hasMatches = filteredMatches.length > 0;
 
-        let html = `<div id="missing-${missing.node_id}-${missing.widget_index}" style="border: 1px solid var(--border-color, #444); padding: 12px; border-radius: 4px; display:flex; flex-direction:column; align-items:stretch; gap:8px; white-space: normal;">`;
+        let html = `<div id="missing-${refSlot(missing)}" style="border: 1px solid var(--border-color, #444); padding: 12px; border-radius: 4px; display:flex; flex-direction:column; align-items:stretch; gap:8px; white-space: normal;">`;
 
         // Display subgraph name as primary identifier if available, otherwise show node type
         // A node type that's a UUID indicates it's a subgraph instance
         const isSubgraphNode = missing.node_type && missing.node_type.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
 
-        const locateId = `locate-${missing.node_id}-${missing.widget_index}`;
+        const locateId = `locate-${refSlot(missing)}`;
         if (missing.subgraph_name) {
             // Show subgraph name as primary identifier
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
@@ -1285,7 +1285,7 @@ class LinkerManagerDialog {
                 + `<span style="opacity:.7; font-size: 12px;"> — save to <code>${escapeHtml(target)}</code></span></div>`;
         }
         // Selected state placeholder (filled dynamically when user queues a selection)
-        const selectedId = `selected-${missing.node_id}-${missing.widget_index}-${missing.subgraph_id || 'top'}`;
+        const selectedId = `selected-${refSlot(missing)}`;
         html += `<div id="${selectedId}" class="model-linker-selected" style="display:none; margin: 8px 0; padding: 8px; border: 1px solid var(--border-color, #444); border-radius: 4px; background: rgba(10,169,110,0.08);"></div>`;
 
         if (hasMatches) {
@@ -1329,7 +1329,7 @@ class LinkerManagerDialog {
 
             for (let matchIndex = 0; matchIndex < sortedMatches.length; matchIndex++) {
                 const match = sortedMatches[matchIndex];
-                const buttonId = `resolve-${missing.node_id}-${missing.widget_index}-${matchIndex}`;
+                const buttonId = `resolve-${refSlot(missing)}-${matchIndex}`;
                 html += `<li style="margin: 4px 0;">`;
                 const label = match.model?.relative_path || match.filename;
                 const isSaved = !!match.is_override;
@@ -1498,7 +1498,7 @@ class LinkerManagerDialog {
 
     // Build a stable key for a missing entry (same as queueResolution)
     getResolutionKey(missing) {
-        return `${missing.node_id}:${missing.widget_index}:${missing.subgraph_id || ''}:${missing.is_top_level ? 'T' : 'F'}`;
+        return refKey(missing);
     }
 
     // Return queued resolution (if any) for a missing entry
@@ -1516,7 +1516,7 @@ class LinkerManagerDialog {
         this.pendingIndex = new Map();
         for (let i = 0; i < this.pendingResolutions.length; i++) {
             const r = this.pendingResolutions[i];
-            const k = `${r.node_id}:${r.widget_index}:${r.subgraph_id || ''}:${r.is_top_level ? 'T' : 'F'}`;
+            const k = refKey(r);
             this.pendingIndex.set(k, i);
         }
     }
@@ -1535,7 +1535,7 @@ class LinkerManagerDialog {
 
     // Update the per-item selected UI area
     updateSelectedBarForMissing(missing) {
-        const containerId = `selected-${missing.node_id}-${missing.widget_index}-${missing.subgraph_id || 'top'}`;
+        const containerId = `selected-${refSlot(missing)}`;
         const el = document.getElementById(containerId);
         if (!el) return;
         const queued = this.getQueuedResolutionForMissing(missing);
@@ -1546,7 +1546,7 @@ class LinkerManagerDialog {
         }
         const model = queued.resolved_model || {};
         const label = model.relative_path || model.filename || queued.resolved_path || 'selected model';
-        const removeId = `selected-remove-${missing.node_id}-${missing.widget_index}-${missing.subgraph_id || 'top'}`;
+        const removeId = `selected-remove-${refSlot(missing)}`;
         el.innerHTML = `<strong>Selected:</strong> <code>${label}</code> <button id="${removeId}" class="model-linker-resolve-btn" style="margin-left:8px; padding: 2px 8px;">Remove</button>`;
         el.style.display = '';
         const btn = document.getElementById(removeId);
@@ -1574,11 +1574,13 @@ class LinkerManagerDialog {
             subgraph_id: missing.subgraph_id,
             is_top_level: missing.is_top_level,
             nested_key: missing.nested_key || null,
+            list_index: (missing.list_index ?? null),
+            adapter_id: missing.adapter_id || null,
             node_type: missing.node_type,
             node_label: missing.subgraph_name || missing.node_type
         };
 
-        const key = `${resolution.node_id}:${resolution.widget_index}:${resolution.subgraph_id || ''}:${resolution.is_top_level ? 'T' : 'F'}`;
+        const key = refKey(resolution);
         if (this.pendingIndex.has(key)) {
             // replace existing selection for this slot
             const idx = this.pendingIndex.get(key);
@@ -1637,7 +1639,9 @@ class LinkerManagerDialog {
                         original_path: missing.original_path,
                         subgraph_id: missing.subgraph_id,
                         is_top_level: missing.is_top_level,
-                        nested_key: missing.nested_key || null
+                        nested_key: missing.nested_key || null,
+                        list_index: (missing.list_index ?? null),
+                        adapter_id: missing.adapter_id || null
                     });
                 }
             }
@@ -1744,13 +1748,13 @@ class LinkerManagerDialog {
     // the node actually loads from
     attachModelCombo(container, missing) {
         const category = (missing.category && missing.category !== 'unknown') ? missing.category : null;
-        const inputId = `combo-input-${missing.node_id}-${missing.widget_index}`;
-        const listId = `combo-list-${missing.node_id}-${missing.widget_index}`;
-        const refreshId = `combo-refresh-${missing.node_id}-${missing.widget_index}`;
-        const scopeId = `combo-scope-${missing.node_id}-${missing.widget_index}`;
+        const inputId = `combo-input-${refSlot(missing)}`;
+        const listId = `combo-list-${refSlot(missing)}`;
+        const refreshId = `combo-refresh-${refSlot(missing)}`;
+        const scopeId = `combo-scope-${refSlot(missing)}`;
 
         // Inject combo markup after 'Selected' bar
-        const selectedBar = container.querySelector(`#selected-${missing.node_id}-${missing.widget_index}-${missing.subgraph_id || 'top'}`);
+        const selectedBar = container.querySelector(`#selected-${refSlot(missing)}`);
         if (!selectedBar) return;
         const comboWrap = document.createElement('div');
         comboWrap.style.position = 'relative';
@@ -2213,7 +2217,12 @@ class LinkerManagerDialog {
                         } catch (_) { /* ignore */ }
                         // For nested dict widgets (e.g. Power Lora Loader), update only the
                         // specific key to preserve other properties (on, strength, etc.)
-                        if (res.nested_key && widget.value && typeof widget.value === 'object' && typeof newValue === 'object') {
+                        if (res.list_index !== undefined && res.list_index !== null) {
+                            // The widget holds a list of entries (Lora Manager).
+                            // The backend returned the whole updated list, so
+                            // assigning it keeps every other entry intact.
+                            widget.value = newValue;
+                        } else if (res.nested_key && widget.value && typeof widget.value === 'object' && typeof newValue === 'object') {
                             widget.value[res.nested_key] = newValue[res.nested_key];
                         } else {
                             widget.value = newValue;
@@ -2516,6 +2525,25 @@ function isSelectableModel(model) {
     const dot = name.lastIndexOf(".");
     if (dot < 0) return true;
     return !NON_MODEL_EXTENSIONS.has(name.slice(dot));
+}
+
+/**
+ * Identify one model reference uniquely.
+ *
+ * A node can hold several references in a single widget: Lora Manager keeps a
+ * list of loras in one slot, so node id and widget index alone are ambiguous
+ * and `list_index` is what separates them. Every element id and every pending
+ * selection is keyed through here so those entries cannot collide.
+ */
+function refSlot(ref) {
+    const list = (ref.list_index === undefined || ref.list_index === null) ? 'n' : ref.list_index;
+    return `${ref.node_id}-${ref.widget_index}-${list}-${ref.subgraph_id || 'top'}`;
+}
+
+/** Stable key for a reference, used to deduplicate queued selections. */
+function refKey(ref) {
+    const list = (ref.list_index === undefined || ref.list_index === null) ? '' : ref.list_index;
+    return `${ref.node_id}:${ref.widget_index}:${list}:${ref.subgraph_id || ''}:${ref.is_top_level ? 'T' : 'F'}`;
 }
 
 /** Escape a value for interpolation into an HTML string. */

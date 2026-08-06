@@ -26,17 +26,30 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
 ## Usage
 
 1. Open a workflow with missing models
-2. Click the "🔗 — Model Linker" button in ComfyUI's top menu bar
-3. Review missing models and their suggested matches 
+2. Open Model Linker in whichever way suits you:
+   - the floating "🔗 Model Linker" button
+   - **View → Model Linker** in the menu
+   - the command palette, or <kbd>Alt</kbd>+<kbd>L</kbd>
+   - right-click the canvas
+3. Review missing models and their suggested matches
 4. Select replacements for individual models (via suggestion buttons or full model dropdown with search)
 5. Click "Apply Selected" to relink queued selections, or use "Auto-Resolve 100% Matches" for perfect matches
 6. Save your workflow when ready
 
+The floating button can be turned off under **Settings → Model Linker**.
+
 ## Features
 
 - **Subgraph Support**: Automatically detects and handles missing models inside subgraphs
-- **Smart Matching**: Shows 100% confidence matches when available, otherwise shows best matches (â‰¥70% confidence)
+- **Smart Matching**: Shows 100% confidence matches when available, otherwise shows best matches (≥70% confidence)
 - **Fuzzy Matching**: Uses intelligent similarity scoring to find model files even with different naming
+- **Category-Aware Suggestions**: A plausible match from the node's own model category is
+  offered ahead of a better-scoring file from elsewhere, since a path only resolves against
+  its own category's folder
+- **Handles Linked Model Folders**: Where several category folders are symlinks or junctions
+  to one shared directory, each model is still listed once rather than once per alias
+- **Download Links**: When a workflow records where a model came from, the original download
+  is offered — useful when nothing on disk resembles it
 - **Auto-Resolve**: One-click resolution for all perfect matches
- - **Learned Overrides**: Your manual picks are persisted and reused automatically
+- **Learned Overrides**: Your manual picks are persisted and reused automatically
 

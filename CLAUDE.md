@@ -43,7 +43,7 @@ Frontend → POST /model_linker/resolve → core/linker.py
 | `core/workflow_analyzer.py` | Extracts model references from workflow JSON, handles subgraph definitions |
 | `core/workflow_updater.py` | Patches `widgets_values` in workflow nodes, supports subgraph nodes |
 | `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections |
-| `web/linker.js` | Full frontend: modal dialog, toolbar button, model search/dropdown, overrides manager |
+| `web/linker.js` | Full frontend: modal dialog, floating button, model search/dropdown, overrides manager |
 
 ### API Routes
 
@@ -61,20 +61,56 @@ All routes are prefixed `/model_linker/`:
 ### Path Handling (Windows/Unix compatibility)
 - **Always use `os.path` methods** — never hardcode separators or normalize to forward slashes
 - ComfyUI uses OS-native separators; the extension must match this behavior
-- Model deduplication compares absolute paths via `os.path.normpath()` to detect symlink duplicates
 - Filename splitting uses regex `[/\\]` to handle both separators in stored paths
+
+### Physical File Identity (symlinks and junctions)
+Category directories are frequently links to one shared folder — `models/checkpoints`,
+`models/unet`, `models/diffusion_models` and `models/diffusers` all pointing at the same
+place is common. Every such alias catalogues the same file again.
+
+- `os.path.normpath()` is **purely lexical and does not resolve links** — never use it to
+  detect duplicates
+- The scanner records `real_path` per entry (resolved once per directory, since `os.walk`
+  visits each root once) and `linker.physical_file_key()` is the identity used everywhere
+- Candidates are collapsed to one entry per physical file **before** matching, preferring
+  the entry whose category matches the node's, so the written path resolves against the
+  right folder
+
+### Scanning
+- Only files with known model extensions are catalogued. A category declaring **no**
+  extension filter means "unknown", not "accept everything" — otherwise sidecar files
+  (`.json`, `.civitai.info`, `.preview.png`, `.lock`) become selectable replacements
+- Links are followed, so the walk guards against cycles by tracking resolved directories
+- `get_model_files()` caches its result, invalidated by per-directory mtimes plus the
+  configured category→paths layout (custom nodes can register paths after startup)
 
 ### Fuzzy Matching
 - Filenames are normalized: lowercase, extensions removed, `_-` converted to spaces
+  (`normalize_filename` is `lru_cache`d — it is called once per candidate per lookup)
+- `SequenceMatcher.ratio()` is **not symmetric**; the target must stay the first argument
 - Scores are capped at 0.999 for non-exact matches to distinguish from true 100% matches
 - Override matches get 99-100% confidence to appear at the top
 - Minimum threshold is 70% confidence
+- A match at or above that threshold from the node's own category outranks a better-scoring
+  one from another category — a path only resolves against its own category's folder.
+  Weaker same-category matches get no boost, so a poor category guess is still recoverable
+
+### Workflow Metadata (`properties.models`)
+Recent frontends attach `[{name, url, directory, hash?, hash_type?}]` to nodes referencing
+models. **`name` is the model filename** (the widget's value), not the input name — look it
+up by value. It supplies the authoritative category, and a download URL for models that no
+longer exist anywhere on disk.
 
 ### Frontend (linker.js)
-- Uses ComfyUI's `$el()` helper for DOM creation, not raw HTML
+- `$el()` is defined **locally**; `scripts/ui.js` is deprecated (announced for removal in
+  frontend v1.34) and must not be imported. Only `scripts/app.js` and `scripts/api.js` are
+- Registers `commands`, `menuCommands`, `keybindings`, `settings` and `getCanvasMenuItems`.
+  Never scrape the DOM for a place to inject UI — the frontend is Vue-rendered
+- Use `app.extensionManager.toast` for errors, never `alert()`/`confirm()` (they block the page)
+- Values interpolated into HTML come from workflow files and are untrusted: escape with
+  `escapeHtml()`, and pass URLs through `safeHttpUrl()`
 - CSS is scoped with specific IDs/classes prefixed `model-linker-` to avoid ComfyUI style conflicts
 - Modal position/size persists via `localStorage`
-- Imports from ComfyUI relative paths: `../../scripts/app.js`, `../../scripts/api.js`, `../../scripts/ui.js`
 
 ### Overrides Persistence
 - Stored at `data/overrides.json` (gitignored)

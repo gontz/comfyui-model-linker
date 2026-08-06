@@ -69,6 +69,36 @@ NESTED_MODEL_KEYS = {
 }
 
 
+def _basename(value: str) -> str:
+    """Filename portion of a stored model reference, for either separator style."""
+    return value.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+
+
+def _lookup_model_metadata(model_metadata: Dict[str, Dict[str, Any]], value: str) -> Optional[Dict[str, Any]]:
+    """Find the properties.models entry describing a stored widget value."""
+    if not model_metadata or not isinstance(value, str):
+        return None
+    return model_metadata.get(value) or model_metadata.get(_basename(value))
+
+
+def _source_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Pull the origin details a workflow records for a model it references.
+
+    The download URL matters most when a model is missing and nothing on disk
+    resembles it: fuzzy matching has nothing to offer, but the workflow still
+    says where the file came from. The hash is recorded by newer frontends and
+    identifies the file exactly, independent of what it was named.
+    """
+    if not metadata:
+        return {'source_url': None, 'source_hash': None, 'source_hash_type': None}
+    return {
+        'source_url': metadata.get('url') or None,
+        'source_hash': metadata.get('hash') or None,
+        'source_hash_type': metadata.get('hash_type') or None,
+    }
+
+
 def is_model_filename(value: Any) -> bool:
     """
     Check if a value looks like a model filename.
@@ -175,17 +205,25 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     # Get category hints for this node type
     category_hint = NODE_TYPE_TO_CATEGORY_HINTS.get(node_type)
 
-    # Build per-input category map from properties.models (newer ComfyUI feature).
-    # This maps widget INPUT NAMES (e.g. "ckpt_name") to their folder_paths category
-    # (e.g. "checkpoints"), allowing detection of model inputs even when the stored
-    # value lacks a standard model file extension.
+    # Build a lookup from properties.models, which recent frontends attach to
+    # nodes that reference models. Entries look like:
+    #   {"name": "flux1-dev.safetensors", "url": "https://...", "directory": "diffusion_models"}
+    # and optionally carry "hash"/"hash_type".
+    #
+    # `name` is the model FILENAME - the value stored in the widget - not the
+    # input name, so this is keyed by value and looked up per widget value below.
+    # Entries are indexed by bare filename too, so a widget holding
+    # "subfolder/model.safetensors" still finds its metadata.
     properties_models = (node.get('properties') or {}).get('models') or []
-    model_input_categories: Dict[str, str] = {}
+    model_metadata: Dict[str, Dict[str, Any]] = {}
     for pm in properties_models:
-        name = pm.get('name', '')
-        directory = pm.get('directory', '')
-        if name and directory:
-            model_input_categories[name] = directory
+        if not isinstance(pm, dict):
+            continue
+        name = pm.get('name')
+        if not isinstance(name, str) or not name:
+            continue
+        model_metadata[name] = pm
+        model_metadata.setdefault(_basename(name), pm)
 
     # Handle both array and dict format for widgets_values
     if isinstance(widgets_values, dict):
@@ -196,19 +234,18 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
         return model_refs
 
     for idx, value in items:
-        # For dict-format widgets_values, idx is the input name (str key).
-        # Check if properties.models identifies this input as a model widget.
-        input_category = model_input_categories.get(idx) if isinstance(idx, str) else None
-
         # Case 1: Direct string value — detected either by file extension
-        # or by properties.models metadata identifying this as a model input
+        # or by properties.models declaring this exact value to be a model
         if isinstance(value, str) and value.strip():
-            has_model_ext = is_model_filename(value)
-            is_known_model_input = input_category is not None
+            metadata = _lookup_model_metadata(model_metadata, value)
+            declared_category = (metadata or {}).get('directory') or None
 
-            if has_model_ext or is_known_model_input:
+            has_model_ext = is_model_filename(value)
+            is_declared_model = metadata is not None
+
+            if has_model_ext or is_declared_model:
                 # Determine best category: properties.models > node type hint > all
-                value_category = input_category or category_hint
+                value_category = declared_category or category_hint
                 categories_to_try = [value_category] if value_category else None
 
                 # Try to resolve the model path
@@ -230,7 +267,8 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
                     'category': category,
                     'full_path': full_path,
                     'exists': exists,
-                    'nested_key': None
+                    'nested_key': None,
+                    **_source_metadata(metadata)
                 })
                 continue
 
@@ -242,7 +280,8 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if not nested_value or not is_model_filename(nested_value):
                     continue
 
-                value_category = nested_category_hint or category_hint
+                metadata = _lookup_model_metadata(model_metadata, nested_value)
+                value_category = (metadata or {}).get('directory') or nested_category_hint or category_hint
                 categories_to_try = [value_category] if value_category else None
 
                 resolved = try_resolve_model_path(nested_value, categories_to_try)
@@ -263,7 +302,8 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
                     'category': category,
                     'full_path': full_path,
                     'exists': exists,
-                    'nested_key': nested_key
+                    'nested_key': nested_key,
+                    **_source_metadata(metadata)
                 })
 
     return model_refs

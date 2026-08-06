@@ -56,10 +56,9 @@ class ModelLinkerExtension:
             
             # Import linker modules - use relative imports which should work for packages
             try:
-                from .core.linker import analyze_and_find_matches, apply_resolution
-                from .core.scanner import get_model_files
+                from .core.linker import analyze_and_find_matches, apply_resolution, list_available_models
                 from .core.overrides import (
-                    record_override,
+                    record_overrides,
                     load_overrides,
                     get_overrides_path,
                     delete_override,
@@ -164,6 +163,7 @@ class ModelLinkerExtension:
                             except Exception:
                                 return None
 
+                        selections = []
                         for res in resolutions:
                             # Expect original_path from client; otherwise derive from pre-update workflow
                             original_path = res.get('original_path')
@@ -176,11 +176,18 @@ class ModelLinkerExtension:
                                     res.get('is_top_level'),
                                     res.get('nested_key')
                                 )
-                            category = res.get('category')
                             resolved_model = res.get('resolved_model')
                             resolved_path = res.get('resolved_path')
                             if original_path and (resolved_model or resolved_path):
-                                record_override(original_path, category, resolved_model, resolved_path)
+                                selections.append({
+                                    'original_path': original_path,
+                                    'category': res.get('category'),
+                                    'resolved': resolved_model,
+                                    'resolved_path': resolved_path,
+                                })
+
+                        # One read and one write for the whole batch
+                        record_overrides(selections)
                     except Exception as e:
                         # Do not fail the request if persisting overrides fails
                         self.logger.warning(f"Model Linker: Failed to record overrides: {e}")
@@ -200,7 +207,7 @@ class ModelLinkerExtension:
             async def get_models(request):
                 """Get list of all available models (for debugging/UI display)."""
                 try:
-                    models = get_model_files()
+                    models = list_available_models()
                     return web.json_response(models)
                 except Exception as e:
                     self.logger.error(f"Model Linker get_models error: {e}", exc_info=True)

@@ -8,7 +8,51 @@
 // These paths are relative to the ComfyUI web directory
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
-import { $el, ComfyDialog } from "../../scripts/ui.js";
+
+/**
+ * Build a DOM element, mirroring ComfyUI's own $el helper.
+ *
+ * Kept local rather than imported from "scripts/ui.js": that module logs a
+ * deprecation notice and was announced for removal in frontend v1.34, which
+ * current releases are well past. Its ComfyDialog base class was the only other
+ * thing used here, and both dialogs below build and manage their own element,
+ * so nothing of it is needed.
+ *
+ * @param {string} tag Tag name, optionally with .classes appended
+ * @param {object|string|Element|Array} [propsOrChildren] Properties to assign,
+ *   or text/children when no properties are needed. `parent` appends the result,
+ *   `style` and `dataset` are merged, and `$` is called with the element.
+ * @param {Array|Element} [children] Children, when properties were given
+ */
+function $el(tag, propsOrChildren, children) {
+    const parts = tag.split(".");
+    const element = document.createElement(parts.shift());
+    if (parts.length > 0) element.classList.add(...parts);
+
+    if (!propsOrChildren) return element;
+
+    if (typeof propsOrChildren === "string") {
+        propsOrChildren = { textContent: propsOrChildren };
+    } else if (propsOrChildren instanceof Element) {
+        propsOrChildren = [propsOrChildren];
+    }
+
+    if (Array.isArray(propsOrChildren)) {
+        element.append(...propsOrChildren);
+        return element;
+    }
+
+    const { parent, $: onCreate, dataset, style, ...rest } = propsOrChildren;
+    if (rest.for) element.setAttribute("for", rest.for);
+    if (style) Object.assign(element.style, style);
+    if (dataset) Object.assign(element.dataset, dataset);
+    Object.assign(element, rest);
+    if (children) element.append(...(Array.isArray(children) ? children : [children]));
+    if (parent) parent.append(element);
+    if (onCreate) onCreate(element);
+
+    return element;
+}
 
 // Check if ComfyButtonGroup is available (from newer ComfyUI versions)
 let ComfyButtonGroup = null;
@@ -28,9 +72,8 @@ try {
     // Fallback if ComfyButtonGroup not available
 }
 
-class LinkerManagerDialog extends ComfyDialog {
+class LinkerManagerDialog {
     constructor() {
-        super();
         this.currentWorkflow = null;
         this.missingModels = [];
         this.allModels = null; // list of all available models for dropdown
@@ -655,8 +698,13 @@ class LinkerManagerDialog extends ComfyDialog {
 
     async show() {
         this.element.style.display = "flex";
-        await this.ensureAllModelsLoaded();
-        await this.loadWorkflowData();
+        // Re-read the catalogue every time, so the picker reflects the models
+        // that exist right now. Runs alongside the analysis rather than before
+        // it, since neither depends on the other.
+        await Promise.all([
+            this.ensureAllModelsLoaded({ force: true }),
+            this.loadWorkflowData(),
+        ]);
         try {
             const fs = localStorage.getItem('model_linker_modal_fullscreen');
             if (fs === '1') this.setFullScreen(true);
@@ -769,22 +817,40 @@ class LinkerManagerDialog extends ComfyDialog {
     /**
      * Ensure all models are loaded for the dropdown.
      */
-    async ensureAllModelsLoaded() {
-        if (this.allModels && this.allModels.length) return;
+    async ensureAllModelsLoaded({ force = false } = {}) {
+        // Without `force` this kept whatever was fetched the first time the
+        // dialog opened, for as long as the page stayed open - so models added
+        // or removed since then, or a server restart, left the picker offering
+        // files that no longer qualify. The dialog refreshes on open instead;
+        // the server caches its scan, so this is cheap.
+        if (!force && this.allModels && this.allModels.length) return;
         try {
             const resp = await api.fetchApi('/model_linker/models');
             if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
             const models = await resp.json();
-            const list = Array.isArray(models) ? models : [];
-            // Build labels and sort alphabetically
-            this.allModels = list.map((m) => ({
-                ...m,
-                __label: `${m.category ? m.category + ': ' : ''}${m.relative_path || m.filename || ''}`
-            })).sort((a, b) => (a.__label || '').localeCompare(b.__label || ''));
+            this.allModels = this.prepareModelList(models);
         } catch (e) {
             console.warn('Model Linker: could not load all models', e);
-            this.allModels = [];
+            // Keep a previously loaded list rather than emptying the picker
+            if (!Array.isArray(this.allModels)) this.allModels = [];
         }
+    }
+
+    /**
+     * Label and sort a raw model list for the picker.
+     *
+     * Every path that populates this.allModels goes through here, so the
+     * refresh button cannot leave the list in a different shape than the
+     * initial load did.
+     */
+    prepareModelList(models) {
+        const list = Array.isArray(models) ? models : [];
+        return list
+            .map((m) => ({
+                ...m,
+                __label: `${m.category ? m.category + ': ' : ''}${m.relative_path || m.filename || ''}`
+            }))
+            .sort((a, b) => (a.__label || '').localeCompare(b.__label || ''));
     }
 
     /**
@@ -1204,6 +1270,20 @@ class LinkerManagerDialog extends ComfyDialog {
         }
         html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${missing.original_path}</code></div>`;
         html += `<div style="margin-bottom: 8px;"><strong>Category:</strong> ${missing.category || 'unknown'}</div>`;
+
+        // Where the workflow says this model came from. Worth showing whatever
+        // the matches look like: when nothing on disk resembles the model, the
+        // original download is the only real way to resolve it.
+        const sourceUrl = safeHttpUrl(missing.source_url);
+        if (sourceUrl) {
+            const target = missing.category && missing.category !== 'unknown'
+                ? `models/${escapeHtml(missing.category)}/` : 'the matching models folder';
+            html += `<div style="margin-bottom: 8px;"><strong>Original source:</strong> `
+                + `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer" `
+                + `title="Opens the download in a new tab. Save it to ${escapeHtml(target)} and re-run the analysis." `
+                + `style="color: var(--primary-color, #4aa3ff);">Download ↗</a>`
+                + `<span style="opacity:.7; font-size: 12px;"> — save to <code>${escapeHtml(target)}</code></span></div>`;
+        }
         // Selected state placeholder (filled dynamically when user queues a selection)
         const selectedId = `selected-${missing.node_id}-${missing.widget_index}-${missing.subgraph_id || 'top'}`;
         html += `<div id="${selectedId}" class="model-linker-selected" style="display:none; margin: 8px 0; padding: 8px; border: 1px solid var(--border-color, #444); border-radius: 4px; background: rgba(10,169,110,0.08);"></div>`;
@@ -1660,12 +1740,14 @@ class LinkerManagerDialog extends ComfyDialog {
         this.updateQueuePanel();
     }
 
-    // Build and wire a node-like combo picker showing ALL models (not category-restricted)
+    // Build and wire a node-like combo picker, scoped by default to the folder
+    // the node actually loads from
     attachModelCombo(container, missing) {
-        const category = null; // show all models regardless of category
+        const category = (missing.category && missing.category !== 'unknown') ? missing.category : null;
         const inputId = `combo-input-${missing.node_id}-${missing.widget_index}`;
         const listId = `combo-list-${missing.node_id}-${missing.widget_index}`;
         const refreshId = `combo-refresh-${missing.node_id}-${missing.widget_index}`;
+        const scopeId = `combo-scope-${missing.node_id}-${missing.widget_index}`;
 
         // Inject combo markup after 'Selected' bar
         const selectedBar = container.querySelector(`#selected-${missing.node_id}-${missing.widget_index}-${missing.subgraph_id || 'top'}`);
@@ -1673,11 +1755,20 @@ class LinkerManagerDialog extends ComfyDialog {
         const comboWrap = document.createElement('div');
         comboWrap.style.position = 'relative';
         comboWrap.style.margin = '8px 0';
-        const catLabel = category ? ` (${category})` : '';
+        // Scoping to the node's own category is the default: a loader resolves
+        // its value against that category's folder, so anything else is not a
+        // usable replacement. The checkbox widens the search for the cases where
+        // the category was guessed wrong or the file lives somewhere unusual.
+        const scopeControl = category
+            ? `<label for="${scopeId}" title="Only show models from the folder this node loads from" style="display:flex; align-items:center; gap:4px; opacity:0.9; white-space:nowrap; cursor:pointer;">
+                   <input id="${scopeId}" type="checkbox" checked style="cursor:pointer;" /> ${escapeHtml(category)} only
+               </label>`
+            : '';
         comboWrap.innerHTML = `
             <div style="display:flex; align-items:center; gap:6px;">
-                <label style="opacity:0.9;">Model${catLabel}:</label>
+                <label style="opacity:0.9;">Model:</label>
                 <input id="${inputId}" type="text" placeholder="type to filter..." style="flex:1; padding:4px;" />
+                ${scopeControl}
                 <button id="${refreshId}" title="Refresh model list" class="model-linker-resolve-btn" style="padding:2px 8px;">⟳</button>
             </div>
             <div id="${listId}" style="position:absolute; top:100%; left:0; background: var(--comfy-input-bg, #2f2f2f); border:1px solid var(--border-color); border-radius:4px; max-height:280px; overflow:auto; display:none; z-index:100000;"></div>
@@ -1687,10 +1778,21 @@ class LinkerManagerDialog extends ComfyDialog {
         const inputEl = comboWrap.querySelector(`#${inputId}`);
         const listEl = comboWrap.querySelector(`#${listId}`);
         const refreshBtn = comboWrap.querySelector(`#${refreshId}`);
+        const scopeEl = comboWrap.querySelector(`#${scopeId}`);
         if (!inputEl || !listEl) return;
 
         const savedPaths = new Set((missing.matches || []).filter(m => m.is_override && m.model && m.model.path).map(m => m.model.path));
-        const getPool = () => Array.isArray(this.allModels) ? this.allModels : [];
+        const getPool = () => {
+            const all = Array.isArray(this.allModels) ? this.allModels : [];
+            const selectable = all.filter(isSelectableModel);
+            if (category && scopeEl?.checked) {
+                const scoped = selectable.filter((m) => m.category === category);
+                // Never strand the user with an empty picker: if the category
+                // holds nothing, fall back to everything rather than nothing.
+                if (scoped.length) return scoped;
+            }
+            return selectable;
+        };
 
         const renderList = (items, query, activeIdx) => {
             if (!items || !items.length) {
@@ -1735,17 +1837,27 @@ class LinkerManagerDialog extends ComfyDialog {
         const buildSuggestions = (query) => {
             const pool = getPool();
             const q = (query || '').toLowerCase();
-            // Deduplicate by normalized label (relative_path || filename) to hide symlink duplicates
+            // Collapse rows pointing at the same physical file. Keyed on file_id
+            // rather than the label, because category folders that are links to
+            // one directory can yield different relative paths for one file
+            // depending on which root reached it.
             const bestByKey = new Map();
             for (const m of pool) {
                 const label = m.relative_path || m.filename || '';
                 const labelNorm = (label || '').toLowerCase().replace(/[\\/]+/g, '/');
                 if (q && !labelNorm.includes(q)) continue;
+                const key = (m.file_id !== undefined && m.file_id !== null) ? `id:${m.file_id}` : labelNorm;
                 const saved = savedPaths.has(m.path);
-                const curr = bestByKey.get(labelNorm);
-                // Prefer a saved entry if available; otherwise keep the first
-                if (!curr || (saved && !curr.saved)) {
-                    bestByKey.set(labelNorm, { m, label, saved });
+                const matchesCategory = !!category && m.category === category;
+                const curr = bestByKey.get(key);
+                // Of the rows for one file, keep a saved pick first, then one
+                // from the node's own category - its path resolves against the
+                // folder this node actually loads from - then whatever came first.
+                const better = !curr
+                    || (saved && !curr.saved)
+                    || (saved === curr.saved && matchesCategory && !curr.matchesCategory);
+                if (better) {
+                    bestByKey.set(key, { m, label, saved, matchesCategory });
                 }
             }
             const items = Array.from(bestByKey.values());
@@ -1810,6 +1922,9 @@ class LinkerManagerDialog extends ComfyDialog {
 
         inputEl.addEventListener('focus', () => { openList(); updateList(); });
         inputEl.addEventListener('input', this.debounce(() => { updateList(); openList(); }, 120));
+        if (scopeEl) {
+            scopeEl.addEventListener('change', () => { updateList(); openList(); inputEl.focus(); });
+        }
         // Keep dropdown aligned on resize
         window.addEventListener('resize', updateListPosition);
         if (window.ResizeObserver) {
@@ -1880,10 +1995,9 @@ class LinkerManagerDialog extends ComfyDialog {
         });
         if (refreshBtn) {
             refreshBtn.addEventListener('click', async () => {
-                try {
-                    const resp = await api.fetchApi('/model_linker/models');
-                    if (resp.ok) this.allModels = await resp.json();
-                } catch (e) { }
+                // Same path as the initial load, so the refreshed list keeps its
+                // labels and ordering instead of arriving in raw scan order
+                await this.ensureAllModelsLoaded({ force: true });
                 updateList(); openList();
             });
         }
@@ -2131,9 +2245,8 @@ class LinkerManagerDialog extends ComfyDialog {
     }
 }
 
-class ManageOverridesDialog extends ComfyDialog {
+class ManageOverridesDialog {
     constructor() {
-        super();
         this.data = null;
         this.search = '';
         this.element = $el("div.comfy-modal", {
@@ -2254,10 +2367,10 @@ class ManageOverridesDialog extends ComfyDialog {
                 if (data.success) {
                     await this.load();
                 } else {
-                    alert('Import failed: ' + (data.error || 'unknown'));
+                    notifyError('Import failed', new Error(data.error || 'unknown'));
                 }
             } catch (err) {
-                alert('Invalid JSON: ' + err.message);
+                notifyError('Invalid JSON', err);
             } finally {
                 e.target.value = '';
             }
@@ -2335,8 +2448,8 @@ class ManageOverridesDialog extends ComfyDialog {
                     try {
                         const resp = await api.fetchApi('/model_linker/overrides/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ key: m.key }) });
                         const data = await resp.json();
-                        if (data.success) await this.load(); else alert('Delete failed');
-                    } catch (e) { alert('Delete failed: ' + e.message); }
+                        if (data.success) await this.load(); else notifyError('Delete failed', new Error(data.error || 'unknown'));
+                    } catch (e) { notifyError('Delete failed', e); }
                 });
             }
             const pathBtn = this.listEl.querySelector(`#ovr-pathbtn-${safeKey}`);
@@ -2355,8 +2468,8 @@ class ManageOverridesDialog extends ComfyDialog {
         try {
             const resp = await api.fetchApi('/model_linker/overrides/clear', { method: 'POST' });
             const data = await resp.json();
-            if (data.success) await this.load(); else alert('Clear failed');
-        } catch (e) { alert('Clear failed: ' + e.message); }
+            if (data.success) await this.load(); else notifyError('Clear failed', new Error(data.error || 'unknown'));
+        } catch (e) { notifyError('Clear failed', e); }
     }
 
     export() {
@@ -2374,6 +2487,82 @@ class ManageOverridesDialog extends ComfyDialog {
     }
 }
 
+// Settings are stored under this id by the frontend's settings store
+const SETTING_FLOATING_BUTTON = "ModelLinker.ShowFloatingButton";
+
+/**
+ * Extensions that are never a model, whatever folder they sit in.
+ *
+ * Preview images, sample videos and metadata sidecars live right beside the
+ * models they describe, and a category can declare extensions broadly enough to
+ * sweep them up. None of them is ever a valid replacement for a model, so the
+ * picker refuses to offer them regardless of how they were catalogued.
+ */
+const NON_MODEL_EXTENSIONS = new Set([
+    ".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".svg", ".avif",
+    ".mp4", ".webm", ".mov", ".avi", ".mkv", ".gifv",
+    ".info", ".lock", ".md", ".html", ".csv", ".log",
+]);
+
+/** Whether a catalogued entry may be offered as a model replacement. */
+function isSelectableModel(model) {
+    const name = (model?.filename || model?.relative_path || "").toLowerCase();
+    const dot = name.lastIndexOf(".");
+    if (dot < 0) return true;
+    return !NON_MODEL_EXTENSIONS.has(name.slice(dot));
+}
+
+/** Escape a value for interpolation into an HTML string. */
+function escapeHtml(value) {
+    if (value === null || value === undefined) return "";
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+/**
+ * Return a URL only if it is a plain web link.
+ *
+ * Download URLs arrive inside workflow files, which are shared and downloaded
+ * freely, so they are untrusted input. Restricting them to http(s) keeps a
+ * javascript: or data: URL from becoming a clickable link in the dialog.
+ */
+function safeHttpUrl(value) {
+    if (!value || typeof value !== "string") return null;
+    try {
+        const url = new URL(value);
+        return (url.protocol === "http:" || url.protocol === "https:") ? url.href : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Surface an error to the user through ComfyUI's toast system.
+ *
+ * Replaces window.alert, which blocks the page and cannot be styled or
+ * dismissed programmatically. Falls back to the console if toasts are
+ * unavailable, so nothing is ever swallowed silently.
+ */
+function notifyError(summary, error) {
+    const detail = error?.message || String(error || "");
+    try {
+        app.extensionManager?.toast?.add({
+            severity: "error",
+            summary: `Model Linker: ${summary}`,
+            detail,
+            life: 6000,
+        });
+        return;
+    } catch (e) {
+        // fall through to the console
+    }
+    console.error(`Model Linker: ${summary}`, error);
+}
+
 // Main extension class
 class ModelLinker {
     constructor() {
@@ -2386,58 +2575,41 @@ class ModelLinker {
         // Remove any existing button
         this.removeExistingButton();
 
-        // Find a visible menu element
-        const allMenus = document.querySelectorAll("[class*='menu']");
-
-        // Try to find a visible menu
-        let visibleMenu = null;
-        for (const menu of allMenus) {
-            const style = window.getComputedStyle(menu);
-            if (style.display !== 'none' && style.visibility !== 'hidden') {
-                visibleMenu = menu;
-                break;
-            }
-        }
-
-        // Try alternative: app.menu.settingsGroup
-        if (!visibleMenu && app.menu?.settingsGroup?.element) {
-            visibleMenu = app.menu.settingsGroup.element.parentElement;
-        }
-
-        // Try alternative selectors for the top bar
-        if (!visibleMenu) {
-            const alternatives = [
-                'header',
-                '.header',
-                '.top-bar',
-                '.toolbar',
-                '.nav',
-                '.navigation',
-                '[role="toolbar"]',
-                '[role="menubar"]'
-            ];
-
-            for (const selector of alternatives) {
-                const element = document.querySelector(selector);
-                if (element) {
-                    const style = window.getComputedStyle(element);
-                    if (style.display !== 'none' && style.visibility !== 'hidden') {
-                        visibleMenu = element;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (visibleMenu) {
-            this.createLinkerButton(visibleMenu);
-        } else {
+        // The extension is reachable through the View menu, the command palette
+        // and the canvas right-click menu, all registered below. The floating
+        // button is an optional shortcut on top of those.
+        //
+        // Earlier versions hunted the DOM for "[class*='menu']" and appended a
+        // raw button to whatever turned up first. Against a Vue-rendered
+        // interface that lands somewhere arbitrary and breaks whenever the
+        // markup shifts, so the button now owns its own corner of the page and
+        // never reaches into ComfyUI's own elements.
+        if (this.isFloatingButtonEnabled()) {
             this.createFloatingButton();
         }
 
         // Create dialog instance (will be created on demand)
         if (!this.dialog) {
             this.dialog = new LinkerManagerDialog();
+        }
+    }
+
+    /** Whether the user wants the floating shortcut button on screen. */
+    isFloatingButtonEnabled() {
+        try {
+            const value = app.extensionManager?.setting?.get(SETTING_FLOATING_BUTTON);
+            return value === undefined ? true : Boolean(value);
+        } catch (e) {
+            return true;
+        }
+    }
+
+    /** Add or remove the floating button to match the current setting. */
+    syncFloatingButton() {
+        if (this.isFloatingButtonEnabled()) {
+            if (!document.getElementById(this.buttonId)) this.createFloatingButton();
+        } else {
+            this.removeExistingButton();
         }
     }
 
@@ -2455,59 +2627,10 @@ class ModelLinker {
         }
     }
 
-    createLinkerButton(menu) {
-        this.linkerButton = $el("button", {
-            id: this.buttonId,
-            textContent: "🔗 Model Linker",
-            title: "Open Model Linker to resolve missing models in workflow",
-            onclick: () => {
-                this.openLinkerManager();
-            },
-            style: {
-                backgroundColor: "var(--comfy-input-bg, #353535)",
-                color: "var(--input-text, #ffffff)",
-                border: "2px solid var(--border-color, #555555)",
-                padding: "8px 16px",
-                margin: "4px",
-                borderRadius: "6px",
-                cursor: "pointer",
-                fontSize: "14px",
-                fontWeight: "600",
-                display: "inline-block",
-                minWidth: "80px",
-                textAlign: "center",
-                zIndex: "1000",
-                position: "relative",
-                transition: "all 0.2s ease",
-                whiteSpace: "nowrap"
-            }
-        });
-
-        // Add hover effects
-        this.linkerButton.addEventListener("mouseenter", () => {
-            this.linkerButton.style.backgroundColor = "var(--comfy-input-bg-hover, #4a4a4a)";
-            this.linkerButton.style.borderColor = "var(--primary-color, #007acc)";
-            this.linkerButton.style.transform = "translateY(-1px)";
-            this.linkerButton.style.boxShadow = "0 2px 4px rgba(0,0,0,0.2)";
-        });
-
-        this.linkerButton.addEventListener("mouseleave", () => {
-            this.linkerButton.style.backgroundColor = "var(--comfy-input-bg, #353535)";
-            this.linkerButton.style.borderColor = "var(--border-color, #555555)";
-            this.linkerButton.style.transform = "translateY(0)";
-            this.linkerButton.style.boxShadow = "none";
-        });
-
-        // Try to insert before settings group if using app.menu
-        if (app.menu?.settingsGroup?.element && menu === app.menu.settingsGroup.element.parentElement) {
-            app.menu.settingsGroup.element.before(this.linkerButton);
-        } else {
-            menu.appendChild(this.linkerButton);
-        }
-    }
-
     createFloatingButton() {
-        // Create a floating button as fallback
+        // Sits in its own fixed corner rather than inside ComfyUI's markup, so
+        // no frontend release can move it somewhere unexpected. It can be turned
+        // off in Settings for anyone who prefers the menu entries.
         this.linkerButton = $el("button", {
             id: this.buttonId,
             textContent: "🔗 Model Linker",
@@ -2517,8 +2640,9 @@ class ModelLinker {
             },
             style: {
                 position: "fixed",
-                top: "10px",
-                right: "10px",
+                // Clear of the top bar rather than overlapping it
+                top: "56px",
+                right: "12px",
                 zIndex: "10000",
                 backgroundColor: "var(--comfy-input-bg, #353535)",
                 color: "var(--input-text, #ffffff)",
@@ -2556,7 +2680,7 @@ class ModelLinker {
             this.dialog.show();
         } catch (error) {
             console.error("🔗 Model Linker: Error creating/showing dialog:", error);
-            alert("Error opening Model Linker: " + error.message);
+            notifyError("Could not open Model Linker", error);
         }
     }
 }
@@ -2567,7 +2691,21 @@ const modelLinker = new ModelLinker();
 app.registerExtension({
     name: "Model Linker",
     setup: modelLinker.setup,
-    // Support for new ComfyUI Frontend menu system
+
+    settings: [
+        {
+            id: SETTING_FLOATING_BUTTON,
+            category: ["Model Linker", "Interface", "Floating button"],
+            name: "Show floating Model Linker button",
+            tooltip: "Turn off to reach Model Linker from the View menu, the command palette or the canvas right-click menu instead.",
+            type: "boolean",
+            defaultValue: true,
+            onChange: () => modelLinker.syncFloatingButton(),
+        }
+    ],
+
+    // Registered as a command so it appears in the command palette and can be
+    // bound to a key, rather than existing only as a button in the page
     commands: [
         {
             id: "model-linker-open",
@@ -2580,6 +2718,12 @@ app.registerExtension({
         {
             path: ["View"],
             commands: ["model-linker-open"]
+        }
+    ],
+    keybindings: [
+        {
+            commandId: "model-linker-open",
+            combo: { key: "l", alt: true }
         }
     ],
     // Add to canvas right-click menu

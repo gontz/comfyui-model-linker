@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from typing import Any, Dict, List, Optional
 
 from .matcher import normalize_filename
@@ -57,13 +58,35 @@ def load_overrides() -> Dict[str, Any]:
 
 
 def _save_overrides(doc: Dict[str, Any]) -> None:
+    """
+    Write the overrides document atomically.
+
+    Writing in place leaves a window where a crash or a full disk truncates the
+    file and loses every saved selection. Writing to a temporary file in the
+    same directory and renaming means readers only ever see a complete document:
+    os.replace is atomic on Windows and POSIX alike.
+    """
     path = _overrides_path()
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=os.path.dirname(path), prefix=".overrides-", suffix=".tmp"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(doc, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+        tmp_path = None
         logging.info(f"Model Linker: Saved overrides to {path}")
     except Exception as e:
         logging.warning(f"Model Linker: Failed to save overrides: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def delete_override(key: str) -> bool:
@@ -114,6 +137,14 @@ def replace_overrides(new_doc: Dict[str, Any]) -> bool:
         return False
 
 
+def _normalize_category(category: Optional[str]) -> str:
+    """Reduce a category to the form used inside override keys."""
+    cat = (category or "").strip().lower() or "any"
+    if cat in ("unknown", "none", "undefined"):
+        cat = "any"
+    return cat
+
+
 def _make_keys(original_path: str, category: Optional[str]) -> List[str]:
     """
     Produce candidate keys for lookup.
@@ -121,9 +152,7 @@ def _make_keys(original_path: str, category: Optional[str]) -> List[str]:
     """
     filename = os.path.basename(original_path or "").strip()
     norm = normalize_filename(filename) if filename else ""
-    cat = (category or "").strip().lower() or "any"
-    if cat in ("unknown", "none", "undefined"):
-        cat = "any"
+    cat = _normalize_category(category)
     keys = [f"{cat}:{norm}"]
     if cat != "any":
         keys.append(f"any:{norm}")
@@ -184,6 +213,83 @@ def find_override_model(original_path: str, category: Optional[str], available_m
     return None
 
 
+def _build_override_entry(
+    original_path: str,
+    category: Optional[str],
+    resolved: Dict[str, Any] | None = None,
+    resolved_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a single override entry, or None if there is nothing to record."""
+    if isinstance(resolved, dict):
+        path = resolved.get("path") or resolved_path
+    else:
+        path = resolved_path
+    if not original_path or not path:
+        return None
+
+    entry: Dict[str, Any] = {
+        "key": _make_keys(original_path, category)[0],  # primary key (category-aware)
+        "original_filename": os.path.basename(original_path),
+        # Normalize category consistently with _make_keys
+        "category": _normalize_category(category),
+        "path": path,
+    }
+    # Optional metadata for convenience
+    if isinstance(resolved, dict):
+        for k in ("filename", "relative_path", "base_directory"):
+            if k in resolved:
+                entry[k] = resolved[k]
+    return entry
+
+
+def _upsert_entry(mappings: List[Dict[str, Any]], entry: Dict[str, Any]) -> None:
+    """Replace the mapping with the same key, or append if there is none."""
+    for i, m in enumerate(mappings):
+        if m.get("key") == entry["key"]:
+            mappings[i] = entry
+            return
+    mappings.append(entry)
+
+
+def record_overrides(selections: List[Dict[str, Any]]) -> int:
+    """
+    Record several user selections with a single read and a single write.
+
+    Resolving a workflow saves one override per relinked model. Recording them
+    one at a time reloads and rewrites the whole document for each, which both
+    wastes work and multiplies the number of moments a failed write could leave
+    the file behind.
+
+    Args:
+        selections: dicts with keys `original_path`, `category`, and `resolved`
+            (model dict from the scanner) and/or `resolved_path`
+
+    Returns:
+        Number of overrides recorded.
+    """
+    entries = []
+    for selection in selections:
+        entry = _build_override_entry(
+            selection.get("original_path"),
+            selection.get("category"),
+            selection.get("resolved"),
+            selection.get("resolved_path"),
+        )
+        if entry:
+            entries.append(entry)
+
+    if not entries:
+        return 0
+
+    doc = load_overrides()
+    mappings = doc.get("mappings", [])
+    for entry in entries:
+        _upsert_entry(mappings, entry)
+    doc["mappings"] = mappings
+    _save_overrides(doc)
+    return len(entries)
+
+
 def record_override(original_path: str, category: Optional[str], resolved: Dict[str, Any] | None = None, resolved_path: Optional[str] = None) -> bool:
     """
     Record a user-selected override.
@@ -197,45 +303,9 @@ def record_override(original_path: str, category: Optional[str], resolved: Dict[
     Returns:
         True if the override file was updated, else False.
     """
-    path = None
-    if isinstance(resolved, dict):
-        path = resolved.get("path") or resolved_path
-    else:
-        path = resolved_path
-    if not original_path or not path:
-        return False
-
-    filename = os.path.basename(original_path)
-    key = _make_keys(original_path, category)[0]  # primary key (category-aware)
-
-    # Normalize category consistently with _make_keys
-    cat = (category or "").strip().lower() or "any"
-    if cat in ("unknown", "none", "undefined"):
-        cat = "any"
-
-    entry: Dict[str, Any] = {
-        "key": key,
-        "original_filename": filename,
-        "category": cat,
-        "path": path,
-    }
-    # Optional metadata for convenience
-    if isinstance(resolved, dict):
-        for k in ("filename", "relative_path", "base_directory"):
-            if k in resolved:
-                entry[k] = resolved[k]
-
-    doc = load_overrides()
-    mappings = doc.get("mappings", [])
-    # replace or append
-    replaced = False
-    for i, m in enumerate(mappings):
-        if m.get("key") == key:
-            mappings[i] = entry
-            replaced = True
-            break
-    if not replaced:
-        mappings.append(entry)
-    doc["mappings"] = mappings
-    _save_overrides(doc)
-    return True
+    return record_overrides([{
+        "original_path": original_path,
+        "category": category,
+        "resolved": resolved,
+        "resolved_path": resolved_path,
+    }]) > 0

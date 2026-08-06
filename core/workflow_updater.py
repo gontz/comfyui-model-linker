@@ -202,7 +202,10 @@ def update_model_path(
             logging.warning(f"Widget key {widget_index!r} not found in node {node_id}")
             return False
     elif isinstance(widgets_values, (list, tuple)):
-        if not isinstance(widget_index, int) or widget_index >= len(widgets_values):
+        # Reject negatives as well as overruns: a negative index is a valid list
+        # subscript, so letting one through would quietly rewrite a widget
+        # counted from the end rather than the one that was asked for.
+        if not isinstance(widget_index, int) or widget_index < 0 or widget_index >= len(widgets_values):
             logging.warning(f"Widget index {widget_index} out of range for node {node_id}")
             return False
     else:

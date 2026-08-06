@@ -15,6 +15,105 @@ from .workflow_updater import update_workflow_nodes
 from .overrides import find_override_model
 
 
+def physical_file_key(model: Dict[str, Any]) -> str:
+    """
+    Identity of the physical file a catalogued model entry points at.
+
+    Uses the scanner's resolved `real_path` so entries reached through
+    junctioned/symlinked category directories collapse together. Falls back to
+    `path` for entries from older callers that predate `real_path`.
+    """
+    path = model.get('real_path') or model.get('path') or ''
+    if not path:
+        return ''
+    try:
+        return os.path.normcase(os.path.normpath(path))
+    except Exception:
+        return path
+
+
+def group_models_by_physical_file(models: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Group catalogued models by the physical file behind them.
+
+    One file is catalogued once per category whose directory reaches it, and
+    those directories are often links to a single shared folder - so the same
+    model can appear a dozen times under different category names and paths.
+    Grouping here lets each physical file be scored and shown exactly once.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for model in models:
+        groups.setdefault(physical_file_key(model), []).append(model)
+    return groups
+
+
+def select_candidates(groups: Dict[str, List[Dict[str, Any]]], category: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Pick one candidate per physical file for a given target category.
+
+    Where a file is catalogued under several categories, prefer the entry whose
+    category matches the one the node expects, so the relative path written back
+    into the workflow resolves against that loader's folder.
+
+    Entries in the preferred category are returned first. find_matches sorts by
+    score with a stable sort, so candidates that score equally keep this order.
+    """
+    preferred: List[Dict[str, Any]] = []
+    others: List[Dict[str, Any]] = []
+
+    want_category = category if category and category != 'unknown' else None
+
+    for entries in groups.values():
+        chosen = None
+        if want_category:
+            for entry in entries:
+                if entry.get('category') == want_category:
+                    chosen = entry
+                    break
+        if chosen is not None:
+            preferred.append(chosen)
+        else:
+            others.append(entries[0])
+
+    return preferred + others
+
+
+def list_available_models() -> List[Dict[str, Any]]:
+    """
+    Catalogue for the UI's model picker.
+
+    Entries keep their category: the category decides which folder the written
+    path is resolved against, so a file reachable under several categories stays
+    listed once per category rather than being collapsed to one row. Only exact
+    duplicates within a single category are dropped - the same physical file
+    reached through two directories configured for that category.
+
+    Each entry carries a `file_id` shared by every row pointing at the same
+    physical file. Where whole category folders are links to one directory, the
+    same model is catalogued under each of them, sometimes with a different
+    relative path depending on which root it was reached from - so the id is the
+    only reliable way for the picker to tell those rows apart from genuinely
+    different files. The resolved path itself is stripped, being both large and
+    of no use to the UI.
+    """
+    seen = set()
+    file_ids: Dict[str, int] = {}
+    listing: List[Dict[str, Any]] = []
+
+    for model in get_model_files():
+        file_key = physical_file_key(model)
+        key = (file_key, model.get('category'))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        entry = {k: v for k, v in model.items() if k != 'real_path'}
+        entry['file_id'] = file_ids.setdefault(file_key, len(file_ids))
+        listing.append(entry)
+
+    return listing
+
+
 def analyze_and_find_matches(
     workflow_json: Dict[str, Any],
     similarity_threshold: float = 0.0,
@@ -59,10 +158,14 @@ def analyze_and_find_matches(
     
     # Get available models
     available_models = get_model_files()
-    
+
+    # Collapse link aliases up front so each physical file is scored once
+    # instead of once per category directory that happens to reach it.
+    model_groups = group_models_by_physical_file(available_models)
+
     # Identify missing models
     missing_models = identify_missing_models(all_model_refs, available_models)
-    
+
     # Find matches for each missing model
     missing_with_matches = []
     for missing in missing_models:
@@ -79,30 +182,27 @@ def analyze_and_find_matches(
             node_type = missing.get('node_type', '')
             category = NODE_TYPE_TO_CATEGORY_HINTS.get(node_type, 'unknown')
         
-        candidates = available_models
-        if category and category != 'unknown':
-            # Prioritize models from the same category
-            candidates = [m for m in available_models if m.get('category') == category]
-            # Also include other categories as fallback
-            candidates.extend([m for m in available_models if m.get('category') != category])
-        
+        # One candidate per physical file, entries in the expected category first
+        candidates = select_candidates(model_groups, category)
+
         # First: compute fuzzy matches as usual
         matches = find_matches(
             original_path,
             candidates,
             threshold=similarity_threshold,
-            max_results=max_matches_per_model
+            max_results=max_matches_per_model,
+            preferred_category=category if category != 'unknown' else None
         )
 
         # Then: check if user has a saved override; inject it as a 99% match (not 100%)
         override_model = find_override_model(original_path, category, available_models)
         if override_model is not None:
-            override_path = os.path.normpath(override_model.get('path', '') or '')
+            override_key = physical_file_key(override_model)
             # Check if already present in matches
             found = None
             for m in matches:
-                p = os.path.normpath(m.get('model', {}).get('path', '') or '')
-                if p and p == override_path:
+                key = physical_file_key(m.get('model', {}))
+                if key and key == override_key:
                     found = m
                     break
             if found:
@@ -119,32 +219,24 @@ def analyze_and_find_matches(
                     'is_override': True,
                 })
         
-        # Deduplicate matches by absolute path - same physical file should only appear once
-        # This handles cases where the same file exists in multiple base directories
-        # or has different relative_paths but is the same file
-        seen_absolute_paths = {}
+        # Safety net: the candidate pool is already one entry per physical file,
+        # but an injected override can collide with a match, so collapse again on
+        # the same physical-file identity and keep the higher-confidence entry.
+        seen_files = {}
         deduplicated_matches = []
         for match in matches:
-            model_dict = match['model']
-            absolute_path = model_dict.get('path', '')
-            
-            # Normalize absolute path for comparison
-            if absolute_path:
-                absolute_path = os.path.normpath(absolute_path)
-            
-            # If we haven't seen this absolute path, add it
-            if absolute_path not in seen_absolute_paths:
-                seen_absolute_paths[absolute_path] = match
+            file_key = physical_file_key(match['model'])
+
+            if file_key not in seen_files:
+                seen_files[file_key] = match
                 deduplicated_matches.append(match)
             else:
-                # If we've seen this absolute path before, replace with better match if confidence is higher
-                existing_match = seen_absolute_paths[absolute_path]
+                existing_match = seen_files[file_key]
                 if match['confidence'] > existing_match['confidence']:
-                    # Replace with better match
                     idx = deduplicated_matches.index(existing_match)
                     deduplicated_matches[idx] = match
-                    seen_absolute_paths[absolute_path] = match
-        
+                    seen_files[file_key] = match
+
         missing_with_matches.append({
             **missing,
             'matches': deduplicated_matches

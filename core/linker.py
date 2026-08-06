@@ -222,14 +222,21 @@ def analyze_and_find_matches(
                 found['similarity'] = 1.0
                 found['confidence'] = 100.0
                 found['is_override'] = True
+                matches.remove(found)
+                override_match = found
             else:
-                matches.append({
+                override_match = {
                     'model': override_model,
                     'filename': override_model.get('filename'),
                     'similarity': 1.0,
                     'confidence': 100.0,
                     'is_override': True,
-                })
+                }
+            # A remembered choice leads, whatever it scores on name alone - the
+            # whole point of saving it is that the user already settled this.
+            # Placed rather than sorted: re-sorting by confidence would undo the
+            # category preference find_matches deliberately established.
+            matches.insert(0, override_match)
         
         # Safety net: the candidate pool is already one entry per physical file,
         # but an injected override can collide with a match, so collapse again on

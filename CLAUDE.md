@@ -13,8 +13,13 @@ This is **not** a custom node — it provides no `NODE_CLASS_MAPPINGS`. It regis
 - **Python >=3.8**, no external dependencies beyond ComfyUI's own (aiohttp, folder_paths, server)
 - **JavaScript**: ES6 modules loaded by ComfyUI from `web/`
 - **Activate venv**: `call c:\ComfyUI\.venv\Scripts\activate`
-- **No test suite, no linter, no build step** — the extension is loaded directly by ComfyUI at startup
-- **To test changes**: restart ComfyUI (Python changes) or hard-refresh the browser (JS changes)
+- **No linter, no build step** — the extension is loaded directly by ComfyUI at startup
+- **Tests**: `python tests/run.py` — stdlib only, no ComfyUI. The suite builds its own
+  model library in a temp directory and answers `import folder_paths` with a fake, so it
+  never touches the developer's models or saved overrides. The frontend suites need Node
+  and are skipped without it. See `tests/README.md`
+- **To see changes in the app**: restart ComfyUI (Python changes) or hard-refresh the
+  browser (JS changes)
 
 ## Architecture
 
@@ -110,7 +115,9 @@ therefore banded, strongest signal first — see `calculate_filename_confidence`
   import. `SequenceMatcher.ratio()` is **not symmetric**; the target must stay the first argument
 - `find_matches` keeps a `heapq` of `max_results` rather than scoring-then-sorting the library,
   and memoizes normalized names on the candidate dict (`_norm`), which persists via the scan cache
-- Override matches get 99-100% confidence to appear at the top
+- A saved override is scored 100% **and placed first** by `analyze_and_find_matches`.
+  It has to be *placed*, not sorted in: re-sorting the list by confidence would undo the
+  category preference below, which `find_matches` established deliberately
 - Minimum threshold is 70% confidence
 - A match at or above that threshold from the node's own category outranks a better-scoring
   one from another category — a path only resolves against its own category's folder.

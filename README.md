@@ -27,16 +27,15 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
 
 1. Open a workflow with missing models
 2. Open Model Linker in whichever way suits you:
-   - the floating "🔗 Model Linker" button
    - **View → Model Linker** in the menu
-   - the command palette, or <kbd>Alt</kbd>+<kbd>L</kbd>
+   - <kbd>Alt</kbd>+<kbd>L</kbd>
+   - the command palette
    - right-click the canvas
 3. Review missing models and their suggested matches
 4. Select replacements for individual models (via suggestion buttons or full model dropdown with search)
 5. Click "Apply Selected" to relink queued selections, or use "Auto-Resolve 100% Matches" for perfect matches
 6. Save your workflow when ready
 
-The floating button can be turned off under **Settings → Model Linker**.
 
 ## Features
 

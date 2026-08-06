@@ -2502,9 +2502,6 @@ class ManageOverridesDialog {
     }
 }
 
-// Settings are stored under this id by the frontend's settings store
-const SETTING_FLOATING_BUTTON = "ModelLinker.ShowFloatingButton";
-
 /**
  * Extensions that are never a model, whatever folder they sit in.
  *
@@ -2600,110 +2597,19 @@ function notifyError(summary, error) {
 // Main extension class
 class ModelLinker {
     constructor() {
-        this.linkerButton = null;
-        this.buttonId = "model-linker-button";
         this.dialog = null;
     }
 
+    // Model Linker is reached from the View menu, the command palette, the
+    // Alt+L shortcut and the canvas right-click menu - all registered below.
+    // It deliberately adds no control of its own: earlier versions searched
+    // ComfyUI's markup for any element whose class named it a menu and appended
+    // a button to the first one found. Against a Vue-rendered interface that
+    // landed somewhere arbitrary and broke whenever the markup shifted.
     setup = () => {
-        // Remove any existing button
-        this.removeExistingButton();
-
-        // The extension is reachable through the View menu, the command palette
-        // and the canvas right-click menu, all registered below. The floating
-        // button is an optional shortcut on top of those.
-        //
-        // Earlier versions hunted the DOM for "[class*='menu']" and appended a
-        // raw button to whatever turned up first. Against a Vue-rendered
-        // interface that lands somewhere arbitrary and breaks whenever the
-        // markup shifts, so the button now owns its own corner of the page and
-        // never reaches into ComfyUI's own elements.
-        if (this.isFloatingButtonEnabled()) {
-            this.createFloatingButton();
-        }
-
-        // Create dialog instance (will be created on demand)
         if (!this.dialog) {
             this.dialog = new LinkerManagerDialog();
         }
-    }
-
-    /** Whether the user wants the floating shortcut button on screen. */
-    isFloatingButtonEnabled() {
-        try {
-            const value = app.extensionManager?.setting?.get(SETTING_FLOATING_BUTTON);
-            return value === undefined ? true : Boolean(value);
-        } catch (e) {
-            return true;
-        }
-    }
-
-    /** Add or remove the floating button to match the current setting. */
-    syncFloatingButton() {
-        if (this.isFloatingButtonEnabled()) {
-            if (!document.getElementById(this.buttonId)) this.createFloatingButton();
-        } else {
-            this.removeExistingButton();
-        }
-    }
-
-    removeExistingButton() {
-        // Remove any existing button by ID
-        const existingButton = document.getElementById(this.buttonId);
-        if (existingButton) {
-            existingButton.remove();
-        }
-
-        // Also remove the stored reference if it exists
-        if (this.linkerButton && this.linkerButton.parentNode) {
-            this.linkerButton.remove();
-            this.linkerButton = null;
-        }
-    }
-
-    createFloatingButton() {
-        // Sits in its own fixed corner rather than inside ComfyUI's markup, so
-        // no frontend release can move it somewhere unexpected. It can be turned
-        // off in Settings for anyone who prefers the menu entries.
-        this.linkerButton = $el("button", {
-            id: this.buttonId,
-            textContent: "🔗 Model Linker",
-            title: "Open Model Linker to resolve missing models in workflow",
-            onclick: () => {
-                this.openLinkerManager();
-            },
-            style: {
-                position: "fixed",
-                // Clear of the top bar rather than overlapping it
-                top: "56px",
-                right: "12px",
-                zIndex: "10000",
-                backgroundColor: "var(--comfy-input-bg, #353535)",
-                color: "var(--input-text, #ffffff)",
-                border: "2px solid var(--primary-color, #007acc)",
-                padding: "8px 16px",
-                borderRadius: "6px",
-                cursor: "pointer",
-                fontSize: "14px",
-                fontWeight: "600",
-                boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
-                transition: "all 0.2s ease",
-                whiteSpace: "nowrap"
-            }
-        });
-
-        // Add hover effects
-        this.linkerButton.addEventListener("mouseenter", () => {
-            this.linkerButton.style.backgroundColor = "var(--primary-color, #007acc)";
-            this.linkerButton.style.transform = "scale(1.05)";
-        });
-
-        this.linkerButton.addEventListener("mouseleave", () => {
-            this.linkerButton.style.backgroundColor = "var(--comfy-input-bg, #353535)";
-            this.linkerButton.style.transform = "scale(1)";
-        });
-
-        document.body.appendChild(this.linkerButton);
     }
 
     openLinkerManager() {
@@ -2726,17 +2632,6 @@ app.registerExtension({
     name: "Model Linker",
     setup: modelLinker.setup,
 
-    settings: [
-        {
-            id: SETTING_FLOATING_BUTTON,
-            category: ["Model Linker", "Interface", "Floating button"],
-            name: "Show floating Model Linker button",
-            tooltip: "Turn off to reach Model Linker from the View menu, the command palette or the canvas right-click menu instead.",
-            type: "boolean",
-            defaultValue: true,
-            onChange: () => modelLinker.syncFloatingButton(),
-        }
-    ],
 
     // Registered as a command so it appears in the command palette and can be
     // bound to a key, rather than existing only as a button in the page

@@ -46,7 +46,7 @@ Frontend → POST /model_linker/resolve → core/linker.py
 | `core/node_adapters.py` | Per-node-pack readers for references stored in non-standard shapes |
 | `core/workflow_updater.py` | Patches `widgets_values` in workflow nodes, supports subgraph nodes |
 | `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections |
-| `web/linker.js` | Full frontend: modal dialog, floating button, model search/dropdown, overrides manager |
+| `web/linker.js` | Full frontend: modal dialog, model search/dropdown, overrides manager |
 
 ### API Routes
 

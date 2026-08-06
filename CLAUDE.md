@@ -18,15 +18,28 @@ The repo began as a fork of [kianxyzw/comfyui-model-linker](https://github.com/k
   sync brought in a download subsystem whose frontend was written against the monolithic
   `web/linker.js` this project has since split into `web/modules/`; reconciling the two
   cost a full manual merge and lost upstream's UI layer anyway.
-- Upstream's download **backend** does live here — `core/downloader.py`, `core/sources/*`,
-  `metadata/*.json`, and six `/model_linker/` routes — and is reachable over HTTP, but
-  **no UI drives it**. That is a known, deliberate gap, not an oversight to "fix" by
-  pulling upstream again. **See [DOWNLOAD-BACKEND.md](DOWNLOAD-BACKEND.md)** before
-  touching, deleting or reviving any of it.
-- One part of it is *not* dormant: `/analyze` searches HuggingFace and CivitAI for every
-  missing model without a 100% local match. That adds roughly half a second per such model
-  and sends workflow filenames to two third parties. There is no setting to disable it.
+- **There is deliberately no download feature.** Upstream's came across in that merge with
+  its backend intact and its UI lost, and was then removed on purpose — see below.
 - Wanting something from upstream means porting that specific change by hand.
+
+### The removed download subsystem
+
+`core/downloader.py`, `core/sources/*` (HuggingFace, CivitAI, popular, model-list),
+`metadata/*.json` and six `/model_linker/` routes (`search`, `download`, `progress`×2,
+`cancel`, `directories`) were deleted in commit *"Remove the download subsystem"*. They
+worked; they had no interface after the frontend split, and one part of them was not
+dormant:
+
+> `/analyze` searched HuggingFace and then CivitAI for **every missing model without a
+> 100% local match** — measured at ~0.19s and ~0.30s each on a miss, run serially, so a
+> workflow with nine missing models added 4–5s to an analysis that takes ~0.06s warm — and
+> sent workflow filenames to both services. There was no setting to disable it.
+
+Recover any of it with `git show <that commit>^:core/downloader.py` and so on.
+
+**Not to be confused with the download link we do offer:** `properties.models[].url` from
+the workflow itself is surfaced as `source_url` and rendered by the dialog. That is local,
+requires no network call during analysis, and stays.
 
 ## Development Environment
 

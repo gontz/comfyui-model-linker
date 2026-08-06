@@ -8,6 +8,22 @@ ComfyUI Model Linker is a ComfyUI extension that helps users relink missing mode
 
 This is **not** a custom node — it provides no `NODE_CLASS_MAPPINGS`. It registers API routes on `PromptServer` and loads a web UI via `WEB_DIRECTORY`.
 
+### This fork does not track upstream
+
+The repo began as a fork of [kianxyzw/comfyui-model-linker](https://github.com/kianxyzw/comfyui-model-linker)
+(MIT — see `LICENSE` and `NOTICE.md`), but **`main` is this fork's own line of work**. The
+`upstream` remote has been removed deliberately.
+
+- **Do not add an `upstream` remote, and do not merge or rebase from kianxyzw.** The last
+  sync brought in a download subsystem whose frontend was written against the monolithic
+  `web/linker.js` this project has since split into `web/modules/`; reconciling the two
+  cost a full manual merge and lost upstream's UI layer anyway.
+- Upstream's download **backend** does live here — `core/downloader.py`, `core/sources/*`,
+  `metadata/*.json`, and six `/model_linker/` routes — and is reachable over HTTP, but
+  **no UI drives it**. That is a known, deliberate gap, not an oversight to "fix" by
+  pulling upstream again.
+- Wanting something from upstream means porting that specific change by hand.
+
 ## Development Environment
 
 - **Python >=3.8**, no external dependencies beyond ComfyUI's own (aiohttp, folder_paths, server)

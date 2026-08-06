@@ -1331,9 +1331,10 @@ class LinkerManagerDialog {
                 const match = sortedMatches[matchIndex];
                 const buttonId = `resolve-${refSlot(missing)}-${matchIndex}`;
                 html += `<li style="margin: 4px 0;">`;
-                const label = match.model?.relative_path || match.filename;
+                const label = match.filename || match.model?.relative_path || '';
                 const isSaved = !!match.is_override;
-                html += `<code>${label}</code> `;
+                // Name only - the containing folder is printed just below
+                html += `<code title="${match.model?.relative_path || label}">${label}</code> `;
                 html += `<span style="color: ${match.confidence === 100 ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
                 if (isSaved) {
                     html += ` <span style="color:#0aa96e; font-weight:600;">(saved)</span>`;
@@ -1545,9 +1546,10 @@ class LinkerManagerDialog {
             return;
         }
         const model = queued.resolved_model || {};
-        const label = model.relative_path || model.filename || queued.resolved_path || 'selected model';
+        const label = model.filename || model.relative_path || queued.resolved_path || 'selected model';
+        const fullPath = model.relative_path || queued.resolved_path || label;
         const removeId = `selected-remove-${refSlot(missing)}`;
-        el.innerHTML = `<strong>Selected:</strong> <code>${label}</code> <button id="${removeId}" class="model-linker-resolve-btn" style="margin-left:8px; padding: 2px 8px;">Remove</button>`;
+        el.innerHTML = `<strong>Selected:</strong> <code title="${fullPath}">${label}</code> <button id="${removeId}" class="model-linker-resolve-btn" style="margin-left:8px; padding: 2px 8px;">Remove</button>`;
         el.style.display = '';
         const btn = document.getElementById(removeId);
         if (btn) {
@@ -1810,31 +1812,38 @@ class LinkerManagerDialog {
             }
             const esc = (s) => (s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[c]));
             const q = (query || '').toLowerCase();
+
+            // Underline where the query matched, so a hit in the folder is
+            // still visible even though the name is what is listed.
+            const highlight = (text) => {
+                if (!q) return esc(text);
+                const low = text.toLowerCase();
+                let out = '';
+                let idx = 0;
+                for (; ;) {
+                    const j = low.indexOf(q, idx);
+                    if (j === -1) { out += esc(text.slice(idx)); break; }
+                    out += esc(text.slice(idx, j))
+                        + `<span style="font-weight:600; text-decoration:underline;">${esc(text.slice(j, j + q.length))}</span>`;
+                    idx = j + q.length;
+                }
+                return out;
+            };
+
             let html = '';
             for (let i = 0; i < items.length; i++) {
                 const m = items[i];
-                const labRaw = m.relative_path || m.filename || '';
+                // Just the name. The folder appears beneath it, which is what
+                // separates two models that share a filename; searching still
+                // matches the whole path.
+                const name = m.filename || m.relative_path || '';
                 const isSaved = savedPaths.has(m.path);
-                // highlight simple substring matches
-                let labelHtml = esc(labRaw);
-                if (q) {
-                    const low = labRaw.toLowerCase();
-                    let out = '';
-                    let idx = 0;
-                    for (; ;) {
-                        const j = low.indexOf(q, idx);
-                        if (j === -1) { out += esc(labRaw.slice(idx)); break; }
-                        out += esc(labRaw.slice(idx, j)) + `<span style="font-weight:600; text-decoration:underline;">${esc(labRaw.slice(j, j + q.length))}</span>`;
-                        idx = j + q.length;
-                    }
-                    labelHtml = out;
-                }
                 const activeStyle = (i === activeIdx) ? 'background: rgba(0,122,204,0.25);' : '';
                 const folderPath = this._getModelFolder(m);
-                const folderHtml = folderPath ? `<div style="font-size:10px; color:#888; opacity:0.8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(folderPath)}">📁 ${esc(folderPath)}</div>` : '';
+                const folderHtml = folderPath ? `<div style="font-size:10px; color:#888; opacity:0.8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(folderPath)}">📁 ${highlight(folderPath)}</div>` : '';
                 html += `<div data-idx="${i}" style="${activeStyle} padding:6px; cursor:pointer;">
                     <div style="display:flex; align-items:center; gap:6px;">
-                        <code style="flex:1;">${labelHtml}</code>
+                        <code style="flex:1;" title="${esc(m.relative_path || name)}">${highlight(name)}</code>
                         ${isSaved ? '<span style="color:#0aa96e; font-weight:600;">(saved)</span>' : ''}
                     </div>
                     ${folderHtml}
@@ -1871,11 +1880,15 @@ class LinkerManagerDialog {
                 }
             }
             const items = Array.from(bestByKey.values());
-            // sort: saved first, then label asc
+            // Saved pick first, then alphabetically by the name shown in the
+            // list. Ordering by the full path instead would group by folder and
+            // read as unsorted, since the folder is not what is listed.
             items.sort((a, b) => {
                 if (a.saved && !b.saved) return -1;
                 if (!a.saved && b.saved) return 1;
-                return (a.label || '').localeCompare(b.label || '');
+                const an = a.m.filename || a.label || '';
+                const bn = b.m.filename || b.label || '';
+                return an.localeCompare(bn) || (a.label || '').localeCompare(b.label || '');
             });
             // return all deduplicated items so user can scroll entire list
             return items.map(x => x.m);
@@ -1969,7 +1982,8 @@ class LinkerManagerDialog {
                     const chosen = currentItems[activeIndex];
                     if (chosen) {
                         this.queueResolution(missing, chosen);
-                        inputEl.value = chosen.relative_path || chosen.filename || '';
+                        inputEl.value = chosen.filename || chosen.relative_path || '';
+                        inputEl.title = chosen.relative_path || '';
                         closeList();
                     }
                 }
@@ -1983,7 +1997,8 @@ class LinkerManagerDialog {
             const chosen = currentItems[idx];
             if (chosen) {
                 this.queueResolution(missing, chosen);
-                inputEl.value = chosen.relative_path || chosen.filename || '';
+                inputEl.value = chosen.filename || chosen.relative_path || '';
+                inputEl.title = chosen.relative_path || '';
                 closeList();
             }
         });

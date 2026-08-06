@@ -265,9 +265,39 @@ def analyze_and_find_matches(
     
     return {
         'missing_models': missing_with_matches,
+        'present_models': summarize_present_models(all_model_refs),
         'total_missing': len(missing_with_matches),
         'total_models_analyzed': len(all_model_refs)
     }
+
+
+# Fields worth sending for a model that is present. The rest of a reference is
+# either only needed to write a replacement back or is large and of no use.
+_PRESENT_MODEL_FIELDS = (
+    'node_id', 'node_type', 'widget_index', 'original_path', 'category',
+    'nested_key', 'list_index', 'adapter_id',
+    'subgraph_id', 'subgraph_name', 'is_top_level',
+)
+
+
+def summarize_present_models(model_refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    The models a workflow uses that were found on disk.
+
+    The analysis already walks every reference to work out which are missing,
+    so reporting the ones that resolved costs nothing extra and answers the
+    question the missing list cannot: what is this workflow actually loading,
+    and from which folder. Useful for confirming a relink landed where it
+    should, and for spotting a model resolving out of an unexpected category.
+    """
+    present = []
+    for ref in model_refs:
+        if not ref.get('exists'):
+            continue
+        entry = {key: ref.get(key) for key in _PRESENT_MODEL_FIELDS if key in ref}
+        entry['canonical_category'] = canonical_category(ref.get('category'))
+        present.append(entry)
+    return present
 
 
 def apply_resolution(

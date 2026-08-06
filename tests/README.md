@@ -33,6 +33,7 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `test_updater.py` | patching paths back in, including into subgraph definitions |
 | `test_overrides.py` | persisted user selections |
 | `test_reveal.py` | opening the file manager: what it refuses, and how it launches |
+| `test_inventory.py` | the found-on-disk list that accompanies the missing one |
 | `js/` | `web/`: registration, escaping, picker filtering, reference identity, overlapping analyses |
 
 `support.py` holds the fixtures. `LibraryTestCase` gives each test a temporary

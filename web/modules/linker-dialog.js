@@ -1085,12 +1085,67 @@ export class LinkerManagerDialog {
     /**
      * Display missing models in the dialog
      */
+    /**
+     * The models this workflow uses that were found on disk.
+     *
+     * Answers what the missing list cannot: what is this workflow actually
+     * loading, and out of which folder. Collapsed by default - it is context,
+     * not the task. A <details> element so the browser handles the toggling.
+     */
+    renderPresentModels(present) {
+        if (!present || !present.length) return '';
+
+        const rows = [...present].sort((a, b) => {
+            const byCategory = (a.category || '').localeCompare(b.category || '');
+            return byCategory || (a.original_path || '').localeCompare(b.original_path || '');
+        });
+
+        let html = `<details id="model-linker-present" style="margin-top:16px;">`
+            + `<summary style="cursor:pointer; opacity:.85;">Models found on disk (${rows.length})</summary>`
+            + `<div style="display:flex; flex-direction:column; gap:4px; margin-top:8px;">`;
+
+        rows.forEach((model, index) => {
+            const name = escapeHtml((model.original_path || '').split(/[\\/]/).pop() || '');
+            const path = escapeHtml(model.original_path || '');
+            const category = escapeHtml(model.category || 'unknown');
+            const node = escapeHtml(`${model.node_type || 'Node'} #${model.node_id}`);
+            const where = model.subgraph_name ? ` · ${escapeHtml(model.subgraph_name)}` : '';
+            html += `<div style="display:flex; align-items:center; gap:8px; padding:4px 6px; border-bottom:1px solid var(--border-color);">`
+                + `<code style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${path}">${name}</code>`
+                + `<span style="flex:0 0 auto; opacity:.75; font-size:12px;">[${category}]</span>`
+                + `<span style="flex:0 0 auto; opacity:.6; font-size:12px;">${node}${where}</span>`
+                + `<button id="present-reveal-${index}" class="model-linker-resolve-btn" style="flex:0 0 auto; padding:2px 8px;" title="Show in the file manager">📂</button>`
+                + `</div>`;
+        });
+
+        html += '</div></details>';
+        this._presentRows = rows;
+        return html;
+    }
+
+    /** Wire the folder buttons in the found-on-disk list. */
+    attachPresentModelHandlers(container) {
+        (this._presentRows || []).forEach((model, index) => {
+            const button = container.querySelector(`#present-reveal-${index}`);
+            if (button) {
+                button.onclick = () => this.revealModel({
+                    category: model.category,
+                    relative_path: model.original_path,
+                });
+            }
+        });
+    }
+
     displayMissingModels(container, data) {
         const missingModels = data.missing_models || [];
         const totalMissing = data.total_missing || 0;
+        const presentHtml = this.renderPresentModels(data.present_models);
 
         if (totalMissing === 0) {
-            container.innerHTML = '<p style="color: green;">✓ No missing models found. All models are available!</p>';
+            container.innerHTML =
+                '<p style="color: green;">✓ No missing models found. All models are available!</p>'
+                + presentHtml;
+            this.attachPresentModelHandlers(container);
             return;
         }
 
@@ -1126,7 +1181,9 @@ export class LinkerManagerDialog {
         }
 
         html += '</div>';
+        html += presentHtml;
         container.innerHTML = html;
+        this.attachPresentModelHandlers(container);
 
         // Attach event listeners for resolve buttons (use sorted order)
         // Note: We need to match the exact same logic as renderMissingModel to find which buttons were rendered

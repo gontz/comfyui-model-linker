@@ -56,7 +56,8 @@ Frontend → POST /model_linker/resolve → core/linker.py
 ### API Routes
 
 All routes are prefixed `/model_linker/`:
-- `POST /analyze` — analyze workflow for missing models
+- `POST /analyze` — missing models with ranked suggestions, plus `present_models`: the
+  inventory of what the workflow *did* find, which the walk already computes
 - `POST /resolve` — apply selected resolutions to workflow
 - `GET /models` — list all available models
 - `GET /overrides` — get saved overrides

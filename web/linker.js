@@ -1782,11 +1782,16 @@ class LinkerManagerDialog {
         if (!inputEl || !listEl) return;
 
         const savedPaths = new Set((missing.matches || []).filter(m => m.is_override && m.model && m.model.path).map(m => m.model.path));
+        // Scope on the canonical category so aliases of one folder count as the
+        // same category (a node loading from text_encoders still sees models
+        // catalogued under clip). Falls back to the raw name on older responses.
+        const scopeCategory = missing.canonical_category || category;
         const getPool = () => {
             const all = Array.isArray(this.allModels) ? this.allModels : [];
             const selectable = all.filter(isSelectableModel);
-            if (category && scopeEl?.checked) {
-                const scoped = selectable.filter((m) => m.category === category);
+            if (scopeCategory && scopeEl?.checked) {
+                const scoped = selectable.filter(
+                    (m) => (m.canonical_category || m.category) === scopeCategory);
                 // Never strand the user with an empty picker: if the category
                 // holds nothing, fall back to everything rather than nothing.
                 if (scoped.length) return scoped;
@@ -1848,7 +1853,8 @@ class LinkerManagerDialog {
                 if (q && !labelNorm.includes(q)) continue;
                 const key = (m.file_id !== undefined && m.file_id !== null) ? `id:${m.file_id}` : labelNorm;
                 const saved = savedPaths.has(m.path);
-                const matchesCategory = !!category && m.category === category;
+                const matchesCategory = !!scopeCategory
+                    && (m.canonical_category || m.category) === scopeCategory;
                 const curr = bestByKey.get(key);
                 // Of the rows for one file, keep a saved pick first, then one
                 // from the node's own category - its path resolves against the

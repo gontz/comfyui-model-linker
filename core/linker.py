@@ -8,6 +8,7 @@ import os
 import logging
 from typing import Dict, Any, List, Optional
 
+from .categories import canonical_category
 from .scanner import get_model_files
 from .workflow_analyzer import analyze_workflow_models, identify_missing_models
 from .matcher import find_matches
@@ -61,15 +62,23 @@ def select_candidates(groups: Dict[str, List[Dict[str, Any]]], category: Optiona
     preferred: List[Dict[str, Any]] = []
     others: List[Dict[str, Any]] = []
 
-    want_category = category if category and category != 'unknown' else None
+    want_category = canonical_category(category)
 
     for entries in groups.values():
         chosen = None
         if want_category:
+            # Prefer an exact category name, then any alias of it, so a node
+            # expecting `diffusion_models` takes that entry over the `unet` one
+            # while still finding the model when only the alias was catalogued.
             for entry in entries:
-                if entry.get('category') == want_category:
+                if entry.get('category') == category:
                     chosen = entry
                     break
+            else:
+                for entry in entries:
+                    if canonical_category(entry.get('category')) == want_category:
+                        chosen = entry
+                        break
         if chosen is not None:
             preferred.append(chosen)
         else:
@@ -107,8 +116,11 @@ def list_available_models() -> List[Dict[str, Any]]:
             continue
         seen.add(key)
 
-        entry = {k: v for k, v in model.items() if k != 'real_path'}
+        entry = {k: v for k, v in model.items() if k not in ('real_path', '_norm')}
         entry['file_id'] = file_ids.setdefault(file_key, len(file_ids))
+        # The picker scopes on this rather than the raw name, so a node loading
+        # from `text_encoders` still sees models catalogued under `clip`.
+        entry['canonical_category'] = canonical_category(model.get('category'))
         listing.append(entry)
 
     return listing
@@ -239,6 +251,8 @@ def analyze_and_find_matches(
 
         missing_with_matches.append({
             **missing,
+            'category': category,
+            'canonical_category': canonical_category(category),
             'matches': deduplicated_matches
         })
     

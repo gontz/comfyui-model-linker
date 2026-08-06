@@ -39,7 +39,8 @@ Frontend → POST /model_linker/resolve → core/linker.py
 | `__init__.py` | Extension entry point; registers 7 aiohttp API routes on `PromptServer` |
 | `core/linker.py` | High-level API: `analyze_and_find_matches()`, `apply_resolution()` |
 | `core/scanner.py` | Discovers model files using ComfyUI's `folder_paths` |
-| `core/matcher.py` | Fuzzy matching with filename normalization (removes extensions, normalizes separators) |
+| `core/matcher.py` | Banded, model-family-aware matching (rapidfuzz when available) |
+| `core/categories.py` | Canonical category names — many aliases reach one model folder |
 | `core/workflow_analyzer.py` | Extracts model references from workflow JSON, handles subgraph definitions |
 | `core/workflow_updater.py` | Patches `widgets_values` in workflow nodes, supports subgraph nodes |
 | `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections |
@@ -85,15 +86,42 @@ place is common. Every such alias catalogues the same file again.
   configured category→paths layout (custom nodes can register paths after startup)
 
 ### Fuzzy Matching
-- Filenames are normalized: lowercase, extensions removed, `_-` converted to spaces
-  (`normalize_filename` is `lru_cache`d — it is called once per candidate per lookup)
-- `SequenceMatcher.ratio()` is **not symmetric**; the target must stay the first argument
-- Scores are capped at 0.999 for non-exact matches to distinguish from true 100% matches
+Plain edit distance ranks model filenames **backwards**: `qwen3vl_8b_int8` differs from
+`qwen3vl_4b_int8` by one character but is a *different model*, while it differs from
+`qwen3vl_8b_bf16` by several and is the *same model* at another precision. Scoring is
+therefore banded, strongest signal first — see `calculate_filename_confidence`:
+
+| band | score | meaning |
+|---|---|---|
+| exact | 100 | identical after normalization |
+| same family | 94.0–95.9 | same model, different precision/quantization |
+| different family | ≤93.9 | capped, so it can never outrank the same model under another name |
+| same signature | ~85 | same architecture and size, different wording |
+| capacity/generation conflict | ≤69 | `8b` vs `4b`, `qwen3` vs `qwen2` — pinned below the plausibility threshold |
+
+- "Family" = filename with precision/quantization tokens stripped (`normalize_model_family`);
+  "signature" = (architecture, parameter count) from that family (`get_model_signature`)
+- Raw similarity only orders candidates *within* a band, never across bands
+- Filenames normalize to lowercase, extension removed, `_-.` → spaces (dots included:
+  `flux1-dev.fp8` and `flux1_dev_fp8` are the same name)
+- **rapidfuzz** is used when installed, `SequenceMatcher` otherwise — keep it an optional
+  import. `SequenceMatcher.ratio()` is **not symmetric**; the target must stay the first argument
+- `find_matches` keeps a `heapq` of `max_results` rather than scoring-then-sorting the library,
+  and memoizes normalized names on the candidate dict (`_norm`), which persists via the scan cache
 - Override matches get 99-100% confidence to appear at the top
 - Minimum threshold is 70% confidence
 - A match at or above that threshold from the node's own category outranks a better-scoring
   one from another category — a path only resolves against its own category's folder.
   Weaker same-category matches get no boost, so a poor category guess is still recoverable
+
+### Category Aliases (`core/categories.py`)
+One folder of models is reachable under several category names: core registers
+`diffusion_models` for both `models/unet` and `models/diffusion_models`, custom nodes add
+`unet_gguf`/`model_gguf`/`select_safetensors`, and installs commonly link `models/clip` to
+`models/text_encoders`. **Never compare category names literally** — use
+`canonical_category()` / `categories_match()`. Selection still prefers the exact name when
+present, falling back to any alias. The canonical name is sent to the frontend as
+`canonical_category` so the picker's scoping agrees with the backend.
 
 ### Workflow Metadata (`properties.models`)
 Recent frontends attach `[{name, url, directory, hash?, hash_type?}]` to nodes referencing

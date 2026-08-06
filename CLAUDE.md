@@ -21,7 +21,11 @@ The repo began as a fork of [kianxyzw/comfyui-model-linker](https://github.com/k
 - Upstream's download **backend** does live here — `core/downloader.py`, `core/sources/*`,
   `metadata/*.json`, and six `/model_linker/` routes — and is reachable over HTTP, but
   **no UI drives it**. That is a known, deliberate gap, not an oversight to "fix" by
-  pulling upstream again.
+  pulling upstream again. **See [DOWNLOAD-BACKEND.md](DOWNLOAD-BACKEND.md)** before
+  touching, deleting or reviving any of it.
+- One part of it is *not* dormant: `/analyze` searches HuggingFace and CivitAI for every
+  missing model without a 100% local match. That adds roughly half a second per such model
+  and sends workflow filenames to two third parties. There is no setting to disable it.
 - Wanting something from upstream means porting that specific change by hand.
 
 ## Development Environment

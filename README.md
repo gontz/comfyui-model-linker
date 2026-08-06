@@ -52,6 +52,13 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
 - **Auto-Resolve**: One-click resolution for all perfect matches
 - **Learned Overrides**: Your manual picks are persisted and reused automatically
 
+## Download support
+
+A download backend is present but has no interface, and `/analyze` searches HuggingFace
+and CivitAI for every missing model without a perfect local match — which slows analysis
+and sends workflow filenames to those services. See
+[DOWNLOAD-BACKEND.md](DOWNLOAD-BACKEND.md).
+
 ## License
 
 MIT — see [LICENSE](LICENSE). A fork of

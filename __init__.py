@@ -272,6 +272,41 @@ class ModelLinkerExtension:
                     self.logger.error(f"Model Linker replace_overrides error: {e}", exc_info=True)
                     return web.json_response({'success': False, 'error': str(e)}, status=500)
 
+            @routes.post("/model_linker/reveal")
+            async def reveal_model(request):
+                """
+                Open the file manager on the machine running ComfyUI, with the
+                named model selected.
+
+                Restricted to requests from the same machine: a file manager
+                window on the server is of no use to a remote user, and is an
+                unwelcome surprise for anyone sitting at it. `core.reveal`
+                handles the rest - the client names a model by category and
+                filename and never supplies a path.
+                """
+                try:
+                    from .core.reveal import locate_model, reveal
+
+                    if request.remote not in ('127.0.0.1', '::1', 'localhost'):
+                        return web.json_response(
+                            {'success': False,
+                             'error': 'Only available when ComfyUI runs on this machine'},
+                            status=403)
+
+                    data = await request.json()
+                    path, problem = locate_model((data or {}).get('category'),
+                                                 (data or {}).get('filename'))
+                    if problem:
+                        return web.json_response({'success': False, 'error': problem}, status=404)
+
+                    opened, problem = reveal(path)
+                    if not opened:
+                        return web.json_response({'success': False, 'error': problem}, status=500)
+                    return web.json_response({'success': True})
+                except Exception as e:
+                    self.logger.error(f"Model Linker reveal error: {e}", exc_info=True)
+                    return web.json_response({'success': False, 'error': str(e)}, status=500)
+
             @routes.get("/model_linker/preview")
             async def get_model_preview(request):
                 """Return a preview image/video for a model if one exists alongside it."""

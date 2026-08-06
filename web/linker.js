@@ -580,9 +580,11 @@ class LinkerManagerDialog {
             const orig = (r.original_path || '').toString();
             const rmId = `queue-remove-${i}`;
             html += `<div style="border:1px solid var(--border-color); border-radius:4px; padding:6px; background: rgba(255,255,255,0.02);">`;
-            html += `<div style="font-weight:600;">${nodeLabel} #${r.node_id}</div>`;
-            html += `<div style="font-size:12px; opacity:0.9;">Original: <code>${orig}</code></div>`;
-            html += `<div style="font-size:12px;">Selected: <code>${label}</code></div>`;
+            // Node type, original path and model names all come from the
+            // workflow file, which may have been downloaded from anywhere
+            html += `<div style="font-weight:600;">${escapeHtml(nodeLabel)} #${escapeHtml(r.node_id)}</div>`;
+            html += `<div style="font-size:12px; opacity:0.9;">Original: <code>${escapeHtml(orig)}</code></div>`;
+            html += `<div style="font-size:12px;">Selected: <code>${escapeHtml(label)}</code></div>`;
             html += `<div style="margin-top:6px;"><button id="${rmId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Remove</button></div>`;
 
         }
@@ -713,6 +715,11 @@ class LinkerManagerDialog {
 
     close() {
         this._hidePreview();
+        // Nothing is waiting for the answer any more
+        if (this.analyzeAbort) {
+            this.analyzeAbort.abort();
+            this.analyzeAbort = null;
+        }
         this.element.style.display = "none";
     }
 
@@ -1045,7 +1052,14 @@ class LinkerManagerDialog {
     async loadWorkflowData(workflow = null) {
         if (!this.contentElement) return;
 
-        // Show loading state
+        // Reopening the dialog or hitting Refresh while an analysis is in
+        // flight starts a second one. Without this, both complete and whichever
+        // *arrives* last wins - which is not necessarily the one describing the
+        // workflow now on screen. Abandon the older request instead.
+        if (this.analyzeAbort) this.analyzeAbort.abort();
+        const abort = new AbortController();
+        this.analyzeAbort = abort;
+
         this.contentElement.innerHTML = '<p>Analyzing workflow...</p>';
 
         try {
@@ -1063,7 +1077,8 @@ class LinkerManagerDialog {
             const response = await api.fetchApi('/model_linker/analyze', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ workflow })
+                body: JSON.stringify({ workflow }),
+                signal: abort.signal
             });
 
             if (!response.ok) {
@@ -1071,13 +1086,23 @@ class LinkerManagerDialog {
             }
 
             const data = await response.json();
+
+            // A newer analysis started while this one was in flight, or the
+            // dialog was closed; either way this answer is stale.
+            if (this.analyzeAbort !== abort || !this.contentElement) return;
+
             this.displayMissingModels(this.contentElement, data);
 
         } catch (error) {
+            // Superseding a request is normal, not a failure to report
+            if (error.name === 'AbortError' || this.analyzeAbort !== abort) return;
             console.error('Model Linker: Error loading workflow data:', error);
             if (this.contentElement) {
-                this.contentElement.innerHTML = `<p style="color: red;">Error: ${error.message}</p>`;
+                this.contentElement.innerHTML =
+                    `<p style="color: red;">Error: ${escapeHtml(error.message)}</p>`;
             }
+        } finally {
+            if (this.analyzeAbort === abort) this.analyzeAbort = null;
         }
     }
 
@@ -1549,11 +1574,47 @@ class LinkerManagerDialog {
         const label = model.filename || model.relative_path || queued.resolved_path || 'selected model';
         const fullPath = model.relative_path || queued.resolved_path || label;
         const removeId = `selected-remove-${refSlot(missing)}`;
-        el.innerHTML = `<strong>Selected:</strong> <code title="${fullPath}">${label}</code> <button id="${removeId}" class="model-linker-resolve-btn" style="margin-left:8px; padding: 2px 8px;">Remove</button>`;
+        const revealId = `selected-reveal-${refSlot(missing)}`;
+        el.innerHTML = `<strong>Selected:</strong> <code title="${escapeHtml(fullPath)}">${escapeHtml(label)}</code>`
+            + ` <button id="${revealId}" class="model-linker-resolve-btn" style="margin-left:8px; padding: 2px 8px;" title="Show this file in the file manager on the machine running ComfyUI">📂 Folder</button>`
+            + ` <button id="${removeId}" class="model-linker-resolve-btn" style="margin-left:4px; padding: 2px 8px;">Remove</button>`;
         el.style.display = '';
         const btn = document.getElementById(removeId);
         if (btn) {
             btn.onclick = () => this.removeQueuedResolution(missing);
+        }
+        const revealBtn = document.getElementById(revealId);
+        if (revealBtn) {
+            revealBtn.onclick = () => this.revealModel(model);
+        }
+    }
+
+    /**
+     * Ask the server to open its file manager with this model selected.
+     *
+     * Only meaningful when ComfyUI runs on the machine you are sitting at; the
+     * route refuses anything else, and the refusal is reported as-is rather
+     * than dressed up as a failure.
+     */
+    async revealModel(model) {
+        const category = model?.category;
+        const filename = model?.relative_path || model?.filename;
+        if (!category || !filename) {
+            this.showNotification('Nothing to show for this model', 'error');
+            return;
+        }
+        try {
+            const response = await api.fetchApi('/model_linker/reveal', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ category, filename }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!result.success) {
+                this.showNotification(result.error || 'Could not open the folder', 'error');
+            }
+        } catch (error) {
+            this.showNotification(`Could not open the folder: ${error.message}`, 'error');
         }
     }
 

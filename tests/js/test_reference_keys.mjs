@@ -1,13 +1,13 @@
 // A model reference is identified by (node_id, widget_index, list_index,
 // subgraph_id). Several loras share one node and one widget index, so ignoring
 // list_index collides them: picking a replacement for one would target another.
-import { createChecker, loadPrivates, readSource } from './harness.mjs';
+import { createChecker, loadModule, readSource } from './harness.mjs';
 
 export const name = 'reference identity';
 
 export default async function run() {
   const check = createChecker(name);
-  const { refSlot, refKey } = loadPrivates(['refSlot', 'refKey']);
+  const { refSlot, refKey } = await loadModule('modules/util.js');
 
   const lora = (listIndex) => ({ node_id: 7, widget_index: 1, list_index: listIndex,
                                  subgraph_id: null, is_top_level: true });
@@ -35,7 +35,7 @@ export default async function run() {
         /^[\w-]+$/.test(String(refSlot(lora(1)))), String(refSlot(lora(1))));
 
   // Building these by hand is what caused the collisions in the first place
-  const source = readSource();
+  const source = readSource('modules/linker-dialog.js');
   const handBuilt = source.match(
     /`[^`]*\$\{(?:missing|r|resolution)\.node_id\}[^`]*\$\{(?:missing|r|resolution)\.widget_index\}[^`]*`/g) || [];
   check('per-reference ids and keys all go through refSlot/refKey',

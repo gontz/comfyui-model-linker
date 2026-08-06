@@ -1,13 +1,13 @@
 // What the replacement picker will show. Media files and sidecars are not
 // replacements for a missing model, and offering one lets it be written into
 // the workflow.
-import { createChecker, loadPrivates } from './harness.mjs';
+import { createChecker, loadModule } from './harness.mjs';
 
 export const name = 'model picker filtering';
 
 export default async function run() {
   const check = createChecker(name);
-  const { isSelectableModel } = loadPrivates(['isSelectableModel']);
+  const { isSelectableModel } = await loadModule('modules/util.js');
 
   const rejected = ['a.jpg', 'a.jpeg', 'a.png', 'a.webp', 'a.gif', 'a.bmp', 'a.avif',
                     'a.mp4', 'a.webm', 'a.mov', 'a.avi', 'a.mkv',

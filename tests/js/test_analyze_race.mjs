@@ -8,7 +8,7 @@ export const name = 'overlapping analyses';
 
 export default async function run() {
   const check = createChecker(name);
-  const source = readSource();
+  const source = readSource('modules/linker-dialog.js');
 
   // Bounded by the next method's doc comment, not by the first mention of
   // getCurrentWorkflow - the method calls that itself, well before the fetch.

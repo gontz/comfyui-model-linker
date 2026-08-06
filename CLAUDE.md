@@ -25,7 +25,7 @@ This is **not** a custom node — it provides no `NODE_CLASS_MAPPINGS`. It regis
 
 ### Data Flow
 ```
-Frontend (linker.js) → POST /model_linker/analyze → core/linker.py
+Frontend (web/modules/linker-dialog.js) → POST /model_linker/analyze → core/linker.py
   → workflow_analyzer.py extracts model refs from all nodes (including subgraphs)
   → scanner.py finds available models via ComfyUI's folder_paths
   → matcher.py fuzzy-matches missing models to available ones
@@ -51,7 +51,7 @@ Frontend → POST /model_linker/resolve → core/linker.py
 | `core/node_adapters.py` | Per-node-pack readers for references stored in non-standard shapes |
 | `core/workflow_updater.py` | Patches `widgets_values` in workflow nodes, supports subgraph nodes |
 | `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections |
-| `web/linker.js` | Full frontend: modal dialog, model search/dropdown, overrides manager |
+| `web/linker.js` | Frontend entry point; the dialog and helpers live in `web/modules/` |
 
 ### API Routes
 
@@ -63,6 +63,13 @@ All routes are prefixed `/model_linker/`:
 - `POST /overrides/delete` — delete single override by key
 - `POST /overrides/clear` — clear all overrides
 - `POST /overrides/replace` — replace entire overrides document
+- `GET /preview` — preview image/video sitting alongside a model
+- `POST /reveal` — open the file manager with a model selected (see `core/reveal.py`)
+
+Both `/preview` and `/reveal` take a **category and filename, never a path**, and confirm
+the resolved file sits inside a directory registered for that category. `/reveal` runs a
+program on the host, so it additionally refuses any request that did not come from this
+machine.
 
 ## Critical Conventions
 
@@ -172,14 +179,32 @@ models. **`name` is the model filename** (the widget's value), not the input nam
 up by value. It supplies the authoritative category, and a download URL for models that no
 longer exist anywhere on disk.
 
-### Frontend (linker.js)
+### Frontend (`web/`)
+ES modules, served by ComfyUI from `WEB_DIRECTORY` — subdirectories included, so relative
+imports work with no build step. Import paths climb one level further from `web/modules/`:
+`../../../scripts/app.js`.
+
+| File | Responsibility |
+|---|---|
+| `web/linker.js` | Entry point only: `registerExtension`, and opening the dialog |
+| `web/modules/linker-dialog.js` | The main dialog: missing models, suggestions, model picker |
+| `web/modules/overrides-dialog.js` | The saved-overrides manager |
+| `web/modules/util.js` | `escapeHtml`, `safeHttpUrl`, `refSlot`/`refKey`, `isSelectableModel`, `notifyError` |
+| `web/modules/dom.js` | `$el` |
+
 - `$el()` is defined **locally**; `scripts/ui.js` is deprecated (announced for removal in
   frontend v1.34) and must not be imported. Only `scripts/app.js` and `scripts/api.js` are
 - Registers `commands`, `menuCommands`, `keybindings`, `settings` and `getCanvasMenuItems`.
   Never scrape the DOM for a place to inject UI — the frontend is Vue-rendered
 - Use `app.extensionManager.toast` for errors, never `alert()`/`confirm()` (they block the page)
-- Values interpolated into HTML come from workflow files and are untrusted: escape with
-  `escapeHtml()`, and pass URLs through `safeHttpUrl()`
+- **Escape everything interpolated into HTML.** Model names, node types and original paths
+  all come from the workflow file, which may have been downloaded from anywhere. This holds
+  for saved overrides too — an override *records* a workflow-supplied name, so the overrides
+  manager renders untrusted text however local the file looks. Use `escapeHtml()`, and pass
+  URLs through `safeHttpUrl()`
+- Only one analysis may render: a new one aborts the request in flight, and a superseded
+  answer is discarded. Without that, two overlapping analyses both complete and whichever
+  *arrives* last wins
 - CSS is scoped with specific IDs/classes prefixed `model-linker-` to avoid ComfyUI style conflicts
 - Modal position/size persists via `localStorage`
 

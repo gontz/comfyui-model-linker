@@ -32,7 +32,8 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `test_adapters.py` | node packs storing references in their own shape |
 | `test_updater.py` | patching paths back in, including into subgraph definitions |
 | `test_overrides.py` | persisted user selections |
-| `js/` | `web/linker.js`: registration, escaping, picker filtering, reference identity |
+| `test_reveal.py` | opening the file manager: what it refuses, and how it launches |
+| `js/` | `web/`: registration, escaping, picker filtering, reference identity, overlapping analyses |
 
 `support.py` holds the fixtures. `LibraryTestCase` gives each test a temporary
 `models/` tree wired into the fake `folder_paths`; `add_models` creates files
@@ -49,8 +50,11 @@ categories at one directory without a link.
   invariant that must hold everywhere needs `alias_category` as well.
 - **Say what the invariant is, not what the code does.** These tests exist to
   survive a rewrite of the thing they cover.
-- **The frontend harness reads `web/linker.js` at its real path every run.** An
-  earlier version imported a copy and went on reporting a setting as registered
-  after it had been deleted. Do not reintroduce a checked-in copy.
+- **The frontend harness copies the live `web/` tree every run.** An earlier
+  version imported a stale copy and went on reporting a setting as registered
+  after it had been deleted. Do not reintroduce a checked-in copy. Use
+  `loadModule('modules/util.js')` to reach exported helpers, `loadExtension()`
+  for what gets registered, and `readAllSources()` for bans that must hold
+  across every module rather than just the entry point.
 - Assertions about source text (no `alert()`, no scraping ComfyUI's markup)
   must be anchored so they match code rather than the comments explaining it.

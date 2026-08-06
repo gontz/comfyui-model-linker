@@ -1,12 +1,15 @@
 // How the extension registers itself with the ComfyUI frontend.
-import { createChecker, loadExtension, readSource } from './harness.mjs';
+import { createChecker, loadExtension, readAllSources } from './harness.mjs';
 
 export const name = 'extension registration';
 
 export default async function run() {
   const check = createChecker(name);
   const config = await loadExtension();
-  const source = readSource();
+  // Bans on imports and blocking dialogs apply to every module, not just
+  // the entry point - splitting the file is precisely what would let one
+  // slip back in somewhere else.
+  const source = readAllSources();
 
   check('the module evaluates and registers an extension', !!config,
         config ? `name=${config.name}` : 'registerExtension was never called');

@@ -1,13 +1,13 @@
 // Values interpolated into the dialog's HTML come from workflow files, which
 // are untrusted: a workflow can be downloaded from anywhere and its model
 // names and URLs are attacker-controlled text.
-import { createChecker, loadPrivates } from './harness.mjs';
+import { createChecker, loadModule } from './harness.mjs';
 
 export const name = 'escaping untrusted workflow values';
 
 export default async function run() {
   const check = createChecker(name);
-  const { escapeHtml, safeHttpUrl } = loadPrivates(['escapeHtml', 'safeHttpUrl']);
+  const { escapeHtml, safeHttpUrl } = await loadModule('modules/util.js');
 
   check('angle brackets are escaped',
         escapeHtml('<img src=x onerror=alert(1)>') === '&lt;img src=x onerror=alert(1)&gt;');

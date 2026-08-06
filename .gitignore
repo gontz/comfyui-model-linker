@@ -29,3 +29,8 @@ Thumbs.db
 *.bak
 *.cache
 
+# Project data
+/data/
+
+# Copy of web/linker.js the frontend harness makes so its ComfyUI imports resolve
+/tests/js/stubs/extensions/

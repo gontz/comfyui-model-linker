@@ -8,6 +8,9 @@ import os
 import logging
 from typing import List, Dict, Any, Optional
 
+from .node_adapters import get_adapter
+from .node_schema import get_model_widget_categories, get_widget_category
+
 # Import folder_paths lazily - it may not be available until ComfyUI is initialized
 try:
     import folder_paths
@@ -17,7 +20,15 @@ except ImportError:
 
 
 # Common model file extensions
-MODEL_EXTENSIONS = {'.ckpt', '.pt', '.pt2', '.bin', '.pth', '.safetensors', '.pkl', '.sft', '.onnx'}
+MODEL_EXTENSIONS = {'.ckpt', '.pt', '.pt2', '.bin', '.pth', '.safetensors', '.pkl', '.sft', '.onnx', '.gguf'}
+
+# Node types that should never be scanned for model references.
+# These are note/utility nodes whose widget values may contain model filenames
+# as text content (e.g. markdown links) but are NOT actual model references.
+SKIP_NODE_TYPES = {
+    'MarkdownNote', 'Note', 'NoteNode', 'TextNote',
+    'Reroute', 'PrimitiveNode',
+}
 
 # Mapping of common node types to their expected model category
 # This is used as hints but we don't rely solely on this
@@ -32,11 +43,63 @@ NODE_TYPE_TO_CATEGORY_HINTS = {
     'UNETLoader': 'diffusion_models',  # UNETLoader uses diffusion_models category
     'ControlNetLoader': 'controlnet',
     'ControlNetLoaderAdvanced': 'controlnet',
+    'CLIPLoader': 'text_encoders',
+    'DualCLIPLoader': 'text_encoders',
+    'TripleCLIPLoader': 'text_encoders',
     'CLIPVisionLoader': 'clip_vision',
     'UpscaleModelLoader': 'upscale_models',
+    'LatentUpscaleModelLoader': 'latent_upscale_models',
+    'StyleModelLoader': 'style_models',
     'HypernetworkLoader': 'hypernetworks',
     'EmbeddingLoader': 'embeddings',
+    'Power Lora Loader (rgthree)': 'loras',
+    # LTX-Video nodes
+    'LTXVAudioVAELoader': 'checkpoints',
+    'LowVRAMAudioVAELoader': 'checkpoints',
+    'LTXVGemmaCLIPModelLoader': 'text_encoders',
 }
+
+# Keys within dict-type widget values that contain model file references.
+# Some nodes (e.g. rgthree Power Lora Loader) store model info as objects like
+# {"on": true, "lora": "name.safetensors", "strength": 1.0} inside widgets_values.
+# Maps nested key name -> category hint.
+NESTED_MODEL_KEYS = {
+    'lora': 'loras',
+    'ckpt_name': 'checkpoints',
+    'checkpoint': 'checkpoints',
+    'vae_name': 'vae',
+    'control_net_name': 'controlnet',
+}
+
+
+def _basename(value: str) -> str:
+    """Filename portion of a stored model reference, for either separator style."""
+    return value.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
+
+
+def _lookup_model_metadata(model_metadata: Dict[str, Dict[str, Any]], value: str) -> Optional[Dict[str, Any]]:
+    """Find the properties.models entry describing a stored widget value."""
+    if not model_metadata or not isinstance(value, str):
+        return None
+    return model_metadata.get(value) or model_metadata.get(_basename(value))
+
+
+def _source_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Pull the origin details a workflow records for a model it references.
+
+    The download URL matters most when a model is missing and nothing on disk
+    resembles it: fuzzy matching has nothing to offer, but the workflow still
+    says where the file came from. The hash is recorded by newer frontends and
+    identifies the file exactly, independent of what it was named.
+    """
+    if not metadata:
+        return {'source_url': None, 'source_hash': None, 'source_hash_type': None}
+    return {
+        'source_url': metadata.get('url') or None,
+        'source_hash': metadata.get('hash') or None,
+        'source_hash_type': metadata.get('hash_type') or None,
+    }
 
 
 def is_model_filename(value: Any) -> bool:
@@ -104,22 +167,80 @@ def try_resolve_model_path(value: str, categories: List[str] = None) -> Optional
     return None
 
 
+def resolve_model_reference(
+    value: str,
+    category: Optional[str],
+    extension_less: bool = False
+) -> Optional[tuple]:
+    """
+    Resolve a stored reference to a file on disk.
+
+    Args:
+        value: the reference as the workflow stores it
+        category: folder category to search, when known
+        extension_less: the reference omits the file extension, as the Lora
+            Manager pack stores it. Such a value cannot be handed to
+            folder_paths directly, so the extension is put back by matching
+            against the category's listing.
+
+    Returns:
+        (category, full_path) when found, None otherwise.
+    """
+    if not extension_less:
+        return try_resolve_model_path(value, [category] if category else None)
+
+    global folder_paths
+    if folder_paths is None:
+        try:
+            import folder_paths as fp
+            folder_paths = fp
+        except ImportError:
+            return None
+
+    wanted = value.strip().replace('\\', '/').lower()
+    wanted_base = wanted.rsplit('/', 1)[-1]
+
+    for candidate_category in ([category] if category else list(folder_paths.folder_names_and_paths.keys())):
+        try:
+            listing = folder_paths.get_filename_list(candidate_category)
+        except Exception:
+            continue
+        for entry in listing:
+            normalized = entry.replace('\\', '/').lower()
+            stem = os.path.splitext(normalized)[0]
+            # Accept either the full relative path or just the filename, which
+            # is how the pack's own lookup behaves
+            if stem == wanted or os.path.basename(stem) == wanted_base:
+                try:
+                    full_path = folder_paths.get_full_path(candidate_category, entry)
+                except Exception:
+                    continue
+                if full_path and os.path.exists(full_path):
+                    return (candidate_category, full_path)
+    return None
+
+
 def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Extract model references from a single node.
-    
+
     This scans all widgets_values entries and tries to identify which ones
     are model file references by attempting to resolve them.
-    
+
+    Handles both array and dict formats for widgets_values (newer ComfyUI
+    frontends may serialize widgets_values as an object with named keys).
+
+    Uses properties.models (when available) for accurate category detection.
+
     Args:
         node: Node dictionary from workflow JSON
-        
+
     Returns:
         List of model reference dictionaries:
         {
             'node_id': node id,
             'node_type': node type,
-            'widget_index': index in widgets_values,
+            'widget_index': index in widgets_values (int for array, str for dict),
             'original_path': original path from workflow,
             'category': model category (if found),
             'exists': True if model exists
@@ -128,43 +249,145 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     model_refs = []
     node_id = node.get('id')
     node_type = node.get('type', '')
-    widgets_values = node.get('widgets_values', [])
-    
+
+    # Skip note/markdown/utility node types that don't contain model references
+    if node_type in SKIP_NODE_TYPES:
+        return model_refs
+
+    widgets_values = node.get('widgets_values')
     if not widgets_values:
         return model_refs
-    
-    # Get category hints for this node type
+
+    # Node packs that store references in their own shape are read by an adapter
+    adapter = get_adapter(node_type)
+    if adapter is not None:
+        for ref in adapter.extract(node):
+            ref['adapter_id'] = adapter.adapter_id
+            resolved = resolve_model_reference(
+                ref['original_path'], ref.get('category'), ref.get('extension_less', False)
+            )
+            if resolved:
+                ref['category'], ref['full_path'] = resolved
+                ref['exists'] = True
+            model_refs.append(ref)
+        return model_refs
+
+    # Category hint for this node type. The hand-written table is only a
+    # fallback now - node_schema asks the installed node class which folder each
+    # widget loads from, which covers custom nodes the table has never seen.
     category_hint = NODE_TYPE_TO_CATEGORY_HINTS.get(node_type)
-    categories_to_try = [category_hint] if category_hint else None
-    
-    # For each widget value, check if it looks like a model file
-    for idx, value in enumerate(widgets_values):
-        if not is_model_filename(value):
+    schema_categories = get_model_widget_categories(node_type)
+    if not category_hint and len(schema_categories) == 1:
+        # A loader with a single model widget: unambiguous whatever the layout
+        category_hint = next(iter(schema_categories.values()))
+
+    # Build a lookup from properties.models, which recent frontends attach to
+    # nodes that reference models. Entries look like:
+    #   {"name": "flux1-dev.safetensors", "url": "https://...", "directory": "diffusion_models"}
+    # and optionally carry "hash"/"hash_type".
+    #
+    # `name` is the model FILENAME - the value stored in the widget - not the
+    # input name, so this is keyed by value and looked up per widget value below.
+    # Entries are indexed by bare filename too, so a widget holding
+    # "subfolder/model.safetensors" still finds its metadata.
+    properties_models = (node.get('properties') or {}).get('models') or []
+    model_metadata: Dict[str, Dict[str, Any]] = {}
+    for pm in properties_models:
+        if not isinstance(pm, dict):
             continue
-        
-        # Try to resolve the model path
-        resolved = try_resolve_model_path(value, categories_to_try)
-        
-        if resolved:
-            category, full_path = resolved
-            exists = os.path.exists(full_path)
-        else:
-            # If we can't resolve it, check if it at least looks like a model filename
-            # This might be a missing model or a custom node's model
-            category = category_hint or 'unknown'
-            full_path = None
-            exists = False
-        
-        model_refs.append({
-            'node_id': node_id,
-            'node_type': node_type,
-            'widget_index': idx,
-            'original_path': value,
-            'category': category,
-            'full_path': full_path,
-            'exists': exists
-        })
-    
+        name = pm.get('name')
+        if not isinstance(name, str) or not name:
+            continue
+        model_metadata[name] = pm
+        model_metadata.setdefault(_basename(name), pm)
+
+    # Handle both array and dict format for widgets_values
+    if isinstance(widgets_values, dict):
+        items = list(widgets_values.items())  # [(key, value), ...]
+    elif isinstance(widgets_values, (list, tuple)):
+        items = list(enumerate(widgets_values))  # [(index, value), ...]
+    else:
+        return model_refs
+
+    for idx, value in items:
+        # Case 1: Direct string value — detected either by file extension
+        # or by properties.models declaring this exact value to be a model
+        if isinstance(value, str) and value.strip():
+            metadata = _lookup_model_metadata(model_metadata, value)
+            declared_category = (metadata or {}).get('directory') or None
+
+            # What the node class says this particular widget loads from. More
+            # precise than the node-level hint on nodes with several model
+            # widgets, e.g. DualCLIPLoader's clip_name1/clip_name2.
+            widget_category = get_widget_category(node_type, idx)
+
+            has_model_ext = is_model_filename(value)
+            is_declared_model = metadata is not None or widget_category is not None
+
+            if has_model_ext or is_declared_model:
+                # Best category: workflow metadata > this widget's declared
+                # folder > node type hint > search everything
+                value_category = declared_category or widget_category or category_hint
+                categories_to_try = [value_category] if value_category else None
+
+                # Try to resolve the model path
+                resolved = try_resolve_model_path(value, categories_to_try)
+
+                if resolved:
+                    category, full_path = resolved
+                    exists = os.path.exists(full_path)
+                else:
+                    category = value_category or 'unknown'
+                    full_path = None
+                    exists = False
+
+                model_refs.append({
+                    'node_id': node_id,
+                    'node_type': node_type,
+                    'widget_index': idx,
+                    'original_path': value,
+                    'category': category,
+                    'full_path': full_path,
+                    'exists': exists,
+                    'nested_key': None,
+                    **_source_metadata(metadata)
+                })
+                continue
+
+        # Case 2: Dict value containing a model reference key
+        # e.g. {"on": true, "lora": "name.safetensors", "strength": 1.0}
+        if isinstance(value, dict):
+            for nested_key, nested_category_hint in NESTED_MODEL_KEYS.items():
+                nested_value = value.get(nested_key)
+                if not nested_value or not is_model_filename(nested_value):
+                    continue
+
+                metadata = _lookup_model_metadata(model_metadata, nested_value)
+                value_category = (metadata or {}).get('directory') or nested_category_hint or category_hint
+                categories_to_try = [value_category] if value_category else None
+
+                resolved = try_resolve_model_path(nested_value, categories_to_try)
+
+                if resolved:
+                    category, full_path = resolved
+                    exists = os.path.exists(full_path)
+                else:
+                    category = value_category or 'unknown'
+                    full_path = None
+                    exists = False
+
+                model_refs.append({
+                    'node_id': node_id,
+                    'node_type': node_type,
+                    'widget_index': idx,
+                    'original_path': nested_value,
+                    'category': category,
+                    'full_path': full_path,
+                    'exists': exists,
+                    'nested_key': nested_key,
+                    **_source_metadata(metadata)
+                })
+
     return model_refs
 
 

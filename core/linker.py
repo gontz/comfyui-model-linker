@@ -5,25 +5,133 @@ Integrates all components to provide high-level API for model linking.
 """
 
 import os
-import re
 import json
 import logging
-from typing import Dict, Any, List, Optional, Tuple
+import re
 from urllib.parse import unquote
+from typing import Dict, Any, List, Optional, Tuple
 
+from .categories import canonical_category
 from .scanner import get_model_files
 from .workflow_analyzer import analyze_workflow_models, identify_missing_models
 from .matcher import find_matches
 from .workflow_updater import update_workflow_nodes
+from .overrides import find_override_model
 
-logger = logging.getLogger(__name__)
 
-# Regex patterns for URL extraction (matches HuggingFace and CivitAI URLs)
-URL_PATTERN = re.compile(r'(https?://(?:huggingface\.co|civitai\.com)[^\s"\'<>\)\\]+)')
+def physical_file_key(model: Dict[str, Any]) -> str:
+    """
+    Identity of the physical file a catalogued model entry points at.
 
-# Model file extensions to look for
-MODEL_EXTENSIONS = ('.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.onnx')
+    Uses the scanner's resolved `real_path` so entries reached through
+    junctioned/symlinked category directories collapse together. Falls back to
+    `path` for entries from older callers that predate `real_path`.
+    """
+    path = model.get('real_path') or model.get('path') or ''
+    if not path:
+        return ''
+    try:
+        return os.path.normcase(os.path.normpath(path))
+    except Exception:
+        return path
 
+
+def group_models_by_physical_file(models: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Group catalogued models by the physical file behind them.
+
+    One file is catalogued once per category whose directory reaches it, and
+    those directories are often links to a single shared folder - so the same
+    model can appear a dozen times under different category names and paths.
+    Grouping here lets each physical file be scored and shown exactly once.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for model in models:
+        groups.setdefault(physical_file_key(model), []).append(model)
+    return groups
+
+
+def select_candidates(groups: Dict[str, List[Dict[str, Any]]], category: Optional[str]) -> List[Dict[str, Any]]:
+    """
+    Pick one candidate per physical file for a given target category.
+
+    Where a file is catalogued under several categories, prefer the entry whose
+    category matches the one the node expects, so the relative path written back
+    into the workflow resolves against that loader's folder.
+
+    Entries in the preferred category are returned first. find_matches sorts by
+    score with a stable sort, so candidates that score equally keep this order.
+    """
+    preferred: List[Dict[str, Any]] = []
+    others: List[Dict[str, Any]] = []
+
+    want_category = canonical_category(category)
+
+    for entries in groups.values():
+        chosen = None
+        if want_category:
+            # Prefer an exact category name, then any alias of it, so a node
+            # expecting `diffusion_models` takes that entry over the `unet` one
+            # while still finding the model when only the alias was catalogued.
+            for entry in entries:
+                if entry.get('category') == category:
+                    chosen = entry
+                    break
+            else:
+                for entry in entries:
+                    if canonical_category(entry.get('category')) == want_category:
+                        chosen = entry
+                        break
+        if chosen is not None:
+            preferred.append(chosen)
+        else:
+            others.append(entries[0])
+
+    return preferred + others
+
+
+def list_available_models() -> List[Dict[str, Any]]:
+    """
+    Catalogue for the UI's model picker.
+
+    Entries keep their category: the category decides which folder the written
+    path is resolved against, so a file reachable under several categories stays
+    listed once per category rather than being collapsed to one row. Only exact
+    duplicates within a single category are dropped - the same physical file
+    reached through two directories configured for that category.
+
+    Each entry carries a `file_id` shared by every row pointing at the same
+    physical file. Where whole category folders are links to one directory, the
+    same model is catalogued under each of them, sometimes with a different
+    relative path depending on which root it was reached from - so the id is the
+    only reliable way for the picker to tell those rows apart from genuinely
+    different files. The resolved path itself is stripped, being both large and
+    of no use to the UI.
+    """
+    seen = set()
+    file_ids: Dict[str, int] = {}
+    listing: List[Dict[str, Any]] = []
+
+    for model in get_model_files():
+        file_key = physical_file_key(model)
+        key = (file_key, model.get('category'))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        entry = {k: v for k, v in model.items() if k not in ('real_path', '_norm')}
+        entry['file_id'] = file_ids.setdefault(file_key, len(file_ids))
+        # The picker scopes on this rather than the raw name, so a node loading
+        # from `text_encoders` still sees models catalogued under `clip`.
+        entry['canonical_category'] = canonical_category(model.get('category'))
+        listing.append(entry)
+
+    return listing
+
+
+# ---------------------------------------------------------------------------
+# Download-source helpers, from upstream. Unused at present, kept intact.
+# ---------------------------------------------------------------------------
 
 def extract_workflow_urls(workflow_json: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """
@@ -182,8 +290,6 @@ def analyze_and_find_matches(
                     'widget_index': widget index,
                     'original_path': original path from workflow,
                     'category': model category,
-                    'workflow_url': URL from workflow if found,
-                    'workflow_directory': directory from workflow if found,
                     'matches': [
                         {
                             'model': model dict from scanner,
@@ -200,30 +306,19 @@ def analyze_and_find_matches(
             'total_models_analyzed': count of all models in workflow
         }
     """
-    # Extract URLs from workflow (node.properties.models + regex)
-    workflow_urls = extract_workflow_urls(workflow_json)
-    logger.debug(f"Extracted {len(workflow_urls)} URLs from workflow")
-    
     # Analyze workflow to find all model references
     all_model_refs = analyze_workflow_models(workflow_json)
     
     # Get available models
     available_models = get_model_files()
-    
+
+    # Collapse link aliases up front so each physical file is scored once
+    # instead of once per category directory that happens to reach it.
+    model_groups = group_models_by_physical_file(available_models)
+
     # Identify missing models
     missing_models = identify_missing_models(all_model_refs, available_models)
-    
-    # Enrich missing models with workflow URLs
-    for missing in missing_models:
-        original_path = missing.get('original_path', '')
-        filename = os.path.basename(original_path)
-        
-        if filename in workflow_urls:
-            url_info = workflow_urls[filename]
-            missing['workflow_url'] = url_info.get('url', '')
-            missing['workflow_directory'] = url_info.get('directory', '')
-            missing['url_source'] = url_info.get('source', '')
-    
+
     # Find matches for each missing model
     missing_with_matches = []
     for missing in missing_models:
@@ -240,57 +335,110 @@ def analyze_and_find_matches(
             node_type = missing.get('node_type', '')
             category = NODE_TYPE_TO_CATEGORY_HINTS.get(node_type, 'unknown')
         
-        candidates = available_models
-        if category and category != 'unknown':
-            # Prioritize models from the same category
-            candidates = [m for m in available_models if m.get('category') == category]
-            # Also include other categories as fallback
-            candidates.extend([m for m in available_models if m.get('category') != category])
-        
-        # Find matches
+        # One candidate per physical file, entries in the expected category first
+        candidates = select_candidates(model_groups, category)
+
+        # First: compute fuzzy matches as usual
         matches = find_matches(
             original_path,
             candidates,
             threshold=similarity_threshold,
-            max_results=max_matches_per_model
+            max_results=max_matches_per_model,
+            preferred_category=category if category != 'unknown' else None
         )
+
+        # Then: check if user has a saved override; inject it as a 99% match (not 100%)
+        override_model = find_override_model(original_path, category, available_models)
+        if override_model is not None:
+            override_key = physical_file_key(override_model)
+            # Check if already present in matches
+            found = None
+            for m in matches:
+                key = physical_file_key(m.get('model', {}))
+                if key and key == override_key:
+                    found = m
+                    break
+            if found:
+                # Boost to 100% and mark as override
+                found['similarity'] = 1.0
+                found['confidence'] = 100.0
+                found['is_override'] = True
+                matches.remove(found)
+                override_match = found
+            else:
+                override_match = {
+                    'model': override_model,
+                    'filename': override_model.get('filename'),
+                    'similarity': 1.0,
+                    'confidence': 100.0,
+                    'is_override': True,
+                }
+            # A remembered choice leads, whatever it scores on name alone - the
+            # whole point of saving it is that the user already settled this.
+            # Placed rather than sorted: re-sorting by confidence would undo the
+            # category preference find_matches deliberately established.
+            matches.insert(0, override_match)
         
-        # Deduplicate matches by absolute path - same physical file should only appear once
-        # This handles cases where the same file exists in multiple base directories
-        # or has different relative_paths but is the same file
-        seen_absolute_paths = {}
+        # Safety net: the candidate pool is already one entry per physical file,
+        # but an injected override can collide with a match, so collapse again on
+        # the same physical-file identity and keep the higher-confidence entry.
+        seen_files = {}
         deduplicated_matches = []
         for match in matches:
-            model_dict = match['model']
-            absolute_path = model_dict.get('path', '')
-            
-            # Normalize absolute path for comparison
-            if absolute_path:
-                absolute_path = os.path.normpath(absolute_path)
-            
-            # If we haven't seen this absolute path, add it
-            if absolute_path not in seen_absolute_paths:
-                seen_absolute_paths[absolute_path] = match
+            file_key = physical_file_key(match['model'])
+
+            if file_key not in seen_files:
+                seen_files[file_key] = match
                 deduplicated_matches.append(match)
             else:
-                # If we've seen this absolute path before, replace with better match if confidence is higher
-                existing_match = seen_absolute_paths[absolute_path]
+                existing_match = seen_files[file_key]
                 if match['confidence'] > existing_match['confidence']:
-                    # Replace with better match
                     idx = deduplicated_matches.index(existing_match)
                     deduplicated_matches[idx] = match
-                    seen_absolute_paths[absolute_path] = match
-        
+                    seen_files[file_key] = match
+
         missing_with_matches.append({
             **missing,
+            'category': category,
+            'canonical_category': canonical_category(category),
             'matches': deduplicated_matches
         })
     
     return {
         'missing_models': missing_with_matches,
+        'present_models': summarize_present_models(all_model_refs),
         'total_missing': len(missing_with_matches),
         'total_models_analyzed': len(all_model_refs)
     }
+
+
+# Fields worth sending for a model that is present. The rest of a reference is
+# either only needed to write a replacement back or is large and of no use.
+_PRESENT_MODEL_FIELDS = (
+    'node_id', 'node_type', 'widget_index', 'original_path', 'category',
+    'nested_key', 'list_index', 'adapter_id',
+    'subgraph_id', 'subgraph_name', 'is_top_level',
+)
+
+
+def summarize_present_models(model_refs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    The models a workflow uses that were found on disk.
+
+    The analysis already walks every reference to work out which are missing,
+    so reporting the ones that resolved costs nothing extra and answers the
+    question the missing list cannot: what is this workflow actually loading,
+    and from which folder. Useful for confirming a relink landed where it
+    should, and for spotting a model resolving out of an unexpected category.
+    """
+    present = []
+    for ref in model_refs:
+        if not ref.get('exists'):
+            continue
+        entry = {key: ref.get(key) for key in _PRESENT_MODEL_FIELDS if key in ref}
+        entry['canonical_category'] = canonical_category(ref.get('category'))
+        present.append(entry)
+    return present
 
 
 def apply_resolution(
@@ -324,7 +472,10 @@ def apply_resolution(
             'category': resolution.get('category'),
             'resolved_model': resolution.get('resolved_model'),
             'subgraph_id': resolution.get('subgraph_id'),  # Include subgraph_id for subgraph nodes
-            'is_top_level': resolution.get('is_top_level')  # True for top-level nodes, False for nodes in subgraph definitions
+            'is_top_level': resolution.get('is_top_level'),  # True for top-level nodes, False for nodes in subgraph definitions
+            'nested_key': resolution.get('nested_key'),  # For dict-type widgets (e.g. Power Lora Loader)
+            'list_index': resolution.get('list_index'),  # Position within an adapter's list of entries
+            'adapter_id': resolution.get('adapter_id'),  # Node pack that owns this reference
         }
         
         # If resolved_model provided, extract path if needed

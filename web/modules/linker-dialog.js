@@ -1,0 +1,2353 @@
+/** The main dialog: missing models, their suggestions, and the model picker. */
+
+import { app } from "../../../scripts/app.js";
+import { api } from "../../../scripts/api.js";
+
+import { $el } from "./dom.js";
+import { ManageOverridesDialog } from "./overrides-dialog.js";
+import {
+    escapeHtml,
+    isSelectableModel,
+    refKey,
+    refSlot,
+    safeHttpUrl,
+} from "./util.js";
+
+// Check if ComfyButtonGroup is available (from newer ComfyUI versions)
+let ComfyButtonGroup = null;
+try {
+    // Try to import from scripts if available
+    if (typeof window !== 'undefined') {
+        try {
+            // Some ComfyUI versions expose this globally
+            if (window.ComfyButtonGroup) {
+                ComfyButtonGroup = window.ComfyButtonGroup;
+            }
+        } catch (e) {
+            // Ignore
+        }
+    }
+} catch (e) {
+    // Fallback if ComfyButtonGroup not available
+}
+
+export class LinkerManagerDialog {
+    constructor() {
+        this.currentWorkflow = null;
+        this.missingModels = [];
+        this.allModels = null; // list of all available models for dropdown
+        this.pendingResolutions = [];
+        this.pendingIndex = new Map(); // key -> index in pendingResolutions
+        this.fullscreen = false;
+        this._dragging = false;
+        this._dragStart = null;
+
+        // Create dialog element using $el
+        this.element = $el("div.comfy-modal", {
+            id: "model-linker-modal",
+            parent: document.body,
+            style: {
+                position: "fixed",
+                top: "50%",
+                left: "50%",
+                transform: "translate(-50%, -50%)",
+                width: "900px",
+                height: "700px",
+                maxWidth: "95vw",
+                maxHeight: "95vh",
+                backgroundColor: "var(--comfy-menu-bg, #202020)",
+                color: "var(--input-text, #ffffff)",
+                border: "2px solid var(--border-color, #555555)",
+                borderRadius: "8px",
+                padding: "0",
+                zIndex: "99999",
+                boxShadow: "0 4px 20px rgba(0,0,0,0.8)",
+                display: "none",
+                flexDirection: "column",
+                resize: "both",
+                overflow: "hidden",
+                minWidth: "640px",
+                minHeight: "420px"
+            }
+        }, [
+            this.createHeader(),
+            this.createContent(),
+            this.createFooter()
+        ]);
+
+        // Inject style to reduce button font-size by 2px within this modal
+        try {
+            if (!document.getElementById('model-linker-style-buttons')) {
+                const style = $el("style", {
+                    id: 'model-linker-style-buttons',
+                    textContent: `
+                        #model-linker-modal .model-linker-resolve-btn,
+                        #model-linker-modal .comfy-button {
+                            font-size: calc(1em - 2px);
+                        }
+                    `
+                });
+                document.head.appendChild(style);
+            }
+        } catch (e) { /* ignore */ }
+
+        // Enforce modal layout to be vertical (column) regardless of ComfyUI updates
+        // and make the model search input comfortably sized
+        try {
+            if (!document.getElementById('model-linker-style-layout')) {
+                const layoutStyle = $el("style", {
+                    id: 'model-linker-style-layout',
+                    textContent: `
+                        /* Force our modals to be column-oriented flex containers */
+                        #model-linker-modal,
+                        #manage-overrides-modal {
+                            flex-direction: column !important;
+                            align-items: stretch !important;
+                            white-space: normal !important;
+                        }
+
+                        /* Ensure text wraps normally inside content */
+                        #model-linker-content, #model-linker-content * { white-space: normal !important; }
+
+                        /* Strongly enforce vertical stacking for the missing list */
+                        #model-linker-modal #model-linker-content { display: block !important; }
+                        #model-linker-modal #model-linker-missing-list {
+                            display: flex !important;
+                            flex-direction: column !important;
+                            align-items: stretch !important;
+                            gap: 16px !important;
+                        }
+                        #model-linker-modal #model-linker-missing-list > div {
+                            display: block !important;
+                        }
+                        /* Make direct children inside each missing item stack vertically */
+                        #model-linker-modal #model-linker-missing-list > div > div,
+                        #model-linker-modal #model-linker-missing-list > div > p,
+                        #model-linker-modal #model-linker-missing-list > div > ul,
+                        #model-linker-modal #model-linker-missing-list > div > li {
+                            display: block !important;
+                            width: auto !important;
+                        }
+
+                        /* Stack each missing-model section vertically while keeping internal rows */
+                        #model-linker-content div[id^="missing-"] {
+                            display: flex !important;
+                            flex-direction: column !important;
+                            align-items: stretch !important;
+                        }
+
+                        /* Ensure the body/content area can actually grow */
+                        #model-linker-modal #model-linker-body,
+                        #manage-overrides-modal { min-height: 0 !important; }
+
+                        /* Make the model search input readable and not tiny */
+                        #model-linker-modal input[id^="combo-input-"] {
+                            flex: 1 1 auto !important;
+                            min-width: 240px !important;
+                            padding: 6px 8px !important;
+                            font-size: 13px !important;
+                        }
+
+                        /* Improve the dropdown list layering and sizing */
+                        #model-linker-modal div[id^="combo-list-"] {
+                            z-index: 100000 !important;
+                            max-height: 320px !important;
+                        }
+                        /* Avoid wrapping inside dropdown labels when sizing */
+                        #model-linker-modal div[id^="combo-list-"] code {
+                            white-space: nowrap !important;
+                        }
+                    `
+                });
+                document.head.appendChild(layoutStyle);
+            }
+        } catch (e) { /* ignore */ }
+
+        // Preview tooltip styles for model image hover previews
+        try {
+            if (!document.getElementById('model-linker-style-preview')) {
+                const previewStyle = $el("style", {
+                    id: 'model-linker-style-preview',
+                    textContent: `
+                        #model-linker-preview-tooltip {
+                            position: fixed;
+                            z-index: 200000;
+                            pointer-events: none;
+                            background: var(--comfy-menu-bg, #1a1a1a);
+                            border: 1px solid var(--border-color, #555);
+                            border-radius: 6px;
+                            padding: 4px;
+                            box-shadow: 0 4px 16px rgba(0,0,0,0.7);
+                            display: none;
+                            max-width: 320px;
+                            max-height: 320px;
+                        }
+                        #model-linker-preview-tooltip img,
+                        #model-linker-preview-tooltip video {
+                            display: block;
+                            max-width: 312px;
+                            max-height: 312px;
+                            object-fit: contain;
+                            border-radius: 4px;
+                        }
+                    `
+                });
+                document.head.appendChild(previewStyle);
+            }
+        } catch (e) { /* ignore */ }
+
+        // Apply saved size if present and persist future resizes
+        try {
+            const saved = localStorage.getItem('model_linker_modal_size');
+            if (saved) {
+                const { w, h } = JSON.parse(saved);
+                if (w && h) {
+                    this.element.style.width = `${w}px`;
+                    this.element.style.height = `${h}px`;
+                }
+            }
+            // Restore last position if available
+            const savedPos = localStorage.getItem('model_linker_modal_pos');
+            if (savedPos) {
+                const { top, left } = JSON.parse(savedPos);
+                if (Number.isFinite(top) && Number.isFinite(left)) {
+                    this.element.style.top = `${top}px`;
+                    this.element.style.left = `${left}px`;
+                    this.element.style.transform = 'none';
+                }
+            }
+            // Observe size changes to persist
+            if (window.ResizeObserver) {
+                const ro = new ResizeObserver((entries) => {
+                    for (const entry of entries) {
+                        const rect = entry.target.getBoundingClientRect();
+                        const w = Math.round(rect.width);
+                        const h = Math.round(rect.height);
+                        localStorage.setItem('model_linker_modal_size', JSON.stringify({ w, h }));
+                    }
+                });
+                ro.observe(this.element);
+                this._resizeObserver = ro;
+            }
+        } catch (e) {
+            // ignore storage/observer errors
+        }
+    }
+
+    createHeader() {
+        const header = $el("div", {
+            style: {
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "20px 20px 10px 20px",
+                borderBottom: "1px solid var(--border-color)",
+                backgroundColor: "var(--comfy-menu-bg, #202020)"
+            }
+        }, [
+            $el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
+                $el("div", {
+                    id: "model-linker-drag-handle",
+                    title: "Drag window",
+                    ondragstart: (e) => e.preventDefault(),
+                    style: {
+                        cursor: "grab",
+                        userSelect: "none",
+                        border: "1px solid var(--border-color)",
+                        borderRadius: "4px",
+                        padding: "0 6px",
+                        height: "24px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        opacity: "0.9"
+                    }
+                }, [
+                    $el("span", { textContent: "⠿" })
+                ]),
+                $el("h2", {
+                    textContent: "🔗 Model Linker",
+                    style: {
+                        margin: "0",
+                        color: "var(--input-text)",
+                        fontSize: "18px",
+                        fontWeight: "600"
+                    }
+                })
+            ]),
+            $el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
+                $el("button", {
+                    id: "model-linker-overrides-btn",
+                    title: "Manage overrides",
+                    textContent: "Overrides",
+                    onclick: () => this.openOverridesManager(),
+                    style: {
+                        background: "none",
+                        border: "1px solid var(--border-color)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "2px 8px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                }),
+                $el("button", {
+                    id: "model-linker-fullscreen-toggle",
+                    title: "Toggle full screen",
+                    textContent: "⛶",
+                    onclick: () => this.toggleFullScreen(),
+                    style: {
+                        background: "none",
+                        border: "1px solid var(--border-color)",
+                        fontSize: "16px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "2px 8px",
+                        minWidth: "32px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                }),
+                $el("button", {
+                    textContent: "×",
+                    onclick: () => this.close(),
+                    style: {
+                        background: "none",
+                        border: "none",
+                        fontSize: "24px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "0",
+                        width: "30px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                })
+            ])
+        ]);
+        // Double-click header to toggle full screen
+        header.addEventListener('dblclick', () => this.toggleFullScreen());
+        // Make only the drag handle draggable
+        try {
+            const handle = header.querySelector('#model-linker-drag-handle');
+            if (handle) {
+                const onMouseDown = (e) => {
+                    if (this.fullscreen) return; // no drag in fullscreen
+                    handle.style.cursor = 'grabbing';
+                    this.startDrag(e);
+                };
+                const onMouseUpLocal = () => { handle.style.cursor = 'grab'; };
+                handle.addEventListener('mousedown', onMouseDown);
+                document.addEventListener('mouseup', onMouseUpLocal);
+                this._dragHandleMouseDown = onMouseDown;
+                this._dragHandleMouseUp = onMouseUpLocal;
+            }
+        } catch (e) { /* ignore */ }
+        return header;
+    }
+
+    createContent() {
+        // Wrap the body in a two-column layout: left = items, right = queued panel
+        const body = $el("div", {
+            id: "model-linker-body",
+            style: {
+                display: "flex",
+                gap: "12px",
+                padding: "16px",
+                flex: "1",
+                minHeight: "0",
+                alignItems: "stretch",
+                position: "relative"
+            }
+        });
+
+        this.contentElement = $el("div", {
+            id: "model-linker-content",
+            style: {
+                overflowY: "auto",
+                flex: "1",
+                minHeight: "0"
+            }
+        });
+
+        this.queueElement = $el("div", {
+            id: "model-linker-queue",
+            style: {
+                width: "320px",
+                minWidth: "240px",
+                maxWidth: "70%",
+                borderLeft: "1px solid var(--border-color)",
+                paddingLeft: "12px",
+                display: "flex",
+                flexDirection: "column"
+            }
+        }, [
+            this.createQueuePanel()
+        ]);
+
+        // Splitter between content and queue
+        this.splitterElement = $el("div", {
+            id: "model-linker-splitter",
+            title: "Drag to resize panels",
+            style: {
+                cursor: "col-resize",
+                width: "6px",
+                minWidth: "6px",
+                background: "var(--border-color)",
+                opacity: "0.4",
+                borderRadius: "3px"
+            },
+            ondragstart: (e) => e.preventDefault()
+        });
+
+        body.appendChild(this.contentElement);
+        body.appendChild(this.splitterElement);
+        body.appendChild(this.queueElement);
+
+        // Restore saved queue width and wire splitter
+        try {
+            const savedSplit = localStorage.getItem('model_linker_split_w');
+            if (savedSplit) {
+                const w = parseInt(savedSplit, 10);
+                if (!isNaN(w) && w > 0) {
+                    this.queueElement.style.width = `${w}px`;
+                }
+            }
+        } catch (e) { }
+
+        try {
+            const onSplitMouseDown = (e) => this.startSplitDrag(e);
+            this.splitterElement.addEventListener('mousedown', onSplitMouseDown);
+            this._splitterMouseDown = onSplitMouseDown;
+        } catch (e) { }
+        // Toggle icon always visible
+        try {
+            this.queueToggleIcon = $el("button", {
+                id: "queue-toggle-icon",
+                title: "Collapse queue",
+                onclick: () => this.toggleQueueCollapsed(),
+                style: {
+                    position: "absolute",
+                    top: "50%",
+                    right: "6px",
+                    transform: "translateY(-50%)",
+                    zIndex: "1000",
+                    padding: "2px 6px",
+                    border: "1px solid var(--border-color)",
+                    borderRadius: "4px",
+                    background: "var(--comfy-input-bg, #2f2f2f)",
+                    cursor: "pointer",
+                    opacity: "0.9"
+                }
+            }, [document.createTextNode('⮜')]);
+            body.appendChild(this.queueToggleIcon);
+            this.updateQueueToggleIcon();
+        } catch (e) { }
+        // Restore queue collapsed state
+        try {
+            const col = localStorage.getItem('model_linker_queue_collapsed');
+            if (col === '1') this.setQueueCollapsed(true);
+        } catch (e) { }
+        return body;
+    }
+
+    openOverridesManager() {
+        try {
+            if (!this.overridesDialog) this.overridesDialog = new ManageOverridesDialog();
+            this.overridesDialog.show();
+        } catch (e) {
+            console.error('Model Linker: failed to open overrides dialog', e);
+        }
+    }
+
+    createQueuePanel() {
+        // Header row with title and clear button
+        this.queueHeader = $el("div", {
+            style: {
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: "8px"
+            }
+        }, [
+            $el("div", { id: "queue-title", textContent: "Queued Selections (0)", style: { fontWeight: "600" } }),
+            $el("div", { style: { display: "flex", gap: "6px" } }, [
+                $el("button", {
+                    id: "queue-toggle",
+                    className: "model-linker-resolve-btn",
+                    textContent: "Collapse",
+                    onclick: () => this.toggleQueueCollapsed(),
+                    style: { padding: "4px 8px" }
+                }),
+                $el("button", {
+                    id: "queue-clear",
+                    className: "model-linker-resolve-btn",
+                    textContent: "Clear All",
+                    onclick: () => this.clearAllQueued(),
+                    style: { padding: "4px 8px" }
+                })
+            ])
+        ]);
+
+        // Scrollable list
+        this.queueList = $el("div", {
+            id: "queue-list",
+            style: {
+                overflowY: "auto",
+                flex: "1",
+                minHeight: "0",
+                border: "1px solid var(--border-color)",
+                borderRadius: "4px",
+                padding: "8px",
+                background: "var(--comfy-input-bg, #2f2f2f)"
+            }
+        });
+
+        const panel = $el("div", { style: { display: "flex", flexDirection: "column", minHeight: "0", flex: "1 1 auto" } }, [this.queueHeader, this.queueList]);
+        return panel;
+    }
+
+    updateQueuePanel() {
+        if (!this.queueList || !this.queueHeader) return;
+        const list = Array.isArray(this.pendingResolutions) ? this.pendingResolutions : [];
+        // Update title count
+        const title = this.queueHeader.querySelector('#queue-title');
+        if (title) title.textContent = `Queued Selections (${list.length})`;
+        const toggleBtn = this.queueHeader.querySelector('#queue-toggle');
+        if (toggleBtn) toggleBtn.textContent = this.queueCollapsed ? 'Expand' : 'Collapse';
+
+        if (!list.length) {
+            this.queueList.innerHTML = '<div style="opacity:0.7;">No selections queued.</div>';
+            return;
+        }
+
+        let html = '<div style="display:flex; flex-direction:column; gap:6px;">';
+        for (let i = 0; i < list.length; i++) {
+            const r = list[i];
+            const label = (r.resolved_model?.relative_path || r.resolved_model?.filename || r.resolved_path || '').toString();
+            const nodeLabel = r.node_label || r.node_type || (r.subgraph_id ? 'Subgraph' : 'Node');
+            const orig = (r.original_path || '').toString();
+            const rmId = `queue-remove-${i}`;
+            html += `<div style="border:1px solid var(--border-color); border-radius:4px; padding:6px; background: rgba(255,255,255,0.02);">`;
+            // Node type, original path and model names all come from the
+            // workflow file, which may have been downloaded from anywhere
+            html += `<div style="font-weight:600;">${escapeHtml(nodeLabel)} #${escapeHtml(r.node_id)}</div>`;
+            html += `<div style="font-size:12px; opacity:0.9;">Original: <code>${escapeHtml(orig)}</code></div>`;
+            html += `<div style="font-size:12px;">Selected: <code>${escapeHtml(label)}</code></div>`;
+            html += `<div style="margin-top:6px;"><button id="${rmId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Remove</button></div>`;
+
+        }
+        html += '</div>';
+        this.queueList.innerHTML = html;
+
+        // Wire remove buttons
+        for (let i = 0; i < list.length; i++) {
+            const rmId = `queue-remove-${i}`;
+            const btn = this.queueList.querySelector(`#${rmId}`);
+            if (btn) {
+                btn.addEventListener('click', () => this.removeQueuedByIndex(i));
+            }
+        }
+    }
+
+    // Remove queued by index (from right panel)
+    removeQueuedByIndex(i) {
+        const list = Array.isArray(this.pendingResolutions) ? this.pendingResolutions : [];
+        if (i < 0 || i >= list.length) return;
+        const r = list[i];
+        // Remove
+        this.pendingResolutions.splice(i, 1);
+        this.rebuildPendingIndex();
+        // Update per-item selected bar
+        const m = { node_id: r.node_id, widget_index: r.widget_index, subgraph_id: r.subgraph_id, is_top_level: r.is_top_level };
+        this.updateSelectedBarForMissing(m);
+        this.updateApplyPendingButton();
+        this.updateQueuePanel();
+    }
+
+    // Clear all queued selections and hide per-item selected bars
+    clearAllQueued() {
+        this.pendingResolutions = [];
+        this.pendingIndex = new Map();
+        this.updateApplyPendingButton();
+        this.updateQueuePanel();
+        try {
+            document.querySelectorAll('.model-linker-selected').forEach(el => { el.style.display = 'none'; el.innerHTML = ''; });
+        } catch (e) { /* ignore */ }
+    }
+
+    // Collapse/expand queue panel and hide/show splitter
+    toggleQueueCollapsed() {
+        this.setQueueCollapsed(!this.queueCollapsed);
+    }
+
+    setQueueCollapsed(collapsed) {
+        this.queueCollapsed = !!collapsed;
+        if (!this.queueElement || !this.splitterElement) return;
+        if (this.queueCollapsed) {
+            this.queueElement.style.display = 'none';
+            this.splitterElement.style.display = 'none';
+            try { localStorage.setItem('model_linker_queue_collapsed', '1'); } catch (e) { }
+        } else {
+            this.queueElement.style.display = '';
+            this.splitterElement.style.display = '';
+            try { localStorage.setItem('model_linker_queue_collapsed', '0'); } catch (e) { }
+        }
+        this.updateQueuePanel();
+        this.updateQueueToggleIcon();
+    }
+
+    updateQueueToggleIcon() {
+        if (!this.queueToggleIcon) return;
+        if (this.queueCollapsed) {
+            this.queueToggleIcon.textContent = '⮞';
+            this.queueToggleIcon.title = 'Expand queue';
+            // keep at far right; nothing else to change
+        } else {
+            this.queueToggleIcon.textContent = '⮜';
+            this.queueToggleIcon.title = 'Collapse queue';
+        }
+    }
+
+    createFooter() {
+        // Create buttons container
+        const footer = $el("div", {
+            style: {
+                padding: "16px",
+                borderTop: "1px solid var(--border-color)",
+                display: "flex",
+                justifyContent: "flex-end",
+                gap: "8px"
+            }
+        });
+
+        // Auto resolve 100%
+        const autoBtn = $el("button", {
+            textContent: "Auto-Resolve 100% Matches",
+            onclick: () => this.autoResolve100Percent(),
+            className: "comfy-button",
+            style: {
+                padding: "8px 16px"
+            }
+        });
+
+        // Apply pending resolutions
+        this.applyPendingBtn = $el("button", {
+            id: "apply-pending-resolutions",
+            textContent: "Apply Selected (0)",
+            className: "comfy-button model-linker-resolve-btn",
+            onclick: () => this.applyPendingResolutions(),
+            style: {
+                padding: "8px 16px"
+            }
+        });
+
+        footer.appendChild(this.applyPendingBtn);
+        footer.appendChild(autoBtn);
+        return footer;
+    }
+
+    async show() {
+        this.element.style.display = "flex";
+        // Re-read the catalogue every time, so the picker reflects the models
+        // that exist right now. Runs alongside the analysis rather than before
+        // it, since neither depends on the other.
+        await Promise.all([
+            this.ensureAllModelsLoaded({ force: true }),
+            this.loadWorkflowData(),
+        ]);
+        try {
+            const fs = localStorage.getItem('model_linker_modal_fullscreen');
+            if (fs === '1') this.setFullScreen(true);
+        } catch (e) { }
+    }
+
+    close() {
+        this._hidePreview();
+        // Nothing is waiting for the answer any more
+        if (this.analyzeAbort) {
+            this.analyzeAbort.abort();
+            this.analyzeAbort = null;
+        }
+        this.element.style.display = "none";
+    }
+
+    // ── Preview tooltip helpers ──────────────────────────────────────
+
+    /** Lazily create the shared preview tooltip element. */
+    _getPreviewTooltip() {
+        if (this._previewTooltip) return this._previewTooltip;
+        const el = document.createElement('div');
+        el.id = 'model-linker-preview-tooltip';
+        document.body.appendChild(el);
+        this._previewTooltip = el;
+        return el;
+    }
+
+    /**
+     * Show a model preview image next to an anchor element.
+     * Falls back to <video> if <img> fails (for .mp4 previews).
+     * Uses a generation counter to discard stale loads when hovering quickly.
+     */
+    _showPreview(category, relativePath, anchorEl) {
+        if (!category || !relativePath) return;
+        const tooltip = this._getPreviewTooltip();
+        const url = `/model_linker/preview?type=${encodeURIComponent(category)}&file=${encodeURIComponent(relativePath)}`;
+
+        // Bump generation so earlier async loads are discarded
+        const gen = (this._previewGen = (this._previewGen || 0) + 1);
+
+        // Try image first
+        const img = document.createElement('img');
+        img.src = url;
+        img.onload = () => {
+            if (this._previewGen !== gen) return; // stale
+            tooltip.innerHTML = '';
+            tooltip.appendChild(img);
+            this._positionTooltip(tooltip, anchorEl);
+            tooltip.style.display = 'block';
+        };
+        img.onerror = () => {
+            if (this._previewGen !== gen) return; // stale
+            // Might be a video preview (.mp4) – try <video>
+            const vid = document.createElement('video');
+            vid.src = url;
+            vid.autoplay = true;
+            vid.loop = true;
+            vid.muted = true;
+            vid.playsInline = true;
+            vid.onloadeddata = () => {
+                if (this._previewGen !== gen) return; // stale
+                tooltip.innerHTML = '';
+                tooltip.appendChild(vid);
+                this._positionTooltip(tooltip, anchorEl);
+                tooltip.style.display = 'block';
+            };
+            vid.onerror = () => {
+                if (this._previewGen !== gen) return; // stale
+                tooltip.style.display = 'none';
+            };
+        };
+    }
+
+    /** Position the tooltip to the right of the anchor, clamped to viewport. */
+    _positionTooltip(tooltip, anchorEl) {
+        const rect = anchorEl.getBoundingClientRect();
+        let left = rect.right + 8;
+        let top = rect.top;
+
+        // Clamp to viewport
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        if (left + 330 > vw) left = rect.left - 330;
+        if (left < 0) left = 4;
+        if (top + 330 > vh) top = vh - 334;
+        if (top < 0) top = 4;
+
+        tooltip.style.left = left + 'px';
+        tooltip.style.top = top + 'px';
+    }
+
+    /** Hide the preview tooltip and cancel any in-flight loads. */
+    _hidePreview() {
+        this._previewGen = (this._previewGen || 0) + 1; // invalidate pending loads
+        if (this._previewTooltip) {
+            this._previewTooltip.style.display = 'none';
+            this._previewTooltip.innerHTML = '';
+        }
+    }
+
+    /** Extract the containing folder from a model dict (display-only, never sent to nodes). */
+    _getModelFolder(model) {
+        if (!model) return '';
+        // Use absolute path and strip the filename to get the directory
+        const absPath = model.path || '';
+        if (!absPath) return model.base_directory || '';
+        // Handle both / and \ separators
+        const lastSep = Math.max(absPath.lastIndexOf('/'), absPath.lastIndexOf('\\'));
+        return lastSep > 0 ? absPath.substring(0, lastSep) : '';
+    }
+
+    // ────────────────────────────────────────────────────────────────
+
+    /**
+     * Ensure all models are loaded for the dropdown.
+     */
+    async ensureAllModelsLoaded({ force = false } = {}) {
+        // Without `force` this kept whatever was fetched the first time the
+        // dialog opened, for as long as the page stayed open - so models added
+        // or removed since then, or a server restart, left the picker offering
+        // files that no longer qualify. The dialog refreshes on open instead;
+        // the server caches its scan, so this is cheap.
+        if (!force && this.allModels && this.allModels.length) return;
+        try {
+            const resp = await api.fetchApi('/model_linker/models');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const models = await resp.json();
+            this.allModels = this.prepareModelList(models);
+        } catch (e) {
+            console.warn('Model Linker: could not load all models', e);
+            // Keep a previously loaded list rather than emptying the picker
+            if (!Array.isArray(this.allModels)) this.allModels = [];
+        }
+    }
+
+    /**
+     * Label and sort a raw model list for the picker.
+     *
+     * Every path that populates this.allModels goes through here, so the
+     * refresh button cannot leave the list in a different shape than the
+     * initial load did.
+     */
+    prepareModelList(models) {
+        const list = Array.isArray(models) ? models : [];
+        return list
+            .map((m) => ({
+                ...m,
+                __label: `${m.category ? m.category + ': ' : ''}${m.relative_path || m.filename || ''}`
+            }))
+            .sort((a, b) => (a.__label || '').localeCompare(b.__label || ''));
+    }
+
+    /**
+     * Simple debounce helper: returns a function that waits for `wait` ms after
+     * the last call before invoking `callback`.
+     */
+    debounce(callback, wait = 250) {
+        let t = null;
+        return (...args) => {
+            if (t) clearTimeout(t);
+            t = setTimeout(() => {
+                callback.apply(this, args);
+            }, wait);
+        };
+    }
+
+    // Begin window drag
+    startDrag(e) {
+        try {
+            const el = this.element;
+            if (!el) return;
+            const rect = el.getBoundingClientRect();
+            // Switch to absolute top/left (no transform) before dragging
+            el.style.top = `${rect.top}px`;
+            el.style.left = `${rect.left}px`;
+            el.style.transform = 'none';
+            this._dragging = true;
+            this._dragStart = {
+                x: e.clientX,
+                y: e.clientY,
+                top: rect.top,
+                left: rect.left
+            };
+            // Prevent text selection while dragging
+            this._prevUserSelect = document.body.style.userSelect;
+            document.body.style.userSelect = 'none';
+            // Attach listeners
+            this._onMouseMove = (ev) => this.onDrag(ev);
+            this._onMouseUp = () => this.endDrag();
+            document.addEventListener('mousemove', this._onMouseMove);
+            document.addEventListener('mouseup', this._onMouseUp, { once: true });
+        } catch (err) { /* ignore */ }
+    }
+
+    onDrag(e) {
+        if (!this._dragging || !this._dragStart) return;
+        const el = this.element;
+        if (!el) return;
+        const dx = e.clientX - this._dragStart.x;
+        const dy = e.clientY - this._dragStart.y;
+        let top = this._dragStart.top + dy;
+        let left = this._dragStart.left + dx;
+        // Clamp to viewport
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+        const w = el.offsetWidth;
+        const h = el.offsetHeight;
+        const pad = 4; // small padding
+        left = Math.max(-w + pad, Math.min(vw - pad, left));
+        top = Math.max(-h + pad, Math.min(vh - pad, top));
+        el.style.top = `${Math.round(top)}px`;
+        el.style.left = `${Math.round(left)}px`;
+    }
+
+    endDrag() {
+        if (!this._dragging) return;
+        this._dragging = false;
+        document.removeEventListener('mousemove', this._onMouseMove);
+        // Persist position
+        try {
+            const el = this.element;
+            const rect = el.getBoundingClientRect();
+            localStorage.setItem('model_linker_modal_pos', JSON.stringify({ top: Math.round(rect.top), left: Math.round(rect.left) }));
+        } catch (e) { /* ignore */ }
+        // Restore selection
+        try { document.body.style.userSelect = this._prevUserSelect || ''; } catch (e) { }
+    }
+
+    // Begin split drag for resizable panels
+    startSplitDrag(e) {
+        try {
+            if (!this.queueElement) return;
+            const rect = this.queueElement.getBoundingClientRect();
+            const body = document.getElementById('model-linker-body');
+            const bodyRect = body ? body.getBoundingClientRect() : { width: window.innerWidth };
+            this._splitDragging = true;
+            this._splitStart = {
+                x: e.clientX,
+                startWidth: rect.width,
+                containerWidth: bodyRect.width
+            };
+            this._prevUserSelect = document.body.style.userSelect;
+            document.body.style.userSelect = 'none';
+            this._onSplitMove = (ev) => this.onSplitDrag(ev);
+            this._onSplitUp = () => this.endSplitDrag();
+            document.addEventListener('mousemove', this._onSplitMove);
+            document.addEventListener('mouseup', this._onSplitUp, { once: true });
+        } catch (err) { /* ignore */ }
+    }
+
+    onSplitDrag(e) {
+        if (!this._splitDragging || !this._splitStart || !this.queueElement) return;
+        const dx = e.clientX - this._splitStart.x;
+        // Dragging right (dx>0) should decrease right panel width; left increases
+        let newW = this._splitStart.startWidth - dx;
+        const minW = 240;
+        const maxW = Math.max(minW, Math.floor(this._splitStart.containerWidth - 360));
+        if (newW < minW) newW = minW;
+        if (newW > maxW) newW = maxW;
+        this.queueElement.style.width = `${Math.round(newW)}px`;
+    }
+
+    endSplitDrag() {
+        if (!this._splitDragging) return;
+        this._splitDragging = false;
+        document.removeEventListener('mousemove', this._onSplitMove);
+        try {
+            const rect = this.queueElement.getBoundingClientRect();
+            localStorage.setItem('model_linker_split_w', String(Math.round(rect.width)));
+        } catch (e) { }
+        try { document.body.style.userSelect = this._prevUserSelect || ''; } catch (e) { }
+    }
+
+    // Toggle full screen mode for the dialog
+    toggleFullScreen() {
+        this.setFullScreen(!this.fullscreen);
+    }
+
+    setFullScreen(enable) {
+        this.fullscreen = !!enable;
+        const el = this.element;
+        if (!el) return;
+        const btn = document.getElementById('model-linker-fullscreen-toggle');
+        if (enable) {
+            // Save current size
+            try {
+                const rect = el.getBoundingClientRect();
+                localStorage.setItem('model_linker_modal_size_before_fs', JSON.stringify({ w: Math.round(rect.width), h: Math.round(rect.height) }));
+            } catch (e) { }
+            el.style.top = '0';
+            el.style.left = '0';
+            el.style.transform = 'none';
+            el.style.width = '100vw';
+            el.style.height = '100vh';
+            el.style.maxWidth = '100vw';
+            el.style.maxHeight = '100vh';
+            el.style.borderRadius = '0';
+            el.style.resize = 'none';
+            if (btn) btn.textContent = '🗗';
+            try { localStorage.setItem('model_linker_modal_fullscreen', '1'); } catch (e) { }
+        } else {
+            // Restore centered sizing
+            el.style.maxWidth = '95vw';
+            el.style.maxHeight = '95vh';
+            el.style.borderRadius = '8px';
+            el.style.resize = 'both';
+            // Restore saved pre-FS size if available
+            let wh = null;
+            try { wh = JSON.parse(localStorage.getItem('model_linker_modal_size_before_fs') || 'null'); } catch (e) { }
+            if (wh && wh.w && wh.h) {
+                el.style.width = `${wh.w}px`;
+                el.style.height = `${wh.h}px`;
+            } else {
+                el.style.width = '900px';
+                el.style.height = '700px';
+            }
+            // Restore last known position if available, else center
+            try {
+                const pos = JSON.parse(localStorage.getItem('model_linker_modal_pos') || 'null');
+                if (pos && Number.isFinite(pos.top) && Number.isFinite(pos.left)) {
+                    el.style.top = `${pos.top}px`;
+                    el.style.left = `${pos.left}px`;
+                    el.style.transform = 'none';
+                } else {
+                    el.style.top = '50%';
+                    el.style.left = '50%';
+                    el.style.transform = 'translate(-50%, -50%)';
+                }
+            } catch (e) {
+                el.style.top = '50%';
+                el.style.left = '50%';
+                el.style.transform = 'translate(-50%, -50%)';
+            }
+            if (btn) btn.textContent = '⛶';
+            try { localStorage.setItem('model_linker_modal_fullscreen', '0'); } catch (e) { }
+        }
+    }
+
+    /**
+     * Load workflow data and display missing models
+     */
+    async loadWorkflowData(workflow = null) {
+        if (!this.contentElement) return;
+
+        // Reopening the dialog or hitting Refresh while an analysis is in
+        // flight starts a second one. Without this, both complete and whichever
+        // *arrives* last wins - which is not necessarily the one describing the
+        // workflow now on screen. Abandon the older request instead.
+        if (this.analyzeAbort) this.analyzeAbort.abort();
+        const abort = new AbortController();
+        this.analyzeAbort = abort;
+
+        this.contentElement.innerHTML = '<p>Analyzing workflow...</p>';
+
+        try {
+            // Use provided workflow, or get current workflow from ComfyUI
+            if (!workflow) {
+                workflow = this.getCurrentWorkflow();
+            }
+
+            if (!workflow) {
+                this.contentElement.innerHTML = '<p>No workflow loaded. Please load a workflow first.</p>';
+                return;
+            }
+
+            // Call analyze endpoint
+            const response = await api.fetchApi('/model_linker/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ workflow }),
+                signal: abort.signal
+            });
+
+            if (!response.ok) {
+                throw new Error(`API error: ${response.status}`);
+            }
+
+            const data = await response.json();
+
+            // A newer analysis started while this one was in flight, or the
+            // dialog was closed; either way this answer is stale.
+            if (this.analyzeAbort !== abort || !this.contentElement) return;
+
+            this.displayMissingModels(this.contentElement, data);
+
+        } catch (error) {
+            // Superseding a request is normal, not a failure to report
+            if (error.name === 'AbortError' || this.analyzeAbort !== abort) return;
+            console.error('Model Linker: Error loading workflow data:', error);
+            if (this.contentElement) {
+                this.contentElement.innerHTML =
+                    `<p style="color: red;">Error: ${escapeHtml(error.message)}</p>`;
+            }
+        } finally {
+            if (this.analyzeAbort === abort) this.analyzeAbort = null;
+        }
+    }
+
+    /**
+     * Get current workflow from ComfyUI
+     */
+    getCurrentWorkflow() {
+        // Try to get workflow from app
+        if (app?.graph) {
+            try {
+                // Use ComfyUI's workflow serialization
+                const workflow = app.graph.serialize();
+                return workflow;
+            } catch (e) {
+                console.warn('Model Linker: Could not serialize workflow from graph:', e);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Display missing models in the dialog
+     */
+    /**
+     * The models this workflow uses that were found on disk.
+     *
+     * Answers what the missing list cannot: what is this workflow actually
+     * loading, and out of which folder. Collapsed by default - it is context,
+     * not the task. A <details> element so the browser handles the toggling.
+     */
+    renderPresentModels(present) {
+        if (!present || !present.length) return '';
+
+        const rows = [...present].sort((a, b) => {
+            const byCategory = (a.category || '').localeCompare(b.category || '');
+            return byCategory || (a.original_path || '').localeCompare(b.original_path || '');
+        });
+
+        let html = `<details id="model-linker-present" style="margin-top:16px;">`
+            + `<summary style="cursor:pointer; opacity:.85;">Models found on disk (${rows.length})</summary>`
+            + `<div style="display:flex; flex-direction:column; gap:4px; margin-top:8px;">`;
+
+        rows.forEach((model, index) => {
+            const name = escapeHtml((model.original_path || '').split(/[\\/]/).pop() || '');
+            const path = escapeHtml(model.original_path || '');
+            const category = escapeHtml(model.category || 'unknown');
+            const node = escapeHtml(`${model.node_type || 'Node'} #${model.node_id}`);
+            const where = model.subgraph_name ? ` · ${escapeHtml(model.subgraph_name)}` : '';
+            html += `<div style="display:flex; align-items:center; gap:8px; padding:4px 6px; border-bottom:1px solid var(--border-color);">`
+                + `<code style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${path}">${name}</code>`
+                + `<span style="flex:0 0 auto; opacity:.75; font-size:12px;">[${category}]</span>`
+                + `<span style="flex:0 0 auto; opacity:.6; font-size:12px;">${node}${where}</span>`
+                + `<button id="present-reveal-${index}" class="model-linker-resolve-btn" style="flex:0 0 auto; padding:2px 8px;" title="Show in the file manager">📂</button>`
+                + `</div>`;
+        });
+
+        html += '</div></details>';
+        this._presentRows = rows;
+        return html;
+    }
+
+    /** Wire the folder buttons in the found-on-disk list. */
+    attachPresentModelHandlers(container) {
+        (this._presentRows || []).forEach((model, index) => {
+            const button = container.querySelector(`#present-reveal-${index}`);
+            if (button) {
+                button.onclick = () => this.revealModel({
+                    category: model.category,
+                    relative_path: model.original_path,
+                });
+            }
+        });
+    }
+
+    displayMissingModels(container, data) {
+        const missingModels = data.missing_models || [];
+        const totalMissing = data.total_missing || 0;
+        const presentHtml = this.renderPresentModels(data.present_models);
+
+        if (totalMissing === 0) {
+            container.innerHTML =
+                '<p style="color: green;">✓ No missing models found. All models are available!</p>'
+                + presentHtml;
+            this.attachPresentModelHandlers(container);
+            return;
+        }
+
+        let html = `<p><strong>Found ${totalMissing} missing model(s):</strong></p>`;
+        html += '<div id="model-linker-missing-list" style="display: flex; flex-direction: column; gap: 16px;">';
+
+        // Sort missing models: those with 100% confidence matches first, then others
+        const sortedMissingModels = missingModels.sort((a, b) => {
+            const aMatches = a.matches || [];
+            const bMatches = b.matches || [];
+
+            // Filter to 70%+ confidence
+            const aFiltered = aMatches.filter(m => m.confidence >= 70);
+            const bFiltered = bMatches.filter(m => m.confidence >= 70);
+
+            // Check if they have 100% matches
+            const aHas100 = aFiltered.some(m => m.confidence === 100);
+            const bHas100 = bFiltered.some(m => m.confidence === 100);
+
+            // If one has 100% and the other doesn't, prioritize the one with 100%
+            if (aHas100 && !bHas100) return -1;
+            if (!aHas100 && bHas100) return 1;
+
+            // If both have 100% or neither has 100%, sort by best confidence
+            const aBestConf = aFiltered.length > 0 ? Math.max(...aFiltered.map(m => m.confidence)) : 0;
+            const bBestConf = bFiltered.length > 0 ? Math.max(...bFiltered.map(m => m.confidence)) : 0;
+
+            return bBestConf - aBestConf; // Higher confidence first
+        });
+
+        for (const missing of sortedMissingModels) {
+            html += this.renderMissingModel(missing);
+        }
+
+        html += '</div>';
+        html += presentHtml;
+        container.innerHTML = html;
+        this.attachPresentModelHandlers(container);
+
+        // Attach event listeners for resolve buttons (use sorted order)
+        // Note: We need to match the exact same logic as renderMissingModel to find which buttons were rendered
+        sortedMissingModels.forEach((missing, missingIndex) => {
+            const allMatches = missing.matches || [];
+
+            // Filter out matches below 70% confidence threshold
+            const filteredMatches = allMatches.filter(m => m.confidence >= 70);
+
+            // Filter to only 100% matches if available, otherwise use filtered matches (>=70%)
+            const perfectMatches = filteredMatches.filter(m => m.confidence === 100);
+            const otherMatches = filteredMatches.filter(m => m.confidence < 100 && m.confidence >= 70);
+
+            // Match the same logic as renderMissingModel
+            const savedMatches = filteredMatches.filter(m => m.is_override);
+            let matchesToShow = null;
+            if (perfectMatches.length > 0) {
+                // Show 100% matches, but always include saved matches as well
+                const combined = [...perfectMatches];
+                for (const sm of savedMatches) {
+                    const p = sm.model?.path;
+                    if (!combined.some(x => x.model?.path === p)) combined.push(sm);
+                }
+                matchesToShow = combined;
+            } else {
+                matchesToShow = otherMatches.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+                // Ensure saved matches are included even if outside top 5
+                for (const sm of savedMatches) {
+                    const p = sm.model?.path;
+                    if (!matchesToShow.some(x => x.model?.path === p)) matchesToShow.push(sm);
+                }
+            }
+
+            // Sort: 100% matches first, then by confidence descending (same as renderMissingModel)
+            const sortedMatches = matchesToShow.sort((a, b) => {
+                if (a.confidence === 100 && b.confidence !== 100) return -1;
+                if (a.confidence !== 100 && b.confidence === 100) return 1;
+                return b.confidence - a.confidence;
+            });
+
+            // Attach listener for all displayed matches so the user can pick explicitly
+            sortedMatches.forEach((match, matchIndex) => {
+                const buttonId = `resolve-${refSlot(missing)}-${matchIndex}`;
+                const resolveButton = container.querySelector(`#${buttonId}`);
+                if (resolveButton) {
+                    resolveButton.addEventListener('click', () => {
+                        this.queueResolution(missing, match.model);
+                    });
+                    // Preview on hover over the match <li>
+                    const liEl = resolveButton.closest('li');
+                    if (liEl && match.model) {
+                        liEl.addEventListener('mouseenter', () => {
+                            this._showPreview(match.model.category || missing.category, match.model.relative_path || match.model.filename, liEl);
+                        });
+                        liEl.addEventListener('mouseleave', () => {
+                            this._hidePreview();
+                        });
+                    }
+                }
+            });
+
+            // Attach model combo picker (category-scoped)
+            this.attachModelCombo(container, missing);
+            // Refresh selected UI for this item based on queued selections
+            this.updateSelectedBarForMissing(missing);
+
+            // Wire Locate button (only available for top-level items)
+            const locateId = `locate-${refSlot(missing)}`;
+            const locateBtn = container.querySelector(`#${locateId}`);
+            if (locateBtn && missing.is_top_level !== false) {
+                locateBtn.addEventListener('click', () => this.locateNodeInGraph(missing.node_id));
+            }
+
+            // Model combo is already attached above
+        });
+    }
+
+    /**
+     * Render a single missing model entry
+     */
+    renderMissingModel(missing) {
+        const allMatches = missing.matches || [];
+
+        // Filter out matches below 70% confidence threshold
+        const filteredMatches = allMatches.filter(m => m.confidence >= 70);
+        const hasMatches = filteredMatches.length > 0;
+
+        let html = `<div id="missing-${refSlot(missing)}" style="border: 1px solid var(--border-color, #444); padding: 12px; border-radius: 4px; display:flex; flex-direction:column; align-items:stretch; gap:8px; white-space: normal;">`;
+
+        // Display subgraph name as primary identifier if available, otherwise show node type
+        // A node type that's a UUID indicates it's a subgraph instance
+        const isSubgraphNode = missing.node_type && missing.node_type.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+
+        const locateId = `locate-${refSlot(missing)}`;
+        if (missing.subgraph_name) {
+            // Show subgraph name as primary identifier
+            html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
+            html += `<span><strong>Subgraph:</strong> ${missing.subgraph_name} (ID: ${missing.node_id})</span>`;
+            if (missing.is_top_level === false) {
+                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
+            } else {
+                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
+            }
+            html += `</div>`;
+        } else if (isSubgraphNode) {
+            // Node type is a UUID (subgraph) but we don't have the name (shouldn't happen, but handle gracefully)
+            html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
+            html += `<span><strong>Node:</strong> <em>Subgraph</em> (ID: ${missing.node_id})</span>`;
+            if (missing.is_top_level === false) {
+                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
+            } else {
+                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
+            }
+            html += `</div>`;
+        } else {
+            // Regular node
+            html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
+            html += `<span><strong>Node:</strong> ${missing.node_type} (ID: ${missing.node_id})</span>`;
+            if (missing.is_top_level === false) {
+                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
+            } else {
+                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
+            }
+            html += `</div>`;
+        }
+        html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${missing.original_path}</code></div>`;
+        html += `<div style="margin-bottom: 8px;"><strong>Category:</strong> ${missing.category || 'unknown'}</div>`;
+
+        // Where the workflow says this model came from. Worth showing whatever
+        // the matches look like: when nothing on disk resembles the model, the
+        // original download is the only real way to resolve it.
+        const sourceUrl = safeHttpUrl(missing.source_url);
+        if (sourceUrl) {
+            const target = missing.category && missing.category !== 'unknown'
+                ? `models/${escapeHtml(missing.category)}/` : 'the matching models folder';
+            html += `<div style="margin-bottom: 8px;"><strong>Original source:</strong> `
+                + `<a href="${escapeHtml(sourceUrl)}" target="_blank" rel="noopener noreferrer" `
+                + `title="Opens the download in a new tab. Save it to ${escapeHtml(target)} and re-run the analysis." `
+                + `style="color: var(--primary-color, #4aa3ff);">Download ↗</a>`
+                + `<span style="opacity:.7; font-size: 12px;"> — save to <code>${escapeHtml(target)}</code></span></div>`;
+        }
+        // Selected state placeholder (filled dynamically when user queues a selection)
+        const selectedId = `selected-${refSlot(missing)}`;
+        html += `<div id="${selectedId}" class="model-linker-selected" style="display:none; margin: 8px 0; padding: 8px; border: 1px solid var(--border-color, #444); border-radius: 4px; background: rgba(10,169,110,0.08);"></div>`;
+
+        if (hasMatches) {
+            // Filter out matches below 70% confidence threshold
+            const filteredMatches = allMatches.filter(m => m.confidence >= 70);
+
+            // Separate 100% matches from others (from filtered list)
+            const perfectMatches = filteredMatches.filter(m => m.confidence === 100);
+            const otherMatches = filteredMatches.filter(m => m.confidence < 100 && m.confidence >= 70);
+
+            // If we have 100% matches, show them AND always include saved matches as well.
+            const savedMatches = filteredMatches.filter(m => m.is_override);
+            let matchesToShow = null;
+            if (perfectMatches.length > 0) {
+                const combined = [...perfectMatches];
+                for (const sm of savedMatches) {
+                    const p = sm.model?.path;
+                    if (!combined.some(x => x.model?.path === p)) combined.push(sm);
+                }
+                matchesToShow = combined;
+            } else {
+                matchesToShow = otherMatches.sort((a, b) => b.confidence - a.confidence).slice(0, 5);
+                for (const sm of savedMatches) {
+                    const p = sm.model?.path;
+                    if (!matchesToShow.some(x => x.model?.path === p)) matchesToShow.push(sm);
+                }
+            }
+
+            html += `<div style="margin-top: 12px;"><strong>Suggested Matches:</strong></div>`;
+            html += '<ul style="margin: 8px 0; padding-left: 20px;">';
+
+            // Sort: 100% matches first, then by confidence descending
+            const sortedMatches = matchesToShow.sort((a, b) => {
+                if (a.confidence === 100 && b.confidence !== 100) return -1;
+                if (a.confidence !== 100 && b.confidence === 100) return 1;
+                return b.confidence - a.confidence;
+            });
+
+            // Find the highest confidence match (even if not 100%)
+            const highestConfidenceMatch = sortedMatches.length > 0 ? sortedMatches[0] : null;
+
+            for (let matchIndex = 0; matchIndex < sortedMatches.length; matchIndex++) {
+                const match = sortedMatches[matchIndex];
+                const buttonId = `resolve-${refSlot(missing)}-${matchIndex}`;
+                html += `<li style="margin: 4px 0;">`;
+                const label = match.filename || match.model?.relative_path || '';
+                const isSaved = !!match.is_override;
+                // Name only - the containing folder is printed just below
+                html += `<code title="${match.model?.relative_path || label}">${label}</code> `;
+                html += `<span style="color: ${match.confidence === 100 ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
+                if (isSaved) {
+                    html += ` <span style="color:#0aa96e; font-weight:600;">(saved)</span>`;
+                }
+                // Always provide a Resolve button so the user can pick explicitly
+                html += ` <button id="${buttonId}"
+                        class="model-linker-resolve-btn" style="margin-left: 8px; padding: 4px 8px;">
+                        Select
+                    </button>`;
+                // Show folder location (UI-only, not sent to nodes)
+                const folderPath = this._getModelFolder(match.model);
+                if (folderPath) {
+                    html += `<div style="font-size:11px; color:#888; opacity:0.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${folderPath}">📁 ${folderPath}</div>`;
+                }
+                html += `</li>`;
+            }
+
+            html += '</ul>';
+
+            // Add note if only showing 100% matches
+            if (perfectMatches.length > 0 && otherMatches.length > 0) {
+                html += `<div style="color: #888; font-size: 12px; margin-top: 8px; font-style: italic;">Showing only 100% confidence matches. ${otherMatches.length} other match${otherMatches.length > 1 ? 'es' : ''} available.</div>`;
+            }
+        } else if (allMatches.length > 0 && filteredMatches.length === 0) {
+            // Had matches but all were below 70% threshold
+            html += `<div style="color: orange; margin-top: 8px;">No matches found above 70% confidence threshold.</div>`;
+        } else {
+            html += `<div style="color: orange; margin-top: 8px;">No matches found.</div>`;
+        }
+
+        // Compact summary removed (duplicate of info shown above)
+
+        // combo picker injected via attachModelCombo
+
+
+
+
+
+
+
+
+        html += `</div>`;
+
+        html += `</div>`;
+
+        html += '</div>';
+        return html;
+    }
+
+    /**
+     * Show a notification banner (similar to ComfyUI's "Reconnecting" banner)
+     */
+    showNotification(message, type = 'success') {
+        // Create notification banner
+        const notification = $el("div", {
+            style: {
+                position: "fixed",
+                top: "0",
+                left: "50%",
+                transform: "translateX(-50%)",
+                backgroundColor: type === 'success' ? '#28a745' : type === 'error' ? '#dc3545' : '#007acc',
+                color: "#ffffff",
+                padding: "12px 24px",
+                borderRadius: "0 0 8px 8px",
+                fontSize: "14px",
+                fontWeight: "500",
+                zIndex: "100000",
+                boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+                display: "flex",
+                alignItems: "center",
+                gap: "12px",
+                minWidth: "300px",
+                maxWidth: "600px",
+                textAlign: "center",
+                animation: "slideDown 0.3s ease"
+            }
+        }, [
+            type === 'success' ? $el("span", {
+                textContent: "✓",
+                style: {
+                    fontSize: "18px",
+                    fontWeight: "bold"
+                }
+            }) : type === 'error' ? $el("span", {
+                textContent: "×",
+                style: {
+                    fontSize: "18px",
+                    fontWeight: "bold"
+                }
+            }) : null,
+            $el("span", {
+                textContent: message
+            }),
+            $el("button", {
+                textContent: "×",
+                onclick: () => {
+                    if (notification.parentNode) {
+                        notification.style.opacity = "0";
+                        notification.style.transform = "translateX(-50%) translateY(-100%)";
+                        setTimeout(() => {
+                            if (notification.parentNode) {
+                                notification.parentNode.removeChild(notification);
+                            }
+                        }, 300);
+                    }
+                },
+                style: {
+                    background: "none",
+                    border: "none",
+                    color: "#ffffff",
+                    fontSize: "20px",
+                    cursor: "pointer",
+                    padding: "0",
+                    marginLeft: "auto",
+                    opacity: "0.8",
+                    width: "24px",
+                    height: "24px",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    borderRadius: "4px"
+                }
+            })
+        ]);
+
+        // Add CSS animation if not already added
+        if (!document.getElementById('model-linker-notification-style')) {
+            const style = $el("style", {
+                id: 'model-linker-notification-style',
+                textContent: `
+                    @keyframes slideDown {
+                        from {
+                            opacity: 0;
+                            transform: translateX(-50%) translateY(-100%);
+                        }
+                        to {
+                            opacity: 1;
+                            transform: translateX(-50%) translateY(0);
+                        }
+                    }
+                `
+            });
+            document.head.appendChild(style);
+        }
+
+        document.body.appendChild(notification);
+
+        // Auto-dismiss after 4 seconds for success, 6 seconds for errors
+        const dismissTime = type === 'success' ? 4000 : 6000;
+        setTimeout(() => {
+            if (notification.parentNode) {
+                notification.style.opacity = "0";
+                notification.style.transform = "translateX(-50%) translateY(-100%)";
+                setTimeout(() => {
+                    if (notification.parentNode) {
+                        notification.parentNode.removeChild(notification);
+                    }
+                }, 300);
+            }
+        }, dismissTime);
+    }
+
+    // Build a stable key for a missing entry (same as queueResolution)
+    getResolutionKey(missing) {
+        return refKey(missing);
+    }
+
+    // Return queued resolution (if any) for a missing entry
+    getQueuedResolutionForMissing(missing) {
+        const key = this.getResolutionKey(missing);
+        if (this.pendingIndex.has(key)) {
+            const idx = this.pendingIndex.get(key);
+            return this.pendingResolutions[idx];
+        }
+        return null;
+    }
+
+    // Rebuild index mapping after removals
+    rebuildPendingIndex() {
+        this.pendingIndex = new Map();
+        for (let i = 0; i < this.pendingResolutions.length; i++) {
+            const r = this.pendingResolutions[i];
+            const k = refKey(r);
+            this.pendingIndex.set(k, i);
+        }
+    }
+
+    // Remove a queued resolution for a missing item
+    removeQueuedResolution(missing) {
+        const key = this.getResolutionKey(missing);
+        if (!this.pendingIndex.has(key)) return;
+        const idx = this.pendingIndex.get(key);
+        this.pendingResolutions.splice(idx, 1);
+        this.rebuildPendingIndex();
+        this.updateSelectedBarForMissing(missing);
+        this.updateApplyPendingButton();
+        this.updateQueuePanel();
+    }
+
+    // Update the per-item selected UI area
+    updateSelectedBarForMissing(missing) {
+        const containerId = `selected-${refSlot(missing)}`;
+        const el = document.getElementById(containerId);
+        if (!el) return;
+        const queued = this.getQueuedResolutionForMissing(missing);
+        if (!queued) {
+            el.style.display = 'none';
+            el.innerHTML = '';
+            return;
+        }
+        const model = queued.resolved_model || {};
+        const label = model.filename || model.relative_path || queued.resolved_path || 'selected model';
+        const fullPath = model.relative_path || queued.resolved_path || label;
+        const removeId = `selected-remove-${refSlot(missing)}`;
+        const revealId = `selected-reveal-${refSlot(missing)}`;
+        el.innerHTML = `<strong>Selected:</strong> <code title="${escapeHtml(fullPath)}">${escapeHtml(label)}</code>`
+            + ` <button id="${revealId}" class="model-linker-resolve-btn" style="margin-left:8px; padding: 2px 8px;" title="Show this file in the file manager on the machine running ComfyUI">📂 Folder</button>`
+            + ` <button id="${removeId}" class="model-linker-resolve-btn" style="margin-left:4px; padding: 2px 8px;">Remove</button>`;
+        el.style.display = '';
+        const btn = document.getElementById(removeId);
+        if (btn) {
+            btn.onclick = () => this.removeQueuedResolution(missing);
+        }
+        const revealBtn = document.getElementById(revealId);
+        if (revealBtn) {
+            revealBtn.onclick = () => this.revealModel(model);
+        }
+    }
+
+    /**
+     * Ask the server to open its file manager with this model selected.
+     *
+     * Only meaningful when ComfyUI runs on the machine you are sitting at; the
+     * route refuses anything else, and the refusal is reported as-is rather
+     * than dressed up as a failure.
+     */
+    async revealModel(model) {
+        const category = model?.category;
+        const filename = model?.relative_path || model?.filename;
+        if (!category || !filename) {
+            this.showNotification('Nothing to show for this model', 'error');
+            return;
+        }
+        try {
+            const response = await api.fetchApi('/model_linker/reveal', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ category, filename }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!result.success) {
+                this.showNotification(result.error || 'Could not open the folder', 'error');
+            }
+        } catch (error) {
+            this.showNotification(`Could not open the folder: ${error.message}`, 'error');
+        }
+    }
+
+    /**
+     * Queue a single resolution (do not call backend yet)
+     */
+    queueResolution(missing, resolvedModel) {
+        if (!resolvedModel) {
+            this.showNotification('No model selected', 'error');
+            return;
+        }
+
+        const resolution = {
+            node_id: missing.node_id,
+            widget_index: missing.widget_index,
+            resolved_path: resolvedModel.path,
+            category: missing.category,
+            resolved_model: resolvedModel,
+            original_path: missing.original_path,
+            subgraph_id: missing.subgraph_id,
+            is_top_level: missing.is_top_level,
+            nested_key: missing.nested_key || null,
+            list_index: (missing.list_index ?? null),
+            adapter_id: missing.adapter_id || null,
+            node_type: missing.node_type,
+            node_label: missing.subgraph_name || missing.node_type
+        };
+
+        const key = refKey(resolution);
+        if (this.pendingIndex.has(key)) {
+            // replace existing selection for this slot
+            const idx = this.pendingIndex.get(key);
+            this.pendingResolutions[idx] = resolution;
+        } else {
+            this.pendingIndex.set(key, this.pendingResolutions.length);
+            this.pendingResolutions.push(resolution);
+        }
+
+        // Update selected bar UI
+        this.updateSelectedBarForMissing(missing);
+        this.updateQueuePanel();
+        this.updateApplyPendingButton();
+    }
+
+    /**
+     * Auto-resolve all 100% confidence matches
+     */
+    async autoResolve100Percent() {
+        if (!this.contentElement) return;
+
+        try {
+            const workflow = this.getCurrentWorkflow();
+            if (!workflow) {
+                this.showNotification('No workflow loaded', 'error');
+                return;
+            }
+
+            // Analyze workflow first
+            const analyzeResponse = await api.fetchApi('/model_linker/analyze', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ workflow })
+            });
+
+            if (!analyzeResponse.ok) {
+                throw new Error(`API error: ${analyzeResponse.status}`);
+            }
+
+            const analyzeData = await analyzeResponse.json();
+            const missingModels = analyzeData.missing_models || [];
+
+            // Collect all 100% matches
+            const resolutions = [];
+            for (const missing of missingModels) {
+                const matches = missing.matches || [];
+                const perfectMatch = matches.find((m) => m.confidence === 100);
+
+                if (perfectMatch && perfectMatch.model) {
+                    resolutions.push({
+                        node_id: missing.node_id,
+                        widget_index: missing.widget_index,
+                        resolved_path: perfectMatch.model.path,
+                        category: missing.category,
+                        resolved_model: perfectMatch.model,
+                        original_path: missing.original_path,
+                        subgraph_id: missing.subgraph_id,
+                        is_top_level: missing.is_top_level,
+                        nested_key: missing.nested_key || null,
+                        list_index: (missing.list_index ?? null),
+                        adapter_id: missing.adapter_id || null
+                    });
+                }
+            }
+
+            if (resolutions.length === 0) {
+                this.showNotification('No 100% confidence matches found to auto-resolve.', 'error');
+                return;
+            }
+
+            // Apply resolutions
+            const resolveResponse = await api.fetchApi('/model_linker/resolve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    workflow,
+                    resolutions
+                })
+            });
+
+            if (!resolveResponse.ok) {
+                throw new Error(`API error: ${resolveResponse.status}`);
+            }
+
+            const resolveData = await resolveResponse.json();
+
+            if (resolveData.success) {
+                // Update workflow in ComfyUI
+                await this.updateWorkflowInComfyUI(resolveData.workflow, resolutions);
+
+                // Show success notification
+                this.showNotification(
+                    `✓ Successfully linked ${resolutions.length} model${resolutions.length > 1 ? 's' : ''}!`,
+                    'success'
+                );
+
+                // Reload dialog using the updated workflow from API response
+                // This ensures we're analyzing the correct updated workflow
+                await this.loadWorkflowData(resolveData.workflow);
+            } else {
+                this.showNotification('Failed to resolve models: ' + (resolveData.error || 'Unknown error'), 'error');
+            }
+
+        } catch (error) {
+            console.error('Model Linker: Error auto-resolving:', error);
+            this.showNotification('Error auto-resolving: ' + error.message, 'error');
+        }
+    }
+
+    /**
+     * Apply all queued resolutions in a single backend call
+     */
+    async applyPendingResolutions() {
+        const list = this.pendingResolutions || [];
+        if (!list.length) {
+            this.showNotification('No selections queued', 'error');
+            return;
+        }
+
+        try {
+            const workflow = this.getCurrentWorkflow();
+            if (!workflow) {
+                this.showNotification('No workflow loaded', 'error');
+                return;
+            }
+
+            const response = await api.fetchApi('/model_linker/resolve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ workflow, resolutions: list })
+            });
+
+            if (!response.ok) throw new Error(`API error: ${response.status}`);
+
+            const data = await response.json();
+            if (data.success) {
+                await this.updateWorkflowInComfyUI(data.workflow, list);
+                this.showNotification(`✓ Linked ${list.length} selection${list.length > 1 ? 's' : ''}`, 'success');
+                // Clear queue and refresh analysis
+                this.pendingResolutions = [];
+                this.pendingIndex = new Map();
+                this.updateApplyPendingButton();
+                this.updateQueuePanel();
+                await this.loadWorkflowData(data.workflow);
+            } else {
+                this.showNotification('Failed to apply selections: ' + (data.error || 'Unknown error'), 'error');
+            }
+        } catch (e) {
+            console.error('Model Linker: applyPendingResolutions error', e);
+            this.showNotification('Error applying selections: ' + e.message, 'error');
+        }
+    }
+
+    updateApplyPendingButton() {
+        if (!this.applyPendingBtn) return;
+        const n = (this.pendingResolutions || []).length;
+        this.applyPendingBtn.textContent = `Apply Selected (${n})`;
+        this.applyPendingBtn.disabled = n === 0;
+        this.applyPendingBtn.style.opacity = n === 0 ? '0.6' : '1';
+        // Keep the queue panel count in sync
+        this.updateQueuePanel();
+    }
+
+    // Build and wire a node-like combo picker, scoped by default to the folder
+    // the node actually loads from
+    attachModelCombo(container, missing) {
+        const category = (missing.category && missing.category !== 'unknown') ? missing.category : null;
+        const inputId = `combo-input-${refSlot(missing)}`;
+        const listId = `combo-list-${refSlot(missing)}`;
+        const refreshId = `combo-refresh-${refSlot(missing)}`;
+        const scopeId = `combo-scope-${refSlot(missing)}`;
+
+        // Inject combo markup after 'Selected' bar
+        const selectedBar = container.querySelector(`#selected-${refSlot(missing)}`);
+        if (!selectedBar) return;
+        const comboWrap = document.createElement('div');
+        comboWrap.style.position = 'relative';
+        comboWrap.style.margin = '8px 0';
+        // Scoping to the node's own category is the default: a loader resolves
+        // its value against that category's folder, so anything else is not a
+        // usable replacement. The checkbox widens the search for the cases where
+        // the category was guessed wrong or the file lives somewhere unusual.
+        const scopeControl = category
+            ? `<label for="${scopeId}" title="Only show models from the folder this node loads from" style="display:flex; align-items:center; gap:4px; opacity:0.9; white-space:nowrap; cursor:pointer;">
+                   <input id="${scopeId}" type="checkbox" checked style="cursor:pointer;" /> ${escapeHtml(category)} only
+               </label>`
+            : '';
+        comboWrap.innerHTML = `
+            <div style="display:flex; align-items:center; gap:6px;">
+                <label style="opacity:0.9;">Model:</label>
+                <input id="${inputId}" type="text" placeholder="type to filter..." style="flex:1; padding:4px;" />
+                ${scopeControl}
+                <button id="${refreshId}" title="Refresh model list" class="model-linker-resolve-btn" style="padding:2px 8px;">⟳</button>
+            </div>
+            <div id="${listId}" style="position:absolute; top:100%; left:0; background: var(--comfy-input-bg, #2f2f2f); border:1px solid var(--border-color); border-radius:4px; max-height:280px; overflow:auto; display:none; z-index:100000;"></div>
+        `;
+        selectedBar.after(comboWrap);
+
+        const inputEl = comboWrap.querySelector(`#${inputId}`);
+        const listEl = comboWrap.querySelector(`#${listId}`);
+        const refreshBtn = comboWrap.querySelector(`#${refreshId}`);
+        const scopeEl = comboWrap.querySelector(`#${scopeId}`);
+        if (!inputEl || !listEl) return;
+
+        const savedPaths = new Set((missing.matches || []).filter(m => m.is_override && m.model && m.model.path).map(m => m.model.path));
+        // Scope on the canonical category so aliases of one folder count as the
+        // same category (a node loading from text_encoders still sees models
+        // catalogued under clip). Falls back to the raw name on older responses.
+        const scopeCategory = missing.canonical_category || category;
+        const getPool = () => {
+            const all = Array.isArray(this.allModels) ? this.allModels : [];
+            const selectable = all.filter(isSelectableModel);
+            if (scopeCategory && scopeEl?.checked) {
+                const scoped = selectable.filter(
+                    (m) => (m.canonical_category || m.category) === scopeCategory);
+                // Never strand the user with an empty picker: if the category
+                // holds nothing, fall back to everything rather than nothing.
+                if (scoped.length) return scoped;
+            }
+            return selectable;
+        };
+
+        const renderList = (items, query, activeIdx) => {
+            if (!items || !items.length) {
+                listEl.innerHTML = '<div style="padding:6px; opacity:0.8;">No results</div>';
+                return;
+            }
+            const esc = (s) => (s || '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#39;' }[c]));
+            const q = (query || '').toLowerCase();
+
+            // Underline where the query matched, so a hit in the folder is
+            // still visible even though the name is what is listed.
+            const highlight = (text) => {
+                if (!q) return esc(text);
+                const low = text.toLowerCase();
+                let out = '';
+                let idx = 0;
+                for (; ;) {
+                    const j = low.indexOf(q, idx);
+                    if (j === -1) { out += esc(text.slice(idx)); break; }
+                    out += esc(text.slice(idx, j))
+                        + `<span style="font-weight:600; text-decoration:underline;">${esc(text.slice(j, j + q.length))}</span>`;
+                    idx = j + q.length;
+                }
+                return out;
+            };
+
+            let html = '';
+            for (let i = 0; i < items.length; i++) {
+                const m = items[i];
+                // Just the name. The folder appears beneath it, which is what
+                // separates two models that share a filename; searching still
+                // matches the whole path.
+                const name = m.filename || m.relative_path || '';
+                const isSaved = savedPaths.has(m.path);
+                const activeStyle = (i === activeIdx) ? 'background: rgba(0,122,204,0.25);' : '';
+                const folderPath = this._getModelFolder(m);
+                const folderHtml = folderPath ? `<div style="font-size:10px; color:#888; opacity:0.8; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(folderPath)}">📁 ${highlight(folderPath)}</div>` : '';
+                html += `<div data-idx="${i}" style="${activeStyle} padding:6px; cursor:pointer;">
+                    <div style="display:flex; align-items:center; gap:6px;">
+                        <code style="flex:1;" title="${esc(m.relative_path || name)}">${highlight(name)}</code>
+                        ${isSaved ? '<span style="color:#0aa96e; font-weight:600;">(saved)</span>' : ''}
+                    </div>
+                    ${folderHtml}
+                </div>`;
+            }
+            listEl.innerHTML = html;
+        };
+
+        const buildSuggestions = (query) => {
+            const pool = getPool();
+            const q = (query || '').toLowerCase();
+            // Collapse rows pointing at the same physical file. Keyed on file_id
+            // rather than the label, because category folders that are links to
+            // one directory can yield different relative paths for one file
+            // depending on which root reached it.
+            const bestByKey = new Map();
+            for (const m of pool) {
+                const label = m.relative_path || m.filename || '';
+                const labelNorm = (label || '').toLowerCase().replace(/[\\/]+/g, '/');
+                if (q && !labelNorm.includes(q)) continue;
+                const key = (m.file_id !== undefined && m.file_id !== null) ? `id:${m.file_id}` : labelNorm;
+                const saved = savedPaths.has(m.path);
+                const matchesCategory = !!scopeCategory
+                    && (m.canonical_category || m.category) === scopeCategory;
+                const curr = bestByKey.get(key);
+                // Of the rows for one file, keep a saved pick first, then one
+                // from the node's own category - its path resolves against the
+                // folder this node actually loads from - then whatever came first.
+                const better = !curr
+                    || (saved && !curr.saved)
+                    || (saved === curr.saved && matchesCategory && !curr.matchesCategory);
+                if (better) {
+                    bestByKey.set(key, { m, label, saved, matchesCategory });
+                }
+            }
+            const items = Array.from(bestByKey.values());
+            // Saved pick first, then alphabetically by the name shown in the
+            // list. Ordering by the full path instead would group by folder and
+            // read as unsorted, since the folder is not what is listed.
+            items.sort((a, b) => {
+                if (a.saved && !b.saved) return -1;
+                if (!a.saved && b.saved) return 1;
+                const an = a.m.filename || a.label || '';
+                const bn = b.m.filename || b.label || '';
+                return an.localeCompare(bn) || (a.label || '').localeCompare(b.label || '');
+            });
+            // return all deduplicated items so user can scroll entire list
+            return items.map(x => x.m);
+        };
+
+        let currentItems = [];
+        let activeIndex = -1;
+        // Align dropdown under input and size to fit longest item (min: input width)
+        const updateListPosition = () => {
+            try {
+                const wrapRect = comboWrap.getBoundingClientRect();
+                const inputRect = inputEl.getBoundingClientRect();
+                const left = Math.max(0, Math.round(inputRect.left - wrapRect.left));
+                const minW = Math.round(inputRect.width);
+                const prevDisplay = listEl.style.display;
+                const prevVis = listEl.style.visibility;
+                if (prevDisplay === 'none') {
+                    listEl.style.visibility = 'hidden';
+                    listEl.style.display = 'block';
+                }
+                const prevWidth = listEl.style.width;
+                listEl.style.width = 'auto';
+                // Prevent wrapping in labels when measuring
+                try {
+                    listEl.querySelectorAll('code').forEach(c => c.style.whiteSpace = 'nowrap');
+                } catch (e) { }
+                let contentW = Math.ceil(listEl.scrollWidth);
+                const viewportRight = window.innerWidth - 16;
+                const maxAllowed = Math.max(200, viewportRight - inputRect.left);
+                const finalW = Math.max(minW, Math.min(contentW || minW, maxAllowed));
+                listEl.style.left = left + 'px';
+                listEl.style.right = 'auto';
+                listEl.style.width = finalW + 'px';
+                if (prevDisplay === 'none') {
+                    listEl.style.display = prevDisplay;
+                    listEl.style.visibility = prevVis || '';
+                    listEl.style.width = prevWidth;
+                }
+            } catch (_) { }
+        };
+        const openList = () => { updateListPosition(); listEl.style.display = 'block'; };
+        const closeList = () => { listEl.style.display = 'none'; activeIndex = -1; this._hidePreview(); };
+        const isOpen = () => listEl.style.display !== 'none';
+
+        const updateList = () => {
+            const q = inputEl.value || '';
+            currentItems = buildSuggestions(q);
+            if (currentItems.length && activeIndex < 0) activeIndex = 0;
+            if (!currentItems.length) activeIndex = -1;
+            renderList(currentItems, q, activeIndex);
+            // Recompute width for new content
+            updateListPosition();
+        };
+
+        inputEl.addEventListener('focus', () => { openList(); updateList(); });
+        inputEl.addEventListener('input', this.debounce(() => { updateList(); openList(); }, 120));
+        if (scopeEl) {
+            scopeEl.addEventListener('change', () => { updateList(); openList(); inputEl.focus(); });
+        }
+        // Keep dropdown aligned on resize
+        window.addEventListener('resize', updateListPosition);
+        if (window.ResizeObserver) {
+            try {
+                const roPos = new ResizeObserver(() => updateListPosition());
+                roPos.observe(comboWrap);
+                roPos.observe(inputEl);
+                this._comboROs = (this._comboROs || []).concat(roPos);
+            } catch (e) { /* ignore */ }
+        }
+        inputEl.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') { closeList(); return; }
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                if (!isOpen()) { openList(); updateList(); return; }
+                if (!currentItems.length) return;
+                activeIndex = Math.min(currentItems.length - 1, (activeIndex < 0 ? 0 : activeIndex + 1));
+                renderList(currentItems, inputEl.value || '', activeIndex);
+                return;
+            }
+            if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                if (!isOpen()) { openList(); updateList(); return; }
+                if (!currentItems.length) return;
+                activeIndex = Math.max(0, (activeIndex < 0 ? 0 : activeIndex - 1));
+                renderList(currentItems, inputEl.value || '', activeIndex);
+                return;
+            }
+            if (e.key === 'Enter') {
+                if (!isOpen()) return;
+                if (activeIndex >= 0 && activeIndex < currentItems.length) {
+                    const chosen = currentItems[activeIndex];
+                    if (chosen) {
+                        this.queueResolution(missing, chosen);
+                        inputEl.value = chosen.filename || chosen.relative_path || '';
+                        inputEl.title = chosen.relative_path || '';
+                        closeList();
+                    }
+                }
+                return;
+            }
+        });
+        listEl.addEventListener('mousedown', (e) => {
+            const item = e.target.closest('[data-idx]');
+            if (!item) return;
+            const idx = parseInt(item.getAttribute('data-idx'), 10);
+            const chosen = currentItems[idx];
+            if (chosen) {
+                this.queueResolution(missing, chosen);
+                inputEl.value = chosen.filename || chosen.relative_path || '';
+                inputEl.title = chosen.relative_path || '';
+                closeList();
+            }
+        });
+        // Preview on hover over dropdown items (event delegation)
+        listEl.addEventListener('mouseover', (e) => {
+            const item = e.target.closest('[data-idx]');
+            if (!item) return;
+            const idx = parseInt(item.getAttribute('data-idx'), 10);
+            const model = currentItems[idx];
+            if (model) {
+                this._showPreview(model.category || missing.category, model.relative_path || model.filename, item);
+            }
+        });
+        listEl.addEventListener('mouseleave', () => {
+            this._hidePreview();
+        });
+        document.addEventListener('click', (e) => {
+            if (!comboWrap.contains(e.target)) closeList();
+        });
+        if (refreshBtn) {
+            refreshBtn.addEventListener('click', async () => {
+                // Same path as the initial load, so the refreshed list keeps its
+                // labels and ordering instead of arriving in raw scan order
+                await this.ensureAllModelsLoaded({ force: true });
+                updateList(); openList();
+            });
+        }
+    }
+
+    // Center and select a node in the current graph by ID
+    locateNodeInGraph(nodeId) {
+        try {
+            if (!app || !app.graph) {
+                this.showNotification('Graph not available', 'error');
+                return;
+            }
+            let node = null;
+            if (typeof app.graph.getNodeById === 'function') {
+                try { node = app.graph.getNodeById(nodeId); } catch (e) { /* ignore */ }
+            }
+            if (!node && app.graph._nodes_by_id) {
+                node = app.graph._nodes_by_id[nodeId];
+            }
+            if (!node) {
+                this.showNotification('Node not found in current view', 'error');
+                return;
+            }
+            const canvas = app.canvas;
+            if (canvas) {
+                // Deselect other nodes
+                if (typeof canvas.deselectAllNodes === 'function') {
+                    try { canvas.deselectAllNodes(); } catch (e) { }
+                }
+                // Select this node
+                if (typeof canvas.selectNode === 'function') {
+                    try { canvas.selectNode(node, true); } catch (e) { }
+                } else if (typeof canvas.selectNodes === 'function') {
+                    try { canvas.selectNodes([node], true); } catch (e) { }
+                }
+                // Center on node
+                if (typeof canvas.centerOnNode === 'function') {
+                    try { canvas.centerOnNode(node); } catch (e) { }
+                } else if (typeof canvas.scrollToCenter === 'function') {
+                    try { canvas.scrollToCenter(); } catch (e) { }
+                }
+            }
+        } catch (error) {
+            console.error('Model Linker: locateNodeInGraph error', error);
+        }
+    }
+
+    /**
+     * Locate a live node that lives inside a subgraph instance's inner graph.
+     *
+     * The root graph (app.graph) only contains top-level nodes and subgraph
+     * *instance* nodes. The nodes defined *inside* a subgraph live in each
+     * instance's own inner graph, reachable via `subgraphNode.subgraph`.
+     * This walks all subgraph instances (recursively, for nested subgraphs)
+     * and returns the matching inner node.
+     *
+     * @param {object} graph    A live LGraph (start with app.graph)
+     * @param {string} subgraphId  Definition UUID of the owning subgraph
+     * @param {number|string} nodeId  Inner node id from the serialized definition
+     * @returns {object|null} The live LGraphNode, or null if not found
+     */
+    findLiveNodeInSubgraphs(graph, subgraphId, nodeId) {
+        const getInner = (n) => {
+            try {
+                if (typeof n.isSubgraphNode === 'function') {
+                    return n.isSubgraphNode() ? (n.subgraph || null) : null;
+                }
+                return n.subgraph || null;
+            } catch (e) {
+                return null;
+            }
+        };
+        const lookup = (sub) => {
+            if (!sub) return null;
+            if (typeof sub.getNodeById === 'function') {
+                const hit = sub.getNodeById(nodeId);
+                if (hit) return hit;
+            }
+            if (sub._nodes_by_id && sub._nodes_by_id[nodeId]) return sub._nodes_by_id[nodeId];
+            return null;
+        };
+
+        // Collect every subgraph instance's inner graph, recursively.
+        const innerGraphs = [];
+        const visit = (g) => {
+            const nodes = (g && (g._nodes || g.nodes)) || [];
+            for (const n of nodes) {
+                const inner = getInner(n);
+                if (inner) {
+                    innerGraphs.push(inner);
+                    visit(inner);
+                }
+            }
+        };
+        visit(graph);
+
+        // First pass: match the owning subgraph by its definition id (most precise).
+        if (subgraphId) {
+            for (const sub of innerGraphs) {
+                if (sub.id === subgraphId) {
+                    const hit = lookup(sub);
+                    if (hit) return hit;
+                }
+            }
+        }
+        // Fallback: id mismatch (older/newer frontends may key differently) —
+        // search every subgraph for a node with this id.
+        for (const sub of innerGraphs) {
+            const hit = lookup(sub);
+            if (hit) return hit;
+        }
+        return null;
+    }
+
+    /**
+     * Update workflow in ComfyUI's UI/memory
+     * Updates the current workflow in place instead of creating a new tab
+     */
+    async updateWorkflowInComfyUI(workflow, resolutions) {
+        if (!app || !app.graph) {
+            console.warn('Model Linker: Could not update workflow - app or app.graph not available');
+            return;
+        }
+
+        try {
+            // Strategy: Directly update only the changed widget values on live graph nodes.
+            // Previous approach used graph.configure() which clears the entire graph and
+            // rebuilds from scratch — causing all nodes to disappear on newer ComfyUI versions.
+            if (resolutions && resolutions.length > 0) {
+                let updatedCount = 0;
+
+                for (const res of resolutions) {
+                    const nodeId = res.node_id;
+                    const widgetIndex = res.widget_index;
+
+                    // Get the new value from the updated workflow returned by backend
+                    let newValue = undefined;
+                    const workflowNodes = workflow?.nodes || [];
+                    for (const wn of workflowNodes) {
+                        if (wn.id === nodeId) {
+                            const wv = wn.widgets_values;
+                            if (Array.isArray(wv) && widgetIndex >= 0 && widgetIndex < wv.length) {
+                                newValue = wv[widgetIndex];
+                            } else if (wv && typeof wv === 'object' && widgetIndex in wv) {
+                                newValue = wv[widgetIndex];
+                            }
+                            break;
+                        }
+                    }
+
+                    // Also check subgraph definitions if not found in top-level nodes
+                    if (newValue === undefined && res.subgraph_id && res.is_top_level === false) {
+                        const defs = (workflow?.definitions?.subgraphs) || [];
+                        for (const sg of defs) {
+                            if (sg.id === res.subgraph_id) {
+                                for (const wn of (sg.nodes || [])) {
+                                    if (wn.id === nodeId) {
+                                        const wv = wn.widgets_values;
+                                        if (Array.isArray(wv) && widgetIndex >= 0 && widgetIndex < wv.length) {
+                                            newValue = wv[widgetIndex];
+                                        } else if (wv && typeof wv === 'object' && widgetIndex in wv) {
+                                            newValue = wv[widgetIndex];
+                                        }
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if (newValue === undefined) continue;
+
+                    // Find the live node in the graph and update its widget value directly.
+                    // Nodes inside a subgraph definition do NOT live in the root graph
+                    // (app.graph) — they live in the subgraph instance's inner graph
+                    // (subgraphNode.subgraph). Route the lookup accordingly so subgraph
+                    // model widgets actually get updated on the live canvas.
+                    let node = null;
+                    if (res.is_top_level === false && res.subgraph_id) {
+                        // Definitely inside a subgraph definition — search subgraphs only.
+                        // (Inner node ids can collide with root ids, so never trust a root match here.)
+                        node = this.findLiveNodeInSubgraphs(app.graph, res.subgraph_id, nodeId);
+                    } else {
+                        node = app.graph.getNodeById(nodeId);
+                        if (!node && res.subgraph_id) {
+                            node = this.findLiveNodeInSubgraphs(app.graph, res.subgraph_id, nodeId);
+                        }
+                    }
+                    if (!node) {
+                        console.debug(`Model Linker: Node ${nodeId} not found in live graph (subgraph_id=${res.subgraph_id || 'none'})`);
+                        continue;
+                    }
+
+                    if (node.widgets && node.widgets[widgetIndex]) {
+                        const widget = node.widgets[widgetIndex];
+                        const oldValue = widget.value;
+                        // Make sure the resolved value is actually a selectable option,
+                        // otherwise a combo widget keeps treating it as missing.
+                        try {
+                            const plainVal = (res.nested_key && newValue && typeof newValue === 'object')
+                                ? newValue[res.nested_key] : newValue;
+                            const vals = widget.options && widget.options.values;
+                            if (Array.isArray(vals) && typeof plainVal === 'string' && !vals.includes(plainVal)) {
+                                vals.push(plainVal);
+                            }
+                        } catch (_) { /* ignore */ }
+                        // For nested dict widgets (e.g. Power Lora Loader), update only the
+                        // specific key to preserve other properties (on, strength, etc.)
+                        if (res.list_index !== undefined && res.list_index !== null) {
+                            // The widget holds a list of entries (Lora Manager).
+                            // The backend returned the whole updated list, so
+                            // assigning it keeps every other entry intact.
+                            widget.value = newValue;
+                        } else if (res.nested_key && widget.value && typeof widget.value === 'object' && typeof newValue === 'object') {
+                            widget.value[res.nested_key] = newValue[res.nested_key];
+                        } else {
+                            widget.value = newValue;
+                        }
+                        // Trigger widget callback if available (updates combo dropdowns, etc.)
+                        if (typeof widget.callback === 'function') {
+                            try { widget.callback(widget.value); } catch (_) { /* ignore */ }
+                        }
+                        // Fire the node's onWidgetChanged hook — this is what ComfyUI's
+                        // error-clearing hooks listen to in order to drop the "missing model"
+                        // flag and remove the red outline. Setting widget.value alone does NOT
+                        // trigger it (that's why users had to toggle the combo manually).
+                        try {
+                            node.onWidgetChanged?.(widget.name, widget.value, oldValue, widget);
+                        } catch (_) { /* ignore */ }
+                        try { node.graph?.incrementVersion?.(); } catch (_) { /* ignore */ }
+                        updatedCount++;
+                    }
+                }
+
+                // Refresh the canvas to reflect changes
+                if (updatedCount > 0) {
+                    app.graph.setDirtyCanvas(true, true);
+                }
+                return;
+            }
+
+            // Fallback: if no resolutions provided, use loadGraphData
+            if (app.loadGraphData) {
+                await app.loadGraphData(workflow, false, false, null);
+            }
+        } catch (error) {
+            console.error('Model Linker: Error updating workflow in ComfyUI:', error);
+        }
+    }
+}

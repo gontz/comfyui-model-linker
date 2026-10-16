@@ -299,7 +299,8 @@ class EngineGuaranteesTests(LibraryTestCase):
     # -- item 9: an unsafe path inside the repo ------------------------------
 
     def test_unsafe_repo_path_is_refused_before_anything_is_spawned(self):
-        for bad in ('../evil.safetensors', '/evil.safetensors', '\\evil.safetensors', 'C:evil.safetensors'):
+        for bad in ('../evil.safetensors', '/evil.safetensors', '\\evil.safetensors', 'C:evil.safetensors',
+                    'sub/C:evil.safetensors'):
             with self.subTest(bad=bad):
                 download_id, dest_path = self._seed('d.safetensors')
 

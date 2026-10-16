@@ -120,13 +120,19 @@ def _unsafe_repo_path(filename: str) -> bool:
     staging directory. The eventual ComfyUI destination is validated
     separately and unconditionally by `downloader.resolve_destination`;
     this only guards the repo-side path handed to the worker process.
+
+    A drive letter is checked on every segment, not just the start of the
+    name: `sub/C:evil.safetensors` is not absolute and has no `..` segment,
+    but joining it on Windows still produces the drive-relative path
+    `C:evil.safetensors`, which is outside staging. huggingface_hub 1.33
+    happens to refuse that itself, but the engine supports 1.1 and up.
     """
     if not filename:
         return True
     normalized = filename.replace('\\', '/')
-    if normalized.startswith('/') or _UNSAFE_DRIVE_RE.match(normalized):
+    if normalized.startswith('/'):
         return True
-    return any(segment == '..' for segment in normalized.split('/'))
+    return any(segment == '..' or _UNSAFE_DRIVE_RE.match(segment) for segment in normalized.split('/'))
 
 
 def _terminate_and_wait(proc: subprocess.Popen) -> None:
@@ -170,8 +176,8 @@ def download_hf_model(
 ) -> bool:
     """Download one file out of a HuggingFace repo straight into dest_dir,
     flattened to dest_filename. Mutates the shared download_progress dict
-    the same way downloader.download_file does, so the existing polling
-    endpoint and frontend work completely unchanged.
+    the same way downloader._stream (the classic streaming engine) does, so
+    the existing polling endpoint and frontend work completely unchanged.
 
     Returns True once the file has landed at dest_path, ready to be hashed;
     False on any failure or cancellation (the record's own 'status' and

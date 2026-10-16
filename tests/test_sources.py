@@ -129,6 +129,47 @@ class MalformedTokenTests(unittest.TestCase):
             self.assertNotIn('LEAKME', line)
 
 
+class SearchCacheTests(unittest.TestCase):
+    """A rate limit or an outage is not an answer: only a complete search
+    that genuinely found nothing may be cached as 'not found'."""
+
+    def setUp(self):
+        huggingface._search_cache.clear()
+        civitai._search_cache.clear()
+        self.addCleanup(huggingface._search_cache.clear)
+        self.addCleanup(civitai._search_cache.clear)
+
+    def test_huggingface_rate_limit_is_not_cached(self):
+        with mock.patch.object(requests, 'get', lambda url, **kw: FakeResponse(429, None)):
+            self.assertIsNone(huggingface.search_huggingface_for_file('a.safetensors', exact_only=True))
+        self.assertEqual(huggingface._search_cache, {})
+
+    def test_huggingface_failed_repo_listing_is_not_cached(self):
+        def get(url, **kw):
+            return FakeResponse(429, None) if '/tree/' in url else FakeResponse(200, [{'id': 'org/repo'}])
+        with mock.patch.object(requests, 'get', get):
+            self.assertIsNone(huggingface.search_huggingface_for_file('a.safetensors', exact_only=True))
+        self.assertEqual(huggingface._search_cache, {})
+
+    def test_huggingface_genuine_miss_is_cached(self):
+        def get(url, **kw):
+            return FakeResponse(200, [{'type': 'file', 'path': 'b.safetensors'}]) if '/tree/' in url \
+                else FakeResponse(200, [{'id': 'org/repo'}])
+        with mock.patch.object(requests, 'get', get):
+            self.assertIsNone(huggingface.search_huggingface_for_file('a.safetensors', exact_only=True))
+        self.assertEqual(list(huggingface._search_cache.values()), [None])
+
+    def test_civitai_rate_limit_is_not_cached(self):
+        with mock.patch.object(requests, 'get', lambda url, **kw: FakeResponse(429, None)):
+            self.assertIsNone(civitai.search_civitai_for_file('a.safetensors', exact_only=True))
+        self.assertEqual(civitai._search_cache, {})
+
+    def test_civitai_genuine_miss_is_cached(self):
+        with mock.patch.object(requests, 'get', lambda url, **kw: FakeResponse(200, {'items': []})):
+            self.assertIsNone(civitai.search_civitai_for_file('a.safetensors', exact_only=True))
+        self.assertEqual(list(civitai._search_cache.values()), [None])
+
+
 class CivArchiveTests(unittest.TestCase):
     def setUp(self):
         self._get = civarchive.requests.get

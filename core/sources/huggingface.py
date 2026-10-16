@@ -112,8 +112,6 @@ def search_huggingface_for_file(
     Returns:
         Dict with url, repo, filename if found, None otherwise
     """
-    global _search_cache
-
     cache_key = f"hf_{filename}_exact{exact_only}"
     if cache_key in _search_cache:
         return _search_cache[cache_key]
@@ -127,6 +125,9 @@ def search_huggingface_for_file(
 
     checked_repos = set()
     partial_result = None
+    # A rate limit (429) or any other non-200 is no answer: "not found" is
+    # cached only when every request this search made actually succeeded.
+    complete = True
     try:
         for query in build_search_queries(target_name):
             # Search for repos matching this query
@@ -134,6 +135,7 @@ def search_huggingface_for_file(
             response = requests.get(search_url, headers=headers, timeout=10)
             if response.status_code != 200:
                 logger.debug(f"HuggingFace search returned {response.status_code}")
+                complete = False
                 continue
 
             for repo in response.json():
@@ -147,10 +149,12 @@ def search_huggingface_for_file(
                 try:
                     files_response = requests.get(files_url, headers=headers, timeout=10)
                     if files_response.status_code != 200:
+                        complete = False
                         continue
                     files = files_response.json()
                 except Exception as e:
                     logger.debug(f"Error checking repo {repo_id}: {type(e).__name__}")
+                    complete = False
                     continue
 
                 for file_info in files:
@@ -193,7 +197,8 @@ def search_huggingface_for_file(
         if partial_result:
             logger.info(f"Found similar file for {filename} on HuggingFace: "
                         f"{partial_result['repo_id']}/{partial_result['path']}")
-        _search_cache[cache_key] = partial_result
+        if complete:
+            _search_cache[cache_key] = partial_result
         return partial_result
 
     except Exception as e:
@@ -250,40 +255,3 @@ def search_huggingface(
         logger.error(f"HuggingFace search error: {type(e).__name__}")
     
     return results
-
-
-def get_repo_files(
-    repo: str,
-    token: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Get list of model files in a HuggingFace repo."""
-    files = []
-    
-    try:
-        headers = {}
-        if token:
-            headers['Authorization'] = f'Bearer {token}'
-        
-        response = requests.get(
-            f"{HF_API_URL}/models/{repo}/tree/main",
-            headers=headers,
-            timeout=15
-        )
-        
-        if response.status_code == 200:
-            items = response.json()
-            
-            for item in items:
-                path = item.get('path', '')
-                if path.endswith(('.safetensors', '.ckpt', '.pt', '.bin', '.pth', '.onnx')):
-                    files.append({
-                        'filename': os.path.basename(path),
-                        'path': path,
-                        'url': get_huggingface_download_url(repo, path),
-                        'size': item.get('size')
-                    })
-                    
-    except Exception as e:
-        logger.error(f"Error getting repo files: {type(e).__name__}")
-    
-    return files

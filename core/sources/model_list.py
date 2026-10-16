@@ -199,10 +199,3 @@ def search_model_list_multiple(filename: str, limit: int = 5) -> List[Dict[str, 
     results.sort(key=lambda x: x['confidence'], reverse=True)
     
     return results[:limit]
-
-
-def reload_model_list():
-    """Force reload of model list."""
-    global _model_list_cache
-    _model_list_cache = None
-    _load_model_list()

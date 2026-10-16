@@ -88,8 +88,6 @@ def search_civitai_for_file(
     Returns:
         Dict with download info if found, None otherwise
     """
-    global _search_cache
-    
     cache_key = f"civit_{filename}_exact{exact_only}"
     if cache_key in _search_cache:
         return _search_cache[cache_key]

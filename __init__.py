@@ -65,6 +65,7 @@ class ModelLinkerExtension:
                     delete_override,
                     clear_overrides,
                     replace_overrides,
+                    resolutions_to_record,
                 )
             except ImportError as e:
                 self.logger.error(f"Model Linker: Could not import core modules: {e}")
@@ -195,7 +196,7 @@ class ModelLinkerExtension:
                                 return None
 
                         selections = []
-                        for res in resolutions:
+                        for res in resolutions_to_record(resolutions):
                             # Expect original_path from client; otherwise derive from pre-update workflow
                             original_path = res.get('original_path')
                             if not original_path:

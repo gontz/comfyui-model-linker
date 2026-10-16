@@ -309,3 +309,13 @@ def record_override(original_path: str, category: Optional[str], resolved: Dict[
         "resolved": resolved,
         "resolved_path": resolved_path,
     }]) > 0
+
+
+def resolutions_to_record(resolutions: Any) -> List[Dict[str, Any]]:
+    """
+    The resolutions worth remembering as overrides. A swap of a model that is
+    present sends `record_override: False`: it is a preference for this
+    workflow, not the answer to "where did this missing model go".
+    """
+    return [r for r in (resolutions or [])
+            if isinstance(r, dict) and r.get('record_override') is not False]

@@ -223,5 +223,24 @@ class OverridesInAnalysisTests(OverridesTestCase):
         self.assertTrue(matches[0]['is_override'])
 
 
+class RecordOverrideFlagTests(unittest.TestCase):
+    """A swap replaces a model that is present; it is not a fix worth remembering."""
+
+    def test_swaps_are_not_recorded(self):
+        from core.overrides import resolutions_to_record
+        kept = resolutions_to_record([
+            {'original_path': 'a.safetensors'},
+            {'original_path': 'b.safetensors', 'record_override': False},
+            {'original_path': 'c.safetensors', 'record_override': True},
+            'not a resolution',
+        ])
+        self.assertEqual([r['original_path'] for r in kept], ['a.safetensors', 'c.safetensors'])
+
+    def test_resolve_route_uses_the_filter(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, '__init__.py'), encoding='utf-8') as handle:
+            self.assertIn('for res in resolutions_to_record(resolutions):', handle.read())
+
+
 if __name__ == '__main__':
     unittest.main()

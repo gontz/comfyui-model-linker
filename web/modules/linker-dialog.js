@@ -9,6 +9,7 @@ import { ManageOverridesDialog } from "./overrides-dialog.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import {
     escapeHtml,
+    groupPresentModels,
     isPerfectMatch,
     isSelectableModel,
     refKey,
@@ -1138,46 +1139,61 @@ export class LinkerManagerDialog {
      * not the task. A <details> element so the browser handles the toggling.
      */
     renderPresentModels(present) {
-        if (!present || !present.length) return '';
-
-        const rows = [...present].sort((a, b) => {
-            const byCategory = (a.category || '').localeCompare(b.category || '');
-            return byCategory || (a.original_path || '').localeCompare(b.original_path || '');
-        });
+        const groups = groupPresentModels(present);
+        this._presentGroups = groups;
+        if (!groups.length) return '';
 
         let html = `<details id="model-linker-present" style="margin-top:16px;">`
-            + `<summary style="cursor:pointer; opacity:.85;">Models found on disk (${rows.length})</summary>`
+            + `<summary style="cursor:pointer; opacity:.85;">Models found on disk (${groups.length}) — swap any of them</summary>`
             + `<div style="display:flex; flex-direction:column; gap:4px; margin-top:8px;">`;
 
-        rows.forEach((model, index) => {
-            const name = escapeHtml((model.original_path || '').split(/[\\/]/).pop() || '');
-            const path = escapeHtml(model.original_path || '');
-            const category = escapeHtml(model.category || 'unknown');
-            const node = escapeHtml(`${model.node_type || 'Node'} #${model.node_id}`);
-            const where = model.subgraph_name ? ` · ${escapeHtml(model.subgraph_name)}` : '';
-            html += `<div style="display:flex; align-items:center; gap:8px; padding:4px 6px; border-bottom:1px solid var(--border-color);">`
-                + `<code style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${path}">${name}</code>`
-                + `<span style="flex:0 0 auto; opacity:.75; font-size:12px;">[${category}]</span>`
-                + `<span style="flex:0 0 auto; opacity:.6; font-size:12px;">${node}${where}</span>`
+        groups.forEach((group, index) => {
+            const first = group.refs[0];
+            const users = group.refs.length === 1
+                ? escapeHtml(`${first.node_type || 'Node'} #${first.node_id}${first.subgraph_name ? ` · ${first.subgraph_name}` : ''}`)
+                : `${group.refs.length} nodes`;
+            html += `<div style="border-bottom:1px solid var(--border-color); padding:4px 6px;">`
+                + `<div style="display:flex; align-items:center; gap:8px;">`
+                + `<code style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(first.original_path)}">${escapeHtml(group.name)}</code>`
+                + `<span style="flex:0 0 auto; opacity:.75; font-size:12px;">[${escapeHtml(group.category)}]</span>`
+                + `<span style="flex:0 0 auto; opacity:.6; font-size:12px;">${users}</span>`
+                + `<button id="present-swap-${index}" class="model-linker-resolve-btn" style="flex:0 0 auto; padding:2px 8px;" title="Replace this model in every node that uses it">⇄ Swap</button>`
                 + `<button id="present-reveal-${index}" class="model-linker-resolve-btn" style="flex:0 0 auto; padding:2px 8px;" title="Show in the file manager">📂</button>`
-                + `</div>`;
+                + `</div>`
+                + `<div id="present-swap-panel-${index}" style="display:none; padding:6px 0;">`
+                + `<div id="selected-${refSlot(first)}" class="model-linker-selected" style="display:none; margin: 4px 0; padding: 6px; border: 1px solid var(--border-color, #444); border-radius: 4px;"></div>`
+                + `</div></div>`;
         });
 
-        html += '</div></details>';
-        this._presentRows = rows;
-        return html;
+        return html + '</div></details>';
     }
 
-    /** Wire the folder buttons in the found-on-disk list. */
+    /** Wire the folder/swap buttons in the found-on-disk list. */
     attachPresentModelHandlers(container) {
-        (this._presentRows || []).forEach((model, index) => {
-            const button = container.querySelector(`#present-reveal-${index}`);
-            if (button) {
-                button.onclick = () => this.revealModel({
-                    category: model.category,
-                    relative_path: model.original_path,
-                });
+        (this._presentGroups || []).forEach((group, index) => {
+            const first = group.refs[0];
+            const reveal = container.querySelector(`#present-reveal-${index}`);
+            if (reveal) {
+                reveal.onclick = () => this.revealModel({ category: first.category, relative_path: first.original_path });
             }
+            const swap = container.querySelector(`#present-swap-${index}`);
+            const panel = container.querySelector(`#present-swap-panel-${index}`);
+            if (!swap || !panel) return;
+            swap.onclick = async () => {
+                const opening = panel.style.display === 'none';
+                panel.style.display = opening ? '' : 'none';
+                if (!opening || panel.dataset.ready) return;
+                panel.dataset.ready = '1';
+                await this.ensureAllModelsLoaded();
+                // A present model has no fuzzy matches; the picker lists the folder
+                this.attachModelCombo(panel, { ...first, matches: [] }, (model) => {
+                    group.refs.forEach((ref) => this.queueResolution({ ...ref, record_override: false }, model));
+                    // The bar shows the first reference only; its Remove must
+                    // drop the swap from every node, not just that one
+                    const remove = panel.querySelector(`#selected-remove-${refSlot(first)}`);
+                    if (remove) remove.onclick = () => group.refs.forEach((ref) => this.removeQueuedResolution(ref));
+                });
+            };
         });
     }
 
@@ -1707,6 +1723,8 @@ export class LinkerManagerDialog {
             nested_key: missing.nested_key || null,
             list_index: (missing.list_index ?? null),
             adapter_id: missing.adapter_id || null,
+            // A swap replaces a model that is present; /resolve must not save it as an override
+            record_override: missing.record_override !== false,
             node_type: missing.node_type,
             node_label: missing.subgraph_name || missing.node_type
         };
@@ -1877,7 +1895,7 @@ export class LinkerManagerDialog {
 
     // Build and wire a node-like combo picker, scoped by default to the folder
     // the node actually loads from
-    attachModelCombo(container, missing) {
+    attachModelCombo(container, missing, onChoose = (model) => this.queueResolution(missing, model)) {
         const category = (missing.category && missing.category !== 'unknown') ? missing.category : null;
         const inputId = `combo-input-${refSlot(missing)}`;
         const listId = `combo-list-${refSlot(missing)}`;
@@ -2110,7 +2128,7 @@ export class LinkerManagerDialog {
                 if (activeIndex >= 0 && activeIndex < currentItems.length) {
                     const chosen = currentItems[activeIndex];
                     if (chosen) {
-                        this.queueResolution(missing, chosen);
+                        onChoose(chosen);
                         inputEl.value = chosen.filename || chosen.relative_path || '';
                         inputEl.title = chosen.relative_path || '';
                         closeList();
@@ -2125,7 +2143,7 @@ export class LinkerManagerDialog {
             const idx = parseInt(item.getAttribute('data-idx'), 10);
             const chosen = currentItems[idx];
             if (chosen) {
-                this.queueResolution(missing, chosen);
+                onChoose(chosen);
                 inputEl.value = chosen.filename || chosen.relative_path || '';
                 inputEl.title = chosen.relative_path || '';
                 closeList();
@@ -2295,6 +2313,8 @@ export class LinkerManagerDialog {
             // Previous approach used graph.configure() which clears the entire graph and
             // rebuilds from scratch — causing all nodes to disappear on newer ComfyUI versions.
             if (resolutions && resolutions.length > 0) {
+                app.canvas?.emitBeforeChange?.();
+                try {
                 let updatedCount = 0;
 
                 for (const res of resolutions) {
@@ -2406,6 +2426,9 @@ export class LinkerManagerDialog {
                     app.graph.setDirtyCanvas(true, true);
                 }
                 return;
+                } finally {
+                    app.canvas?.emitAfterChange?.();
+                }
             }
 
             // Fallback: if no resolutions provided, use loadGraphData

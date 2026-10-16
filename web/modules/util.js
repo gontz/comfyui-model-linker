@@ -109,3 +109,26 @@ export function notifyError(summary, error) {
 export function isPerfectMatch(match) {
     return match?.confidence === 100 && !match?.category_mismatch;
 }
+
+/**
+ * Present-model references grouped by file: one row per (folder, path), with
+ * every reference that loads it. A swap then updates all of them at once.
+ */
+export function groupPresentModels(present) {
+    const groups = new Map();
+    for (const ref of present || []) {
+        const category = ref.canonical_category || ref.category || "unknown";
+        const key = `${category}|${ref.original_path}`;
+        if (!groups.has(key)) {
+            groups.set(key, {
+                key,
+                name: (ref.original_path || "").split(/[\\/]/).pop(),
+                category,
+                refs: [],
+            });
+        }
+        groups.get(key).refs.push(ref);
+    }
+    return [...groups.values()].sort((a, b) =>
+        a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
+}

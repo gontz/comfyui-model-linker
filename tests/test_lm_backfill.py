@@ -16,7 +16,7 @@ try:
 except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
-from core import hf_identify, lm_api, lm_backfill, overrides, routes_downloads
+from core import hf_identify, lm_api, lm_backfill, lm_readme_guard, overrides, routes_downloads
 from support import LibraryTestCase
 
 SHA = 'ab' * 32
@@ -47,7 +47,8 @@ class BackfillTestCase(LibraryTestCase):
             getattr(fake, name).side_effect = (lambda n: lambda *a, **k: self.calls.append((n, a, k)))(name)
         fake.hydrate_huggingface.side_effect = self._default_hydrate
         for patcher in (mock.patch.object(lm_backfill, 'lm_api', fake),
-                        mock.patch.object(lm_backfill, 'PAUSE_BETWEEN_MODELS', 0)):
+                        mock.patch.object(lm_backfill, 'PAUSE_BETWEEN_MODELS', 0),
+                        mock.patch.object(lm_readme_guard, 'card_is_safe', return_value=True)):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -182,6 +183,28 @@ class RunTests(BackfillTestCase):
         self.assertNotIn('link_huggingface', self.names())
         with open(os.path.join(self.data_dir, 'lm-backfill.json'), encoding='utf-8') as handle:
             self.assertEqual(json.load(handle)['results'][0]['outcome'], 'not_found')
+
+    def test_a_card_that_would_freeze_lora_manager_is_never_handed_to_it(self):
+        """Neither linked nor hydrated: a link alone lets Lora Manager's own refresh read it."""
+        for linked in (True, False):
+            with self.subTest(linked=linked):
+                del self.calls[:]
+                self.write_sidecar(**({'source_url': 'https://huggingface.co/o/r'} if linked else {}))
+                with mock.patch.object(lm_readme_guard, 'card_is_safe', return_value=False),                      mock.patch.object(hf_identify, 'find_repo',
+                                       return_value={'repo': 'o/r', 'card': None, 'how': 'sha256'}):
+                    lm_backfill._run(use_ai=False)
+                self.assertNotIn('link_huggingface', self.names())
+                self.assertNotIn('hydrate_huggingface', self.names())
+                result = lm_backfill.status()['results'][0]
+                self.assertEqual((result['outcome'], result['repo']), ('card_would_hang', 'o/r'))
+
+    def test_a_card_that_could_not_be_checked_is_left_for_the_next_run(self):
+        self.write_sidecar(source_url='https://huggingface.co/o/r')
+        with mock.patch.object(lm_readme_guard, 'card_is_safe', return_value=None):
+            lm_backfill._run(use_ai=False)
+        self.assertNotIn('hydrate_huggingface', self.names())
+        self.assertEqual(lm_backfill.status()['counts'], {'card_unchecked': 1})
+        self.assertEqual(len(lm_backfill.candidates()), 1)  # still empty, so still a candidate
 
     def test_a_link_to_another_site_is_left_untouched(self):
         """

@@ -82,6 +82,11 @@ requires no network call during analysis, and stays.
   persists in `data/lm-backfill.json` (gitignored). `GET /lm-backfill` (polled by the
   dialog) returns only the last 20 results plus `results_total`; the full list stays in
   the live state and on disk. See "Lora Manager sidecars" below.
+- **Lora Manager 1.2.5 hangs ComfyUI on some HuggingFace READMEs** (an infinite loop in
+  its `_md_to_html`, run on the event loop; every mradermacher GGUF card). Every path that
+  links or hydrates a HF repo goes through `lm_readme_guard.card_is_safe(repo)` first —
+  `lm_backfill._fill` and `lm_sidecar.on_download_complete`. Add any new one there too.
+  See `docs/lora-manager-readme-hang.md`.
 - **Never interpolate a request exception's text** (`{e}`, `str(e)`) anywhere headers
   carried a token: a token with a CR/LF makes requests raise `InvalidHeader` with the whole
   `Authorization` value in its message. Report `type(e).__name__` (re-raise `from None`),
@@ -95,7 +100,7 @@ requires no network call during analysis, and stays.
   `metadata/*.json` and `tools/build_hf_index.py`, `core/source_chain.py`,
   `core/lookups.py`, `core/downloader.py`, `core/hf_downloader.py`/`core/_hf_worker.py`,
   `core/civitai_meta.py`, `core/lm_sidecar.py`, `core/online_search.py`, `core/lm_api.py`,
-  `core/hf_identify.py`, `core/lm_backfill.py`, `core/exporter.py`, and
+  `core/hf_identify.py`, `core/lm_backfill.py`, `core/lm_readme_guard.py`, `core/exporter.py`, and
   `core/routes_downloads.py`/`core/routes_export.py`.
 - **Everything above except the settings store (`core/settings.py`,
   `core/routes_settings.py`) registers only when `requests` imports** (`__init__.py`'s

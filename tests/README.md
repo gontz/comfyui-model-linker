@@ -45,7 +45,8 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `test_lm_sidecar.py` | Lora Manager sidecar/preview writing: no-clobber landing, case-insensitive folder discovery, `autov3` omitted (not `null`) when CivitAI has none; validates against Lora Manager's published schema when it is installed alongside |
 | `test_online_search.py` | scores and returns similar-model candidates (CivitAI + HuggingFace); one failing source doesn't hide the others, tokens go only to their own host, a total outage is reported rather than returning empty — the same-basename refusal itself is frontend-only, see `js/test_downloads.mjs` |
 | `test_hf_identify.py` | identifying a HuggingFace repo by SHA-256 |
-| `test_lm_backfill.py` | the Lora Manager HuggingFace backfill: no forced scans, `linked_elsewhere` for non-HF links, `hydrated` verified against pre-hydration values (else `no_card`), AI gated to models with no trigger words/notes/usage tips/base model, `trainedWords_before` restore trail, `interrupted` after a restart, `limit` |
+| `test_lm_backfill.py` | the Lora Manager HuggingFace backfill: no forced scans, `linked_elsewhere` for non-HF links, `hydrated` verified against pre-hydration values (else `no_card`), AI gated to models with no trigger words/notes/usage tips/base model, `trainedWords_before` restore trail, `interrupted` after a restart, `limit`, a card that would freeze Lora Manager never linked or hydrated |
+| `test_lm_readme_guard.py` | the README pre-screen: shapes that hang Lora Manager 1.2.5's converter and shapes it reads, `main` then `master`, a failed fetch is unknown and not cached, the copy in `docs/lora-manager-readme-hang.md` matches |
 | `test_registration.py` | route registration in `__init__.py`: a failing Export leaves lookups working; `/analyze` answers `lookups_available` |
 | `test_exporter.py` | `strip_secrets` (userinfo, fragment, `;params`, secret query keys incl. AWS/GCS, losslessly); the exported note and node links |
 | `js/test_extension.mjs` | registration (`commands`, `settings`, `afterConfigureGraph`, `nodeCreated`, `getCanvasMenuItems`); only `scripts/app.js`/`scripts/api.js` imported |
@@ -64,7 +65,7 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 
 Suites that need `requests` (`test_sources.py`, `test_source_chain.py`, `test_downloader.py`,
 `test_hf_routing.py`, `test_online_search.py`, `test_hf_identify.py`, `test_lm_backfill.py`,
-`test_lm_sidecar.py`, `test_registration.py`) are reported as skipped, not failing, when it is not installed.
+`test_lm_readme_guard.py`, `test_lm_sidecar.py`, `test_registration.py`) are reported as skipped, not failing, when it is not installed.
 
 `support.py` holds the fixtures. `LibraryTestCase` gives each test a temporary
 `models/` tree wired into the fake `folder_paths`; `add_models` creates files

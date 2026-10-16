@@ -101,7 +101,8 @@ export class SettingsDialog {
     renderBackfill(state) {
         const c = state?.counts || {};
         const order = [["hydrated", "hydrated"], ["no_card", "no card"], ["linked_elsewhere", "linked elsewhere"],
-            ["not_found", "not found"], ["skipped", "skipped"], ["failed", "failed"]];
+            ["not_found", "not found"], ["card_would_hang", "card would freeze Lora Manager"],
+            ["card_unchecked", "card unchecked"], ["skipped", "skipped"], ["failed", "failed"]];
         // AI-skip count stays out of `order` and gets its own separator -
         // it's not an outcome of the fill itself, just a note about which
         // hydrated models the (opt-in) AI step was allowed to touch.

@@ -87,7 +87,7 @@ Other shapes that hang:
 
 ## A cheap pre-screen
 
-This check agreed with a ground-truth hang detector on all 46 READMEs. It needs the raw
+Model Linker ships this check as `core/lm_readme_guard.py`. It agreed with a ground-truth hang detector on all 46 READMEs. It needs the raw
 README (`https://huggingface.co/{repo}/raw/main/README.md`), the same file Lora Manager
 fetches anyway. Model Linker's `hf_identify.card()` returns the API JSON, which does not
 include the README body.
@@ -132,9 +132,12 @@ assert not lm_readme_would_hang("***\n# x\n|a|\n|-|\n|b|\n- item\n> q")
 
 ## Until Lora Manager is fixed
 
-- **Exclude the affected models in Lora Manager.** Model Linker's fill skips models Lora
-  Manager marks `exclude`.
-- **Or have the fill pre-screen each repo** with the check above before asking Lora Manager to
-  hydrate it. This is not built in yet.
+- **Model Linker screens every card first.** Before the fill or a HuggingFace download links
+  or hydrates a repo, it fetches the same README and runs the check above. A card that would
+  hang is not handed over; the fill reports it as `card_would_hang` with the repo name. A card
+  that could not be fetched is `card_unchecked` and is tried again on the next run.
+- **Exclude the affected models in Lora Manager.** The screen protects only Model Linker's own
+  calls; anything else that makes Lora Manager read such a card still hangs. Model Linker's
+  fill skips models Lora Manager marks `exclude`.
 - If ComfyUI is already frozen, restart it. The fill stops when Lora Manager stops answering,
   and running it again carries on where it stopped.

@@ -91,8 +91,10 @@ is linked to a repo. This fills that gap for models whose Lora Manager info is e
 
 1. It identifies the repo the file came from **by its SHA-256 only**. A name match alone
    never links.
-2. It links the repo.
-3. It lets Lora Manager read the card.
+2. It checks the repo's model card, and skips any card Lora Manager cannot read (see Known
+   issues).
+3. It links the repo.
+4. It lets Lora Manager read the card.
 
 Existing trigger words are kept. A model you linked to another site is left alone. The
 optional AI enrichment is used only for models that have no trigger words, notes, usage
@@ -114,7 +116,8 @@ stops by itself if Lora Manager stops answering (see Known issues).
   - the file's SHA-256 is sent to CivitAI to fill its Lora Manager info;
   - a preview image is fetched from CivitAI's image CDN.
 - **The Lora Manager fill** sends the SHA-256 and filename of models Lora Manager already
-  catalogues.
+  catalogues, and fetches the model card of each repo it identifies (the same file Lora
+  Manager then reads). A HuggingFace download's own model card is fetched the same way.
 - A URL taken from a workflow is never fetched during lookups. It is only shown to you, and
   downloaded only if you press Download.
 - Tokens go only to HuggingFace and CivitAI themselves, as a header, and never appear in
@@ -133,11 +136,15 @@ stops by itself if Lora Manager stops answering (see Known issues).
   It runs on ComfyUI's main loop, so ComfyUI stops answering until it is restarted. All 14
   **mradermacher** GGUF cards we tested have such a line (`***For a convenient overview…***`,
   from their template), and so do some others, such as DavidAU's
-  Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882. The Lora Manager fill is built to stop as soon
-  as Lora Manager stops answering; this is covered by tests but has not yet been tried against
-  a real freeze. Until Lora Manager is fixed, exclude those models in Lora Manager; the fill
-  skips excluded models. The details, a bug report ready for Lora Manager, and a pre-screen
-  are in [docs/lora-manager-readme-hang.md](docs/lora-manager-readme-hang.md).
+  Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882.
+
+  Model Linker checks a card before handing it to Lora Manager, in the fill and after a
+  download, and leaves out any card that would freeze it. The fill reports those as "card
+  would freeze Lora Manager", with the repo. A card the check could not fetch is reported as
+  "card unchecked" and tried again on the next run. Anything else that makes Lora Manager read
+  such a card still freezes ComfyUI, so exclude those models in Lora Manager. If Lora Manager
+  stops answering anyway, the fill stops by itself. The details and a bug report ready for
+  Lora Manager are in [docs/lora-manager-readme-hang.md](docs/lora-manager-readme-hang.md).
 - **Lora Manager catalogues everything under its model roots.** If a root reaches folders of
   LLM files or HuggingFace caches (through a junction or symlink, for instance), Lora
   Manager lists those too. Exclude them in Lora Manager or narrow its roots.
@@ -184,6 +191,7 @@ main changes, by area:
   without ever overwriting its own files.
 - Filling empty entries from HuggingFace, identified by SHA-256, with trigger words kept and
   a circuit breaker.
+- A check that keeps Lora Manager away from the model cards that freeze it.
 
 **Workflow tools** (new in 1.2)
 - Swap any model across all its nodes; Locate into nested subgraphs; a notice when a
@@ -201,7 +209,7 @@ main changes, by area:
 **Under the hood**
 - Analysis, resolution and listing run off ComfyUI's main loop.
 - A settings store that keeps tokens on the server.
-- A test suite of 420+ Python tests plus frontend checks. It builds its own model library
+- A test suite of 430+ Python tests plus frontend checks. It builds its own model library
   and never touches the network or your files.
 
 The removed download code from upstream came back in 1.2. It was ported file by file and

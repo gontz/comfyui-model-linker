@@ -313,13 +313,29 @@ class WriteTests(SidecarTestCase):
         with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=None), \
              mock.patch('core.lm_api.link_huggingface', lambda *a: calls.append('link')), \
              mock.patch('core.lm_api.hydrate_huggingface', lambda *a: calls.append('hydrate')), \
-             mock.patch('core.downloader.category_directory', return_value=self.root):
+             mock.patch('core.lm_readme_guard.card_is_safe', return_value=True),              mock.patch('core.downloader.category_directory', return_value=self.root):
             outcome = lm_sidecar.on_download_complete({
                 'path': self.model, 'category': 'loras', 'sha256': SHA,
                 'url': 'https://huggingface.co/o/r/resolve/main/rebel.safetensors'})
         self.assertEqual(outcome, 'written+huggingface')
         self.assertEqual(calls, ['link', 'hydrate'])
         self.assertEqual(self.notified, [('loras', False)])  # no CivitAI fetch for a HF file
+
+    @unittest.skipUnless(importlib.util.find_spec('requests'), 'requests is not installed')
+    def test_a_card_lora_manager_cannot_read_is_not_handed_to_it(self):
+        # It would freeze ComfyUI (False), or nobody could check (None)
+        for verdict in (False, None):
+            with self.subTest(verdict=verdict):
+                for name in os.listdir(self.root):
+                    if name.endswith('.metadata.json'):
+                        os.remove(os.path.join(self.root, name))
+                calls = []
+                with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=None),                      mock.patch('core.lm_api.link_huggingface', lambda *a: calls.append('link')),                      mock.patch('core.lm_api.hydrate_huggingface', lambda *a: calls.append('hydrate')),                      mock.patch('core.lm_readme_guard.card_is_safe', return_value=verdict):
+                    outcome = lm_sidecar.on_download_complete({
+                        'path': self.model, 'category': 'loras', 'sha256': SHA,
+                        'url': 'https://huggingface.co/o/r/resolve/main/rebel.safetensors'})
+                self.assertEqual(outcome, 'written')
+                self.assertEqual(calls, [])
 
 
 class LoraManagerSettingsTests(unittest.TestCase):

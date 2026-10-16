@@ -13,7 +13,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from . import hf_identify, lm_api, overrides
+from . import hf_identify, lm_api, lm_readme_guard, overrides
 from .categories import canonical_category
 from .downloader import sha256_file
 from .lm_sidecar import lm_target, sidecar_path
@@ -193,11 +193,21 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
         lm_api.save_metadata(prefix, path, {'sha256': sha256, 'hash_status': 'completed'})
 
     info, how = None, 'already linked'
+    linked = bool(repo)
     if not repo:
         found = hf_identify.find_repo(path, sha256)
         if not found:
             return 'not_found'
         repo, info, how = found['repo'], found.get('card'), found['how']
+
+    # Lora Manager 1.2.5 freezes ComfyUI on some model cards (lm_readme_guard).
+    # Checked before linking too: a linked model is hydrated by Lora Manager's
+    # own refresh as well, so the link alone would leave the trap set.
+    safe = lm_readme_guard.card_is_safe(repo)
+    if not safe:
+        item['repo'], item['how'] = repo, how
+        return 'card_unchecked' if safe is None else 'card_would_hang'
+    if not linked:
         lm_api.link_huggingface(path, repo)
 
     # Decided from the state *before* hydration: Lora Manager's AI enrichment
@@ -271,6 +281,7 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
 def _run(use_ai: bool, limit: Optional[int] = None) -> None:
     _cancel.clear()
     hf_identify.clear_cache()  # a card fetched last run may have changed since
+    lm_readme_guard.clear_cache()
     _update(status='running', started_at=time.time(), finished_at=None, total=0, candidates_total=0,
             limit=limit, done=0, current='', counts={}, results=[], use_ai=use_ai, ai_error=None, error=None)
     try:

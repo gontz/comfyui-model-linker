@@ -458,7 +458,7 @@ def write_sidecar(model_path: str, category: str, sha256: str, fetch_if_unknown:
 def on_download_complete(record: Dict[str, Any]) -> Optional[str]:
     if not record.get('sha256') or not record.get('path'):
         return None
-    from . import hf_identify, lm_api
+    from . import hf_identify, lm_api, lm_readme_guard
     from .downloader import category_directory
 
     path = record['path']
@@ -475,6 +475,10 @@ def on_download_complete(record: Dict[str, Any]) -> Optional[str]:
         written = {}
     if (written.get('civitai') or {}).get('id'):
         return outcome  # CivitAI knew the file; its record is the richer one
+    if not lm_readme_guard.card_is_safe(repo):
+        logger.info(f"Model Linker: {repo}'s model card was not handed to Lora Manager "
+                    "(it would freeze ComfyUI, or could not be checked)")
+        return outcome
     try:
         lm_api.link_huggingface(path, repo)
         lm_api.hydrate_huggingface(path, category_directory(record['category']), repo)

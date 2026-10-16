@@ -36,7 +36,7 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `test_inventory.py` | the found-on-disk list that accompanies the missing one; `source_url`/`source_hash`/`source_hash_type` are kept on a present model's summary so Export can reuse the workflow's own link |
 | `test_node_schema.py` | per-node-type category introspection via the `get_filename_list` sentinel: retried for a node type that registers late, and thread-safe (other threads see the real list, not the sentinel, during a concurrent introspection) |
 | `test_node.py` | the `ModelLinker` node: no inputs/outputs, never executes |
-| `test_settings.py` | the settings store: tokens never echoed in errors, `auto_lookup` and other options, control-character token rejection |
+| `test_settings.py` | the settings store: tokens never echoed in errors (a token containing an embedded newline never leaks through the error message), `auto_lookup` and other options |
 | `test_sources.py` | the ported download sources (`civitai`, `civarchive`, `huggingface`, `hf_index`, `popular`, `model_list`); host checks are exact, not substring |
 | `test_source_chain.py` | `find_download_source`/`find_by_hash`; never contacts a workflow's own URL |
 | `test_lookups.py` | the background lookup store/worker; `lookup_key()` scoping (`url:<16hex>:<key>` when a workflow URL is present) |

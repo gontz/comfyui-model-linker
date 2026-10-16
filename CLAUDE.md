@@ -70,12 +70,13 @@ requires no network call during analysis, and stays.
   only surfaced to the user (see "Not to be confused with" above).
 - **Similar-model search is user-initiated** (🔎 Search similar in the dialog) and runs
   only on request. `core/online_search.py` only scores and returns candidates; the
-  refusal lives in the frontend — `web/modules/downloads.js` compares a candidate's
-  basename (`candidateKey`) against every on-screen card's basename (`fileKey`,
-  regardless of category) and refuses a match, since category folders are often
-  junctions to one shared directory and such a match would catalogue a duplicate, not a
-  new file. A chosen candidate downloads and keeps its own filename — never the missing
-  model's name.
+  refusal lives in the frontend — `web/modules/downloads.js`'s
+  `collidesWithWorkflowName()` compares a candidate's basename against every on-screen
+  card's `original_path` basename, with no category involved at all (not the
+  category-scoped `candidateKey`/`fileKey` used elsewhere for download tracking), since
+  category folders are often junctions to one shared directory and such a match would
+  catalogue a duplicate, not a new file. A chosen candidate downloads and keeps its own
+  filename — never the missing model's name.
 - **Filling empty Lora Manager info from HuggingFace** is a server job started from
   ⚙ Settings (not automatic), implemented in `core/lm_backfill.py`; its last report
   persists in `data/lm-backfill.json` (gitignored). See "Lora Manager sidecars" below.

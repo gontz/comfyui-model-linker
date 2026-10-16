@@ -1,7 +1,9 @@
 """Which engine takes a URL - decided by the real host."""
 
+import hashlib
 import json
 import os
+import types
 import unittest
 from unittest import mock
 
@@ -322,3 +324,60 @@ class EngineGuaranteesTests(LibraryTestCase):
     def test_unsafe_repo_path_check_is_a_segment_check_not_a_substring_check(self):
         self.assertFalse(self.hf._unsafe_repo_path('a..b/x.safetensors'))
         self.assertFalse(self.hf._unsafe_repo_path('sub/model.safetensors'))
+
+
+class RunHfTests(LibraryTestCase):
+    """
+    downloader._run_hf must decide success from the engine's return value,
+    not from a status the engine is never allowed to set itself (ruling 7).
+    A fake engine stands in here - this does not need huggingface_hub, since
+    it is downloader.py's own dispatch logic under test, not hf_downloader.py.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.loras = self.add_models('loras', [], ['.safetensors'])
+        patcher = mock.patch.object(downloader, '_ensure_workers')
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _start(self, filename):
+        url = f'https://huggingface.co/o/r/resolve/main/{filename}'
+        download_id = downloader.start_download(url, 'loras', filename)
+        self.addCleanup(downloader.download_progress.pop, download_id, None)
+        return download_id
+
+    def test_true_leads_to_completed_with_a_real_hash(self):
+        download_id = self._start('ok.safetensors')
+
+        def fake_download_hf_model(repo, filename, dest_dir, dest_filename, did,
+                                    revision='main', display_url=None):
+            with open(os.path.join(dest_dir, dest_filename), 'wb') as f:
+                f.write(b'payload')
+            return True
+
+        engine = (types.SimpleNamespace(download_hf_model=fake_download_hf_model),
+                  {'repo': 'o/r', 'filename': 'ok.safetensors', 'branch': 'main'})
+        with mock.patch.object(downloader, '_hf_engine_for', return_value=engine):
+            downloader._run(download_id)
+
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'completed')
+        self.assertEqual(record['sha256'], hashlib.sha256(b'payload').hexdigest())
+
+    def test_false_leads_to_error_not_completed(self):
+        download_id = self._start('bad.safetensors')
+
+        def fake_download_hf_model(repo, filename, dest_dir, dest_filename, did,
+                                    revision='main', display_url=None):
+            downloader._set(did, error='synthetic failure')
+            return False
+
+        engine = (types.SimpleNamespace(download_hf_model=fake_download_hf_model),
+                  {'repo': 'o/r', 'filename': 'bad.safetensors', 'branch': 'main'})
+        with mock.patch.object(downloader, '_hf_engine_for', return_value=engine):
+            downloader._run(download_id)
+
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'error')
+        self.assertEqual(record['error'], 'synthetic failure')

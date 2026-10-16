@@ -6,9 +6,10 @@ closes and "download all" cannot open twenty connections at once. A file
 streams to `<name>.part` and only takes its real name once complete and
 hashed, so ComfyUI never lists a half-written model.
 
-`download_progress`, `download_lock`, `cancelled_downloads`, `format_bytes`
-and `generate_download_id` are the interface the HuggingFace engine
-(`hf_downloader.py`, ported from upstream) expects. Keep their names.
+`download_progress`, `download_lock`, `cancelled_downloads`, `format_bytes`,
+`_rename_no_clobber`, `_check_disk` and `DownloadError` are the interface the
+HuggingFace engine (`hf_downloader.py`, ported from upstream) expects. Keep
+their names.
 """
 
 import hashlib

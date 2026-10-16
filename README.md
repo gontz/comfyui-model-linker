@@ -27,7 +27,8 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
 
 ## Installation
 
-1. Clone this repository into `ComfyUI/custom_nodes/`, or install it through ComfyUI-Manager.
+1. Clone this repository into `ComfyUI/custom_nodes/`. (The "Model Linker" entry in
+   ComfyUI-Manager's registry installs the upstream original, not this fork.)
 2. Install the requirements into ComfyUI's Python: `pip install -r requirements.txt`
    (`requests`; ComfyUI already provides `aiohttp`).
 3. Restart ComfyUI.
@@ -129,11 +130,14 @@ stops by itself if Lora Manager stops answering (see Known issues).
   - a `# ` heading with nothing after it;
   - a `| … |` line with no table separator under it.
 
-  It runs on ComfyUI's main loop, so ComfyUI stops answering until it is restarted. Every
-  **mradermacher** GGUF card has such a line (`***For a convenient overview…***`), and so do
-  some others, such as DavidAU's Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882. The Lora
-  Manager fill stops as soon as Lora Manager stops answering, and running it again carries
-  on where it stopped. Until Lora Manager is fixed, keep those models out of the fill.
+  It runs on ComfyUI's main loop, so ComfyUI stops answering until it is restarted. All 14
+  **mradermacher** GGUF cards we tested have such a line (`***For a convenient overview…***`,
+  from their template), and so do some others, such as DavidAU's
+  Qwen3.8-27B-TURBO-Fable-Cold-Fusion-735-882. The Lora Manager fill is built to stop as soon
+  as Lora Manager stops answering; this is covered by tests but has not yet been tried against
+  a real freeze. Until Lora Manager is fixed, exclude those models in Lora Manager; the fill
+  skips excluded models. The details, a bug report ready for Lora Manager, and a pre-screen
+  are in [docs/lora-manager-readme-hang.md](docs/lora-manager-readme-hang.md).
 - **Lora Manager catalogues everything under its model roots.** If a root reaches folders of
   LLM files or HuggingFace caches (through a junction or symlink, for instance), Lora
   Manager lists those too. Exclude them in Lora Manager or narrow its roots.

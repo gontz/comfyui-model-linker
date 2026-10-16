@@ -93,7 +93,8 @@ no token is saved in Settings. Tokens are never echoed back in error messages.
 
 - **Background lookups** send a missing model's filename (never a path) to HuggingFace and
   CivitAI to look for a matching download. Turn this off in ⚙ Settings (`auto_lookup`); it
-  never runs for a model that already carries its own download link.
+  never goes online for a model that already carries its own download link — that link is
+  returned as-is, before any search.
 - **🔎 Search similar** sends a filename online only when you press it for that specific
   model.
 - **Export** looks up links the same way background lookups do, for every model in the

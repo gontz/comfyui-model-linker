@@ -86,10 +86,11 @@ requires no network call during analysis, and stays.
   `core/civitai_meta.py`, `core/lm_sidecar.py`, `core/online_search.py`, `core/lm_api.py`,
   `core/hf_identify.py`, `core/lm_backfill.py`, `core/exporter.py`, and
   `core/routes_downloads.py`/`core/routes_export.py`.
-- **Everything above registers only when `requests` imports** (`__init__.py`'s guarded
-  registration block) — without it, relinking from disk (`/analyze`, `/resolve`) still
-  works; only `/settings` and `/settings/check/{provider}` (the settings store itself)
-  register unconditionally.
+- **Everything above except the settings store (`core/settings.py`,
+  `core/routes_settings.py`) registers only when `requests` imports** (`__init__.py`'s
+  guarded registration block) — without it, relinking from disk (`/analyze`,
+  `/resolve`) still works; `/settings` and `/settings/check/{provider}` register
+  unconditionally.
 
 ### Lora Manager sidecars
 

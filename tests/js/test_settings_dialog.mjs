@@ -17,5 +17,7 @@ export default async function run() {
   check('AI enrichment is opt-in', /use_ai:\s*this\.useAi\.checked/.test(src));
   check('progress is shown as text, not markup', /backfillStatus\.textContent\s*=/.test(src));
   check('an AI enrichment failure is shown', /ai_error/.test(src));
+  check('a failed poll reschedules rather than stopping for good',
+    /catch\s*\(e\)\s*\{\s*(?:\/\/[^\n]*\s*)*this\.schedulePoll\(\);/.test(src));
   return check.failures;
 }

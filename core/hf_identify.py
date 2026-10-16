@@ -13,7 +13,7 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
-from . import settings
+from . import civitai_meta, settings
 from .sources import hf_index
 from .sources.huggingface import HF_API_URL, build_search_queries
 
@@ -53,9 +53,17 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             # Never str(e): some exceptions (requests.exceptions.InvalidHeader on
             # a malformed token) embed the full Authorization header, token
             # included - same reasoning as civitai_meta._get_json's guard.
-            raise RuntimeError(type(e).__name__)
+            # `from None` so the token-bearing original is never chained onto
+            # a traceback this exception's message is built from.
+            raise RuntimeError(type(e).__name__) from None
         if response.status_code == 429 and attempt == 0:
-            time.sleep(min(30, int(response.headers.get('Retry-After') or 10)))
+            try:
+                # HuggingFace may send an HTTP-date here instead of seconds;
+                # either way this is a wait, never worth failing the lookup over.
+                wait = int(response.headers.get('Retry-After') or 10)
+            except ValueError:
+                wait = 10
+            time.sleep(min(30, wait))
             continue
         if response.status_code == 404:
             return None
@@ -84,11 +92,19 @@ def _has_file(info: Optional[Dict[str, Any]], sha256: str) -> bool:
 
 def find_repo(filename: str, sha256: str) -> Optional[Dict[str, Any]]:
     sha256 = (sha256 or '').lower()
-    if not re.fullmatch(r'[0-9a-f]{64}', sha256):
+    if not re.fullmatch(r'[0-9a-f]{64}', sha256) or sha256 == civitai_meta.EMPTY_FILE_SHA256:
         return None
     hit = hf_index.lookup_by_sha256(sha256)
     if hit:
-        return {'repo': hit['repo_id'], 'card': card(hit['repo_id']), 'how': 'bundled index'}
+        # The hash already proved the file; the card is only ever a bonus
+        # (base model, tags) on top of an identification that's already
+        # complete, so a failure fetching it must not undo the match.
+        try:
+            info = card(hit['repo_id'])
+        except Exception as e:
+            logger.debug(f"Model Linker: no model card for {hit['repo_id']}: {e}")
+            info = None
+        return {'repo': hit['repo_id'], 'card': info, 'how': 'bundled index'}
     repos: List[str] = []
     for query in build_search_queries(os.path.basename(filename)):
         for model in _get(f'{HF_API_URL}/models', {'search': query, 'limit': SEARCH_REPOS}) or []:
@@ -96,7 +112,13 @@ def find_repo(filename: str, sha256: str) -> Optional[Dict[str, Any]]:
             if repo and repo not in repos:
                 repos.append(repo)
     for repo in repos[:SEARCH_REPOS * 2]:
-        info = card(repo)
+        try:
+            info = card(repo)
+        except Exception as e:
+            # One repo's card being unreachable must not stop checking the
+            # rest - the hash match could still be the next one.
+            logger.debug(f"Model Linker: no model card for {repo}: {e}")
+            continue
         if _has_file(info, sha256):
             return {'repo': repo, 'card': info, 'how': 'hash-verified search'}
     return None

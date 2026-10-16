@@ -14,6 +14,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from . import hf_identify, lm_api, overrides
+from .categories import canonical_category
 from .downloader import sha256_file
 from .lm_sidecar import lm_target, sidecar_path
 
@@ -26,9 +27,16 @@ _lock = threading.Lock()
 _cancel = threading.Event()
 _state: Dict[str, Any] = {'status': 'idle'}
 
-# Lora Manager catalogues a junctioned folder under the first root that reaches it
-_CATEGORY_PREFERENCE = ('loras', 'checkpoints', 'embeddings', 'diffusion_models', 'unet',
-                        'text_encoders', 'clip', 'vae', 'upscale_models', 'clip_vision', 'controlnet')
+# Lora Manager catalogues a junctioned folder under the first root that
+# reaches it. Canonical names only - 'unet'/'clip' are aliases already
+# covered by 'diffusion_models'/'text_encoders'.
+_CATEGORY_PREFERENCE = ('loras', 'checkpoints', 'embeddings', 'diffusion_models',
+                        'text_encoders', 'vae', 'upscale_models', 'clip_vision', 'controlnet')
+
+
+def _preference_rank(category: Optional[str]) -> int:
+    canon = canonical_category(category)
+    return _CATEGORY_PREFERENCE.index(canon) if canon in _CATEGORY_PREFERENCE else len(_CATEGORY_PREFERENCE)
 
 
 def _report_path() -> str:
@@ -42,6 +50,12 @@ def _read(path: str) -> Optional[Dict[str, Any]]:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _blank(value: Any) -> bool:
+    """Empty, for Lora Manager's own "empty" spellings of notes/usage_tips."""
+    text = str(value or '').strip()
+    return text in ('', '{}')
 
 
 def is_empty(data: Dict[str, Any]) -> bool:
@@ -59,8 +73,7 @@ def candidates() -> List[Dict[str, Any]]:
         managed = [e for e in entries if lm_target(e.get('category'))]
         if not managed:
             continue
-        managed.sort(key=lambda e: _CATEGORY_PREFERENCE.index(e['category'])
-                     if e['category'] in _CATEGORY_PREFERENCE else len(_CATEGORY_PREFERENCE))
+        managed.sort(key=lambda e: _preference_rank(e['category']))
         entry = managed[0]
         data = _read(sidecar_path(entry['path']))
         if data is None or not is_empty(data):
@@ -77,11 +90,20 @@ def candidates() -> List[Dict[str, Any]]:
 
 
 def status() -> Dict[str, Any]:
+    """
+    The current run, or - once idle - the last persisted report, verbatim.
+
+    A previous run's own status ('done'/'error'/'cancelled') must survive a
+    server restart: overwriting it with 'idle' here would hide a failure or
+    a cancellation behind a status that claims nothing has ever run.
+    'from_report' marks that this came from disk rather than a live run, so
+    a caller (and the Settings dialog) can tell the two apart.
+    """
     with _lock:
         if _state.get('status') == 'idle':
             saved = _read(_report_path())
             if saved:
-                return {**saved, 'status': 'idle'}
+                return {**saved, 'from_report': True}
         return json.loads(json.dumps(_state))
 
 
@@ -98,6 +120,11 @@ def _record(item: Dict[str, Any], outcome: str, **extra: Any) -> None:
         _state['done'] += 1
 
 
+def _note_ai_skip() -> None:
+    with _lock:
+        _state['counts']['ai_skipped'] = _state['counts'].get('ai_skipped', 0) + 1
+
+
 def _save_report() -> None:
     with _lock:
         report = json.loads(json.dumps(_state))
@@ -109,13 +136,29 @@ def _save_report() -> None:
 
 def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     """One model. Returns the outcome; raises on Lora Manager or network failure."""
-    path, prefix, data = item['path'], item['prefix'], item['sidecar']
+    path, prefix = item['path'], item['prefix']
+
+    # Re-read rather than trust the snapshot candidates() took: time passes
+    # between listing candidates and reaching this one (other models' own
+    # searches/hydrations, the pause between models), during which the user
+    # could have resolved, excluded, or opted this model out in Lora Manager.
+    data = _read(sidecar_path(path))
+    if data is None or data.get('exclude') or data.get('skip_metadata_refresh') or not is_empty(data):
+        return 'skipped'
+
+    source_url = data.get('source_url') or data.get('hf_url')
+    repo = hf_identify.repo_from_url(source_url)
+    if source_url and not repo:
+        # A link to another site (ModelScope, Tensor.Art, ...) the user chose
+        # on purpose. hf_identify can neither confirm nor replace it, so it is
+        # never searched, never relinked, and never hydrated from here.
+        return 'linked_elsewhere'
+
     sha256 = (data.get('sha256') or '').lower()
     if not sha256:
         sha256 = sha256_file(path)
         lm_api.save_metadata(prefix, path, {'sha256': sha256, 'hash_status': 'completed'})
 
-    repo = hf_identify.repo_from_url(data.get('source_url') or data.get('hf_url'))
     info, how = None, 'already linked'
     if not repo:
         found = hf_identify.find_repo(path, sha256)
@@ -124,7 +167,15 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
         repo, info, how = found['repo'], found.get('card'), found['how']
         lm_api.link_huggingface(path, repo)
 
-    words_before = list((data.get('civitai') or {}).get('trainedWords') or [])
+    # Decided from the state *before* hydration: Lora Manager's AI enrichment
+    # (if used later) can replace trigger words, notes, usage_tips and base
+    # model wholesale, which would undo the merge-back below for any model
+    # that already had its own. Models with none of those are the only ones
+    # the AI batch may touch.
+    civitai_before = data.get('civitai') if isinstance(data.get('civitai'), dict) else {}
+    words_before = list(civitai_before.get('trainedWords') or [])
+    ai_eligible = not words_before and _blank(data.get('notes')) and _blank(data.get('usage_tips'))
+
     lm_api.hydrate_huggingface(path, item['root'], repo)
     after = _read(sidecar_path(path)) or {}
 
@@ -134,6 +185,7 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     merged = words_before + [w for w in words_after if w not in words_before]
     if merged != words_after:
         extra['civitai'] = {'trainedWords': merged}
+
     if info is None:
         try:
             info = hf_identify.card(repo)
@@ -147,8 +199,16 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
         extra['tags'] = tags
     if extra:
         lm_api.save_metadata(prefix, path, extra)
+
     item['repo'], item['how'] = repo, how
-    return 'hydrated'
+    # Lora Manager's own hydration route can answer success while writing
+    # nothing - HuggingFace unreachable, no README, a gated card, a
+    # repo/filename mismatch. Only count it as hydrated when it actually
+    # left something behind.
+    hydrated = (after.get('metadata_source') == 'source:huggingface'
+                or bool((after.get('modelDescription') or '').strip()))
+    item['ai_eligible'] = hydrated and ai_eligible
+    return 'hydrated' if hydrated else 'no_card'
 
 
 def _run(use_ai: bool, limit: Optional[int] = None) -> None:
@@ -181,11 +241,21 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
             _update(current=os.path.basename(item['path']))
             try:
                 outcome = _fill(item, allowed)
-                _record(item, outcome, repo=item.get('repo'), how=item.get('how'))
-                if outcome == 'hydrated':
+                ai_skip = outcome == 'hydrated' and not item.get('ai_eligible')
+                extra = {'repo': item.get('repo'), 'how': item.get('how')}
+                if ai_skip:
+                    extra['ai_skipped'] = True
+                _record(item, outcome, **extra)
+                if ai_skip:
+                    _note_ai_skip()
+                if outcome == 'hydrated' and item.get('ai_eligible'):
                     hydrated.append(item['path'])
             except Exception as e:
                 _record(item, 'failed', error=str(e))
+            # Persisted after every model, not only at the end, so an
+            # interrupted run (a server restart, a crash) still leaves a
+            # report listing every sidecar actually touched so far.
+            _save_report()
             time.sleep(PAUSE_BETWEEN_MODELS)
         if use_ai and hydrated and not _cancel.is_set():
             # One batch: Lora Manager runs each call as its own background task,

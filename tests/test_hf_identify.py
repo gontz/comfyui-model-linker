@@ -8,7 +8,7 @@ try:
 except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
-from core import hf_identify
+from core import civitai_meta, hf_identify
 
 SHA = 'ab' * 32
 
@@ -78,6 +78,64 @@ class FindRepoTests(unittest.TestCase):
         }):
             found = hf_identify.find_repo('m.safetensors', SHA)
         self.assertEqual((found['repo'], found['how']), ('Comfy-Org/x', 'bundled index'))
+
+    def test_the_empty_file_hash_is_never_identified(self):
+        """Fix round 1, item 4: a zero-byte file's hash is never looked up -
+        it would describe whatever unrelated repo happens to collide on it,
+        not this file. Checked before any network call."""
+        with mock.patch.object(hf_identify.hf_index, 'lookup_by_sha256',
+                               side_effect=AssertionError('must not be called')), \
+             mock.patch.object(requests, 'get', side_effect=AssertionError('must not be called')):
+            self.assertIsNone(hf_identify.find_repo('m.safetensors', civitai_meta.EMPTY_FILE_SHA256))
+            self.assertIsNone(hf_identify.find_repo('m.safetensors', civitai_meta.EMPTY_FILE_SHA256.upper()))
+
+    def test_a_card_fetch_failure_does_not_abort_checking_the_rest(self):
+        """Fix round 1, item 11: one repo's card being unreachable must not
+        stop verifying the remaining search hits."""
+        with mock.patch.object(hf_identify.hf_index, 'lookup_by_sha256', return_value=None), self.routes({
+            'https://huggingface.co/api/models/owner/broken': FakeResponse({}, 500),
+            'https://huggingface.co/api/models/owner/right': FakeResponse(card_payload('owner/right', SHA)),
+            'https://huggingface.co/api/models': FakeResponse([{'id': 'owner/broken'}, {'id': 'owner/right'}]),
+        }):
+            found = hf_identify.find_repo('m.safetensors', SHA)
+        self.assertEqual(found['repo'], 'owner/right')
+
+    def test_bundled_index_match_survives_a_card_fetch_failure(self):
+        """Fix round 1, item 11: the hash already proved the match; a card
+        that can't be fetched is only a missed bonus, not a lost identification."""
+        hit = {'repo_id': 'Comfy-Org/x', 'path': 'a/m.safetensors'}
+        with mock.patch.object(hf_identify.hf_index, 'lookup_by_sha256', return_value=hit), self.routes({
+            'https://huggingface.co/api/models/Comfy-Org/x': FakeResponse({}, 500),
+        }):
+            found = hf_identify.find_repo('m.safetensors', SHA)
+        self.assertEqual((found['repo'], found['how'], found['card']), ('Comfy-Org/x', 'bundled index', None))
+
+    def test_retry_after_as_an_http_date_falls_back_to_ten_seconds(self):
+        """Fix round 1, item 10: HuggingFace may send an HTTP-date instead
+        of a number of seconds; that must not raise."""
+        responses = [FakeResponse({}, 429, headers={'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT'}),
+                     card_payload('owner/x', SHA)]
+
+        def get(url, params=None, headers=None, timeout=None):
+            value = responses.pop(0)
+            return value if isinstance(value, FakeResponse) else FakeResponse(value)
+
+        with mock.patch.object(requests, 'get', get), mock.patch.object(hf_identify.time, 'sleep') as sleep:
+            result = hf_identify._get('https://huggingface.co/api/models/owner/x')
+        sleep.assert_called_once_with(10)
+        self.assertEqual(result['id'], 'owner/x')
+
+    def test_a_malformed_token_exception_does_not_chain_onto_the_raised_error(self):
+        """Fix round 1, item 9: `from None` so a traceback never surfaces
+        the original, token-bearing exception via exception chaining."""
+        with mock.patch.object(requests, 'get',
+                               side_effect=requests.exceptions.InvalidHeader(
+                                   'Authorization: Bearer SECRET-TOKEN-VALUE')):
+            with self.assertRaises(RuntimeError) as ctx:
+                hf_identify._get('https://huggingface.co/api/models/owner/x')
+        self.assertTrue(ctx.exception.__suppress_context__)
+        self.assertIsNone(ctx.exception.__cause__)
+        self.assertNotIn('SECRET-TOKEN-VALUE', str(ctx.exception))
 
 
 class CardTests(unittest.TestCase):

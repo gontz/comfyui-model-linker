@@ -83,11 +83,15 @@ export class SettingsDialog {
             $el("strong", { textContent: "Lora Manager" }),
             $el("div", { style: { fontSize: "12px", opacity: "0.6" },
                 textContent: "For models whose Lora Manager info is empty: finds the HuggingFace repo each file "
-                    + "came from (by its SHA-256, never by name alone), links it, and has Lora Manager read the "
-                    + "model card. Runs on the server; you can close this window. Models it cannot identify can "
-                    + "be linked by hand in Lora Manager and are filled on the next run." }),
+                    + "came from (by its SHA-256, never by name alone - filenames are sent to HuggingFace's "
+                    + "search to find candidates, which are then verified), links it, and has Lora Manager read "
+                    + "the model card. A link to another site is left alone. Runs on the server; you can close "
+                    + "this window. Models it cannot identify can be linked by hand in Lora Manager and are "
+                    + "filled on the next run." }),
             $el("label", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
-                this.useAi, document.createTextNode("Also use Lora Manager's AI enrichment (base model, tags, usage tips)"),
+                this.useAi, document.createTextNode("Also use Lora Manager's AI enrichment - may replace trigger "
+                    + "words, notes, usage tips and base model; applied only to models that currently have none "
+                    + "of those"),
             ]),
             this.backfillButton,
             this.backfillStatus,
@@ -96,7 +100,10 @@ export class SettingsDialog {
 
     renderBackfill(state) {
         const c = state?.counts || {};
-        const summary = `hydrated ${c.hydrated || 0} · not found ${c.not_found || 0} · failed ${c.failed || 0}`
+        const order = [["hydrated", "hydrated"], ["no_card", "no card"], ["linked_elsewhere", "linked elsewhere"],
+            ["not_found", "not found"], ["failed", "failed"]];
+        const summary = order.filter(([key]) => c[key]).map(([key, label]) => `${label} ${c[key]}`).join(" · ")
+            + (c.ai_skipped ? ` · AI skipped ${c.ai_skipped}` : "")
             + (state?.limit ? ` · sample of ${state.total || 0} from ${state.candidates_total || 0} empty models` : "")
             + (state?.ai_error ? `\nAI enrichment did not run: ${state.ai_error}` : "");
         if (state?.status === "running") {
@@ -104,17 +111,31 @@ export class SettingsDialog {
                 + `${state.current ? ` — ${state.current}` : ""}\n${summary}`;
         } else if (state?.finished_at) {
             const when = new Date(state.finished_at * 1000).toLocaleString();
-            this.backfillStatus.textContent = `Last run ${state.status === "error" ? `failed: ${state.error}` : state.status} (${when})\n${summary}`;
+            const label = state.status === "error" ? `failed: ${state.error}` : state.status;
+            const restored = state.from_report ? " (restored after a restart)" : "";
+            this.backfillStatus.textContent = `Last run ${label} (${when})${restored}\n${summary}`;
         } else {
             this.backfillStatus.textContent = "";
         }
         this.backfillButton.disabled = state?.status === "running";
-        clearTimeout(this.backfillTimer);
         if (state?.status === "running" && this.element.style.display !== "none") {
-            this.backfillTimer = setTimeout(async () => {
-                try { this.renderBackfill(await this.request("/model_linker/lm-backfill")); } catch (e) { }
-            }, 2000);
+            this.schedulePoll();
+        } else {
+            clearTimeout(this.backfillTimer);
         }
+    }
+
+    schedulePoll() {
+        clearTimeout(this.backfillTimer);
+        this.backfillTimer = setTimeout(async () => {
+            try {
+                this.renderBackfill(await this.request("/model_linker/lm-backfill"));
+            } catch (e) {
+                // A transient failure (the server restarting, a dropped
+                // connection) must not stop polling for good - try again.
+                this.schedulePoll();
+            }
+        }, 2000);
     }
 
     async startBackfill() {

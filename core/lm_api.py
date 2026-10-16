@@ -11,7 +11,17 @@ TIMEOUT = 300
 
 
 class LoraManagerUnavailable(Exception):
-    pass
+    """
+    `status_code` is the HTTP status Lora Manager answered with, when it
+    answered at all - None for a request that never got a response (a
+    timeout, a connection error). `scan()` uses this to tell "this root
+    is spelled differently" (400) apart from "Lora Manager isn't reachable
+    right now", which must never be treated the same way.
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def lm_path(path: str) -> str:
@@ -38,7 +48,8 @@ def _call(method: str, route: str, **kwargs) -> Dict[str, Any]:
         data = {}
     if response.status_code >= 400 or (isinstance(data, dict) and data.get('success') is False):
         message = data.get('error') or data.get('message') if isinstance(data, dict) else None
-        raise LoraManagerUnavailable(message or f'HTTP {response.status_code} from {route}')
+        raise LoraManagerUnavailable(message or f'HTTP {response.status_code} from {route}',
+                                     status_code=response.status_code)
     return data
 
 
@@ -56,8 +67,14 @@ def scan(prefix: str, root: Optional[str] = None) -> None:
         try:
             _call('GET', f'/{prefix}/scan', params={'roots': lm_path(root)})
             return
-        except LoraManagerUnavailable:
-            pass  # spelled differently there ("Unknown model root"): scan everything
+        except LoraManagerUnavailable as e:
+            # Only "this root is spelled differently there" (HTTP 400,
+            # "Unknown model root(s)") falls back to a full scan. A timeout
+            # or connection error means Lora Manager isn't reachable at all
+            # right now, and scanning "everything" would just fail the same
+            # way a second time.
+            if e.status_code != 400:
+                raise
     _call('GET', f'/{prefix}/scan')
 
 
@@ -80,6 +97,11 @@ def hydrate_huggingface(model_path: str, model_root: str, repo: str) -> None:
         raise LoraManagerUnavailable(f'{model_path} is not inside {model_root}')
     if relative == '..' or relative.startswith('../') or not os.path.isfile(model_path):
         raise LoraManagerUnavailable(f'{model_path} is not a file inside {model_root}')
+    if os.path.getsize(model_path) <= 0:
+        # Lora Manager only treats a same-named file as "already there" when
+        # it has real bytes; a zero-byte file makes it download the repo's
+        # copy over this path instead of reading the card into the sidecar.
+        raise LoraManagerUnavailable(f'{model_path} is empty; hydrating would make Lora Manager download it')
     _call('POST', '/download-model-source', json={
         'platform': 'huggingface', 'repo': repo, 'filename': os.path.basename(model_path),
         'model_root': lm_path(model_root), 'relative_path': '' if relative == '.' else relative,

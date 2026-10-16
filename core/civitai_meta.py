@@ -40,8 +40,10 @@ def _get_json(url: str) -> Optional[Dict[str, Any]]:
         # header that contains one) embed the full header value, token
         # included - the same reasoning as settings.check_token's guard
         # against the same leak. Caught broadly, not just RequestException,
-        # because the encode failure is a plain UnicodeEncodeError.
-        raise CivitaiUnavailable(type(e).__name__)
+        # because the encode failure is a plain UnicodeEncodeError. `from
+        # None` so the token-bearing original is never chained onto a
+        # traceback built from this exception.
+        raise CivitaiUnavailable(type(e).__name__) from None
     if response.status_code == 404:
         return None
     if response.status_code != 200:

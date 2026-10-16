@@ -17,6 +17,12 @@ def _bad(web, message):
     return web.json_response({'error': message}, status=400)
 
 
+def _invalid_limit(limit) -> bool:
+    """None (the whole library) or a positive int is valid; anything else - a
+    bool (an int subclass), zero, a negative number, a string - is not."""
+    return limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1)
+
+
 def register(routes, web) -> None:
     from . import lm_sidecar
     downloader.add_completion_hook(lm_sidecar.on_download_complete)
@@ -109,9 +115,9 @@ def register(routes, web) -> None:
             data = {}
         if not isinstance(data, dict):
             data = {}
-        use_ai = bool(data.get('use_ai'))
+        use_ai = data.get('use_ai') is True
         limit = data.get('limit')
-        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        if _invalid_limit(limit):
             return _bad(web, 'limit must be a positive integer')
         started = lm_backfill.start(use_ai=use_ai, limit=limit)
         return web.json_response({'started': started, 'state': lm_backfill.status()})

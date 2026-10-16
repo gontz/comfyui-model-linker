@@ -265,11 +265,17 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
     try:
         if not lm_api.available():
             raise lm_api.LoraManagerUnavailable('Lora Manager is not running in this ComfyUI')
-        for prefix in ('loras', 'checkpoints', 'embeddings', 'other'):
-            try:
-                lm_api.scan(prefix)   # creates sidecars for files it has not catalogued yet
-            except lm_api.LoraManagerUnavailable as e:
-                logger.debug(f"Model Linker: Lora Manager scan of {prefix} failed: {e}")
+        # Deliberately does not call lm_api.scan() here. A scan with no root
+        # (one per Lora Manager prefix, unavoidable since this job's own
+        # candidates aren't known yet) makes Lora Manager catalogue its
+        # *entire* library - every file under every registered root for that
+        # prefix, not just the ones this run will touch - and can rewrite
+        # file_path in sidecars it had already catalogued differently.
+        # candidates() below only ever considers models that already have a
+        # sidecar; this job fills what Lora Manager already catalogues, it
+        # does not catalogue anything on its own. notify_lora_manager (after
+        # a download) still calls lm_api.scan(), but always scoped to the
+        # one root the new file landed in.
         try:
             allowed = lm_api.base_models()
         except lm_api.LoraManagerUnavailable:

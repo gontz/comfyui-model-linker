@@ -133,6 +133,21 @@ class SelectionTests(BackfillTestCase):
 
 
 class RunTests(BackfillTestCase):
+    def test_the_run_never_scans(self):
+        """
+        The backfill fills only what Lora Manager already catalogues. A
+        scan here has no root to limit it to this run's own candidates, so
+        it would make Lora Manager catalogue (and potentially rewrite
+        file_path in) its entire library for every registered root - far
+        more than this run will ever touch. `notify_lora_manager` (after a
+        download) still calls `lm_api.scan`, but always scoped to the one
+        root the new file landed in - that is unaffected by this.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r')
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=False)
+        lm_backfill.lm_api.scan.assert_not_called()
+
     def test_linked_model_is_hydrated_without_searching(self):
         self.write_sidecar(source_url='https://huggingface.co/o/r')
         with mock.patch.object(hf_identify, 'find_repo', side_effect=AssertionError('no search')), \
@@ -148,8 +163,11 @@ class RunTests(BackfillTestCase):
         with mock.patch.object(hf_identify, 'find_repo',
                                return_value={'repo': 'o/r', 'card': card, 'how': 'hash-verified search'}):
             lm_backfill._run(use_ai=False)
-        self.assertIn('scan', self.names())  # one per Lora Manager model type, before anything else
-        self.assertEqual([n for n in self.names() if n != 'scan'][:2], ['link_huggingface', 'hydrate_huggingface'])
+        # The backfill fills only what Lora Manager already catalogues; it
+        # never scans (a scan has no root to limit it to this run's own
+        # candidates, so it would catalogue Lora Manager's entire library).
+        self.assertNotIn('scan', self.names())
+        self.assertEqual(self.names()[:2], ['link_huggingface', 'hydrate_huggingface'])
         saved = [c for c in self.calls if c[0] == 'save_metadata'][-1][1][2]
         self.assertEqual(saved['base_model'], 'Flux.1 D')
         self.assertEqual(saved['tags'], ['style'])
@@ -176,7 +194,7 @@ class RunTests(BackfillTestCase):
             before = handle.read()
         with mock.patch.object(hf_identify, 'find_repo', side_effect=AssertionError('no search')):
             lm_backfill._run(use_ai=False)
-        self.assertEqual([n for n in self.names() if n != 'scan'], [])  # no link/hydrate/save_metadata
+        self.assertEqual(self.names(), [])  # no scan, no link/hydrate/save_metadata
         state = lm_backfill.status()
         self.assertEqual(state['counts']['linked_elsewhere'], 1)
         self.assertEqual(state['results'][0]['outcome'], 'linked_elsewhere')

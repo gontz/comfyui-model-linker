@@ -67,6 +67,20 @@ export default async function run() {
         downloadState({}).kind === 'none');
   check('lookup_state "idle" (auto-lookup off) still offers a manual search',
         downloadState({ lookup_state: 'idle' }).kind === 'idle');
+  {
+    // The server answers 'unknown' for a key it has no entry for (nothing was
+    // ever looked up): that is "not searched yet", never "nothing found"
+    const c = new DownloadController(fakeDialog());
+    const m = mk(1, 'u.safetensors', 'loras', { lookup_state: 'pending', lookup_key: 'k', download_source: null });
+    c.live = true;
+    c.missing = new Map([['1', m]]);
+    c.request = async () => ({ results: { k: { state: 'unknown', source: null } } });
+    c.refresh = () => {};
+    await c.pollLookups();
+    clearTimeout(c.lookupTimer);
+    check('a lookup the server knows nothing about offers "Find a download", not "No download found"',
+          m.lookup_state === 'idle' && downloadState(m).kind === 'idle', m.lookup_state);
+  }
 
   const src = readSource('modules/downloads.js');
   const poll = src.slice(src.indexOf('async pollLookups'), src.indexOf('async searchAgain'));
@@ -76,6 +90,8 @@ export default async function run() {
   check('download all starts one download per file', /seen\.has\(/.test(src.slice(src.indexOf('async downloadAll'))));
   check('reopening reconnects to running downloads', /async reconnect\(/.test(src) && /reconnect\(\)/.test(src));
   check('source names are escaped', /escapeHtml\(where\)/.test(src));
+  check('no "Lora Manager info written" label: a finished card leaves the list before it could show',
+        !/Lora Manager info written/.test(src));
   check('workflow-derived slots are escaped in attributes',
         !/data-ml-slot="\$\{slot\}"/.test(src) && /data-ml-slot="\$\{escapeHtml\(slot\)\}"/.test(src)
         && /id="\$\{escapeHtml\(this\.blockId\(missing\)\)\}"/.test(src) && /CSS\.escape\(/.test(src));

@@ -75,6 +75,12 @@ export default async function run() {
   check('a present model keeps the workflow\'s link', b.present === true && b.url === 'https://h/b');
   check('a sha256 hash is used', b.sha256 === 'ab'.repeat(32));
   check('another hash type is not', rows.find(r => r.name === 'c.safetensors').sha256 === '');
+  const separatorRows = exportRows({
+    missing_models: [{ node_id: 5, widget_index: 0, original_path: 'sub\\a.safetensors', category: 'loras' }],
+    present_models: [{ node_id: 6, widget_index: 0, original_path: 'sub/a.safetensors', category: 'loras' }],
+  });
+  check('a backslash and a forward-slash path are one row',
+        separatorRows.length === 1 && separatorRows[0].refs.length === 2);
 
   // Every row goes to the server, its link included, so links the workflow
   // carries or the user pasted come back stripped of tokens
@@ -743,7 +749,9 @@ export default async function run() {
       dialog,
       onGraphLoaded() {
         this.dialog?.exportDialog?.close?.();
-        if (this.dialog?.analyzeAbort) this.dialog.loadWorkflowData();
+        const switched = true;   // a tab switch; the key comparison is tested in test_workflow_switch.mjs
+        if (switched) this.dialog?.clearAllQueued?.();
+        if (this.dialog?.analyzeAbort || (switched && this.dialog?.isOpen?.())) this.dialog.loadWorkflowData();
       },
     };
     const opening = dialog.openExport();
@@ -780,7 +788,7 @@ export default async function run() {
   check('the export dialog is closed when another workflow loads',
         /onGraphLoaded\(\)\s*\{\s*this\.dialog\?\.exportDialog\?\.close\(\);/.test(linkerSrc));
   check('a tab switch re-analyses rather than leaving the dialog stuck, when one is in flight',
-        /onGraphLoaded\(\)\s*\{[\s\S]{0,300}?if \(this\.dialog\?\.analyzeAbort\) this\.dialog\.loadWorkflowData\(\);/
+        /onGraphLoaded\(\)\s*\{[\s\S]{0,500}?if \(this\.dialog\?\.analyzeAbort \|\| \(switched && this\.dialog\?\.isOpen\(\)\)\) this\.dialog\.loadWorkflowData\(\);/
           .test(linkerSrc));
   check('opening Export reports a failure instead of throwing', /notifyError\("Could not open Export"/.test(linkerSrc));
   check('opening Export is async and awaits the dialog, so a rejection cannot escape unhandled',

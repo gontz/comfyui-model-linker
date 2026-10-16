@@ -75,9 +75,18 @@ export class ModelLinker {
     // own first line) before issuing a new one, so the pending openExport()
     // still gets null from the one it was awaiting, while an open dialog
     // re-renders for the workflow now on screen instead of hanging.
+    //
+    // Queued selections are node ids in the workflow they were picked on, so
+    // they are dropped whenever another workflow loads - never applied to it.
+    // Reloading the same workflow (an undo does) keeps them; with no workflow
+    // identity to compare, every load counts as a switch.
     onGraphLoaded() {
         this.dialog?.exportDialog?.close();
-        if (this.dialog?.analyzeAbort) this.dialog.loadWorkflowData();
+        const key = this.workflowKey();
+        const switched = key === undefined || key !== this.loadedWorkflowKey;
+        this.loadedWorkflowKey = key;
+        if (switched) this.dialog?.clearAllQueued();
+        if (this.dialog?.analyzeAbort || (switched && this.dialog?.isOpen())) this.dialog.loadWorkflowData();
         clearTimeout(this.loadTimer);
         this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
     }

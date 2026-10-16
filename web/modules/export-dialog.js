@@ -11,7 +11,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 import { $el } from "./dom.js";
-import { escapeHtml, notifyError, safeHttpUrl } from "./util.js";
+import { escapeHtml, notifyError, presentModelGroupKey, safeHttpUrl } from "./util.js";
 
 const OPTIONS = [
     ["note", "Add a \"Model links\" note"],
@@ -51,7 +51,7 @@ export function exportRows(data) {
     const rows = new Map();
     const add = (ref, present) => {
         const category = ref.canonical_category || ref.category || "unknown";
-        const key = `${category}|${ref.original_path}`;
+        const key = presentModelGroupKey(ref);   // "sub\a" and "sub/a" are one file
         if (!rows.has(key)) {
             rows.set(key, { key, name: basename(ref.original_path), category, original_path: ref.original_path,
                 url: "", sha256: "", present, refs: [] });

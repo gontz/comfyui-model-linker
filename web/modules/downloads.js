@@ -147,7 +147,7 @@ export class DownloadController {
                 break;
             }
             case "done":
-                html = `<div style="color:#0aa96e;">✓ Downloaded${record.metadata === "written" ? " · Lora Manager info written" : ""}</div>`;
+                html = `<div style="color:#0aa96e;">✓ Downloaded</div>`;
                 break;
             case "error":
                 html = `<div style="color:#e05050;">✗ ${escapeHtml(state.message || "Download failed")}</div>`
@@ -419,7 +419,10 @@ export class DownloadController {
         for (const missing of waiting) {
             const result = data.results?.[missing.lookup_key];
             if (!result || result.state === "pending") continue;
-            missing.lookup_state = result.state === "found" ? "found" : "not_found";
+            // 'unknown': the server holds no entry for this key - nothing was
+            // searched, so offer the search rather than claim nothing was found
+            missing.lookup_state = result.state === "found" ? "found"
+                : result.state === "unknown" ? "idle" : "not_found";
             missing.download_source = result.source || null;
             this.refresh(missing);
         }

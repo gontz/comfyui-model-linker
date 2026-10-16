@@ -524,6 +524,12 @@ export class LinkerManagerDialog {
         // earlier analysis - perhaps of another tab - must never be used
         const data = await this.loadWorkflowData();
         if (!data) return;   // superseded, no workflow, or failed; the dialog says which
+        // Every Export path (its links, the credential scrub) goes through
+        // routes the server registers only when `requests` is installed
+        if (data.lookups_available === false) {
+            this.showNotification('Export needs the Python package "requests", which is not installed', 'error');
+            return;
+        }
         if (!this.exportDialog) this.exportDialog = new ExportDialog(this);
         this.exportDialog.show(data);
     }
@@ -728,7 +734,7 @@ export class LinkerManagerDialog {
             }
         });
 
-        const downloadAllBtn = $el("button", {
+        const downloadAllBtn = this.downloadAllBtn = $el("button", {
             textContent: "☁ Download all found",
             title: "Download every missing model a source was found for (two at a time)",
             onclick: () => this.downloads.downloadAll(),
@@ -1147,6 +1153,9 @@ export class LinkerManagerDialog {
             // dialog was closed; either way this answer is stale.
             if (this.analyzeAbort !== abort || !this.contentElement) return null;
 
+            // Without online lookups (no `requests` on the server) nothing
+            // is ever found to download
+            if (this.downloadAllBtn) this.downloadAllBtn.style.display = data.lookups_available === false ? 'none' : '';
             this.displayMissingModels(this.contentElement, data);
             return data;
 

@@ -11,18 +11,51 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-from . import civitai_meta
+from . import civitai_meta, downloader
 from .categories import canonical_category
 
 logger = logging.getLogger(__name__)
 
 _EXTENSION_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LORA_MANAGER_DIR = os.path.join(os.path.dirname(_EXTENSION_DIR), 'comfyui-lora-manager')
 _LORA_MANAGER_APP = 'ComfyUI-LoRA-Manager'
+_LORA_MANAGER_FOLDER = 'comfyui-lora-manager'
+
+
+def _discover_lora_manager_dir() -> str:
+    """
+    Lora Manager's own folder, found case-insensitively under every
+    registered `custom_nodes` root - installs are seen under different
+    casings (`comfyui-lora-manager`, `ComfyUI-LoRA-Manager`, ...). Falls back
+    to this extension's own parent directory when `folder_paths` has no
+    answer (outside a running ComfyUI, e.g. under the test runner).
+    """
+    roots = []
+    try:
+        import folder_paths
+        roots = list(folder_paths.get_folder_paths('custom_nodes'))
+    except Exception:
+        roots = []
+    if not roots:
+        roots = [os.path.dirname(_EXTENSION_DIR)]
+    for root in roots:
+        try:
+            entries = os.listdir(root)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.lower() == _LORA_MANAGER_FOLDER:
+                return os.path.join(root, entry)
+    # Not found under any known root - keep the expected name under the
+    # first one, so a later `open()`/`isfile()` simply finds nothing there.
+    return os.path.join(roots[0], _LORA_MANAGER_FOLDER)
+
+
+_LORA_MANAGER_DIR = _discover_lora_manager_dir()
 
 # Canonical ComfyUI category -> (Lora Manager route prefix, sub_type)
 _TARGETS = {
@@ -55,6 +88,15 @@ _SAVEABLE_PREVIEW = {'.jpeg', '.jpg', '.png', '.webp', '.gif'}
 MAX_PREVIEW_BYTES = 25 * 1024 * 1024
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    """`int(value)`, but a non-numeric value (a malformed field from CivitAI,
+    not ours to validate) falls back to `default` instead of raising."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def lm_target(category: Optional[str]) -> Optional[Tuple[str, Optional[str]]]:
     return _TARGETS.get(canonical_category(category) or '')
 
@@ -83,7 +125,8 @@ def autov3_for(version: Dict[str, Any], sha256: str) -> Optional[str]:
         hashes = entry.get('hashes') or {}
         if str(hashes.get('SHA256', '')).lower() == sha256.lower():
             value = hashes.get('AutoV3')
-            # e3b0c44298fc is the hash of empty input - a packaging artefact
+            # e3b0c44298fc is the SHA-256 of zero bytes, truncated - not a
+            # real file's hash, however it got into this field.
             if isinstance(value, str) and len(value) >= 12 and value[:12].lower() != 'e3b0c44298fc':
                 return value[:12].lower()
             return None
@@ -105,7 +148,7 @@ def build_sidecar(model_path: str, category: str, sha256: str,
         'sha256': sha256.lower(),
         'base_model': determine_base_model((version or {}).get('baseModel')),
         'preview_url': lm_path(preview_path) if preview_path else '',
-        'preview_nsfw_level': int(preview_nsfw_level or 0),
+        'preview_nsfw_level': _safe_int(preview_nsfw_level, 0),
         'notes': '',
         'from_civitai': bool(version),
         'civitai': version or {},
@@ -121,8 +164,15 @@ def build_sidecar(model_path: str, category: str, sha256: str,
         'hash_status': 'completed',
     }
     if version:
-        # Present-but-null means "checked, CivitAI has none"; absent means "not checked"
-        data['autov3'] = autov3_for(version, sha256)
+        # Deliberate deviation from the published contract: a JSON `null`
+        # here tells Lora Manager "checked, CivitAI has none" and stops it
+        # computing the value itself from the file's own header, which it
+        # otherwise falls back to. The key is written only when a 12-hex
+        # value was actually found, and left out - not nulled - every other
+        # time (not checked, or checked and nothing matched).
+        found = autov3_for(version, sha256)
+        if found:
+            data['autov3'] = found
     prefix, sub_type = lm_target(category) or ('loras', None)
     if prefix == 'loras':
         data['usage_tips'] = '{}'
@@ -143,7 +193,7 @@ def pick_preview(version: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """First still image, preferring one below CivitAI's R level (4)."""
     images = [i for i in version.get('images') or [] if isinstance(i, dict) and i.get('url')]
     stills = [i for i in images if (i.get('type') or 'image') == 'image']
-    tame = [i for i in stills if int(i.get('nsfwLevel') or 0) < 4]
+    tame = [i for i in stills if _safe_int(i.get('nsfwLevel'), 0) < 4]
     return (tame or stills or [None])[0]
 
 
@@ -151,21 +201,64 @@ def _rendition(url: str) -> str:
     return url.replace('/original=true/', '/width=450,optimized=true/')
 
 
+def _is_civitai_image_url(url: str) -> bool:
+    """https, and on CivitAI's own image host - checked on the initial URL
+    and, separately, re-checked on every hop a redirect actually took."""
+    try:
+        parsed = urlparse(url or '')
+        host = (parsed.hostname or '').lower()
+    except ValueError:
+        # A malformed authority (e.g. an unbalanced IPv6 literal) can make
+        # urlparse, or the lazy `.hostname` property, raise - that is not a
+        # CivitAI URL either.
+        return False
+    return parsed.scheme == 'https' and (host == 'civitai.com' or host.endswith('.civitai.com'))
+
+
+def _remove_quietly(path: str) -> None:
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _land_file(tmp: str, dest: str) -> bool:
+    """
+    Move `tmp` onto `dest`, never clobbering a file someone else created
+    there since the caller last checked - Lora Manager's own scan, or
+    another download, can both land the same name. True once landed; False
+    (the caller removes `tmp`) on that collision.
+    """
+    try:
+        downloader._rename_no_clobber(tmp, dest)
+        return True
+    except downloader.DownloadError:
+        return False
+
+
 def download_preview(model_path: str, image: Dict[str, Any]) -> str:
     """Save CivitAI's 450px rendition as `<stem><ext>`. Returns the path, or '' on any failure."""
     import requests
     url = _rendition(image.get('url') or '')
-    parsed = urlparse(url)
-    host = (parsed.hostname or '').lower()
-    if parsed.scheme != 'https' or not (host == 'civitai.com' or host.endswith('.civitai.com')):
+    if not _is_civitai_image_url(url):
         return ''
-    ext = os.path.splitext(parsed.path)[1].lower()
+    ext = os.path.splitext(urlparse(url).path)[1].lower()
     if ext not in _SAVEABLE_PREVIEW:
         return ''
     dest = os.path.splitext(model_path)[0] + ext
-    tmp = dest + '.part'
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest) or '.', prefix='.model-linker-', suffix='.tmp')
+    os.close(fd)
     try:
-        with requests.get(url, stream=True, timeout=30) as response:
+        with requests.get(url, stream=True, timeout=30, allow_redirects=True) as response:
+            # A redirect can leave CivitAI's own host, or https, entirely -
+            # for the final URL or for any hop along the way - refused
+            # before a single byte is written either way, same reasoning as
+            # downloader._stream's own redirect check.
+            hops = [getattr(response, 'url', None) or url]
+            hops += [getattr(hop, 'url', '') or '' for hop in (getattr(response, 'history', None) or ())]
+            if not all(_is_civitai_image_url(hop) for hop in hops):
+                return ''
             if response.status_code != 200:
                 return ''
             size = 0
@@ -175,14 +268,12 @@ def download_preview(model_path: str, image: Dict[str, Any]) -> str:
                     if size > MAX_PREVIEW_BYTES:
                         raise ValueError('preview too large')
                     handle.write(chunk)
-        os.replace(tmp, dest)
-        return dest
+        return dest if _land_file(tmp, dest) else ''
     except Exception as e:
         logger.debug(f"Model Linker: preview download failed: {e}")
         return ''
     finally:
-        if os.path.exists(tmp):
-            os.remove(tmp)
+        _remove_quietly(tmp)
 
 
 def _user_config_dir() -> str:
@@ -236,11 +327,25 @@ def centralized_sidecars() -> bool:
         return False
 
 
-def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
-    tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as handle:
-        json.dump(data, handle, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
+def _write_sidecar_file(path: str, data: Dict[str, Any]) -> bool:
+    """
+    Write `data` to `path` without ever overwriting a file already there -
+    Lora Manager's own scan can write this exact sidecar while this call was
+    out talking to CivitAI. A fixed `.tmp` name would also collide with Lora
+    Manager's own temp file of the same name, so the temp name is unique.
+
+    True once `path` holds this data; False when something else landed there
+    first, in which case `path` is untouched and this call's temp file is gone.
+    """
+    tmp_dir = os.path.dirname(path) or '.'
+    fd, tmp = tempfile.mkstemp(dir=tmp_dir, prefix='.model-linker-', suffix='.tmp')
+    os.close(fd)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+        return _land_file(tmp, path)
+    finally:
+        _remove_quietly(tmp)
 
 
 def notify_lora_manager(prefix: str, model_path: str, fetch: bool = False) -> None:
@@ -291,9 +396,14 @@ def write_sidecar(model_path: str, category: str, sha256: str, fetch_if_unknown:
         image = pick_preview(version)
         if image:
             preview = download_preview(model_path, image)
-            nsfw = int(image.get('nsfwLevel') or 0) if preview else 0
+            nsfw = _safe_int(image.get('nsfwLevel'), 0) if preview else 0
 
-    _write_json_atomic(path, build_sidecar(model_path, category, sha256, version, preview, nsfw))
+    data = build_sidecar(model_path, category, sha256, version, preview, nsfw)
+    if not _write_sidecar_file(path, data):
+        # Lora Manager's own scan, or another download, wrote this exact
+        # sidecar while CivitAI/the preview were being fetched - leave
+        # whatever it wrote alone.
+        return 'exists'
     notify_lora_manager(target[0], model_path, fetch=version is None and fetch_if_unknown)
     return 'written'
 

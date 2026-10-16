@@ -7,16 +7,26 @@ Lora Manager's published schema whenever it is installed alongside.
 import json
 import os
 import shutil
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
+
+try:
+    import requests
+except ImportError:
+    raise unittest.SkipTest('requests is not installed')
 
 from core import civitai_meta, lm_sidecar
 
 SHA = 'ab' * 32
 LM_REQUIRED = ('file_name', 'model_name', 'file_path', 'size', 'modified', 'sha256', 'base_model', 'preview_url')
-SCHEMA = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), os.pardir,
-                      'comfyui-lora-manager', '.specs', 'metadata.schema.json')
+# Lora Manager's install directory is found the same way lm_sidecar itself
+# finds it (case-insensitively, under custom_nodes) - a hardcoded relative
+# path here would silently skip the schema test the moment that lookup
+# changed, which is exactly what must never happen.
+SCHEMA = os.path.join(lm_sidecar._LORA_MANAGER_DIR, '.specs', 'metadata.schema.json')
 
 VERSION = {
     'id': 3090220, 'modelId': 2224836, 'name': 'v1', 'baseModel': 'SDXL Lightning', 'trainedWords': ['zz'],
@@ -74,11 +84,16 @@ class FormatTests(SidecarTestCase):
             self.assertNotIn('usage_tips', data, category)
             self.assertNotIn('model_type', data, category)
 
-    def test_autov3_three_states(self):
+    def test_autov3_present_only_when_civitai_actually_has_one(self):
+        # Deliberate deviation from the published contract (ruling, fix round
+        # 1): a JSON `null` tells Lora Manager "checked, CivitAI has none"
+        # and stops it computing the value itself from the file's own
+        # header. So the key is written only on an actual match; every other
+        # case - CivitAI checked and had nothing, or never checked at all -
+        # omits the key rather than nulling it.
         self.assertEqual(lm_sidecar.build_sidecar(self.model, 'loras', SHA, VERSION)['autov3'], 'f7ad278a79a8')
         unmatched = dict(VERSION, files=[])
-        self.assertIn('autov3', lm_sidecar.build_sidecar(self.model, 'loras', SHA, unmatched))
-        self.assertIsNone(lm_sidecar.build_sidecar(self.model, 'loras', SHA, unmatched)['autov3'])
+        self.assertNotIn('autov3', lm_sidecar.build_sidecar(self.model, 'loras', SHA, unmatched))
         self.assertNotIn('autov3', lm_sidecar.build_sidecar(self.model, 'loras', SHA, None))
 
     def test_unknown_to_civitai(self):
@@ -185,6 +200,40 @@ class WriteTests(SidecarTestCase):
             lm_sidecar.write_sidecar(self.model, 'loras', SHA, fetch_if_unknown=False)
         self.assertEqual(self.notified, [('loras', False)])
 
+    def test_sidecar_race_with_lora_managers_own_write(self):
+        """
+        write_sidecar checks the sidecar is missing, then spends time on
+        CivitAI and the preview before landing its own file. If Lora
+        Manager's own scan (triggered by some other download) writes that
+        exact sidecar in the gap, this call must not clobber it.
+        """
+        path = os.path.join(self.root, 'rebel.metadata.json')
+
+        def sneaky(sha256):
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('{"written_by": "someone else"}')
+            return None  # no further lookups needed to prove the point
+
+        with mock.patch.object(civitai_meta, 'version_for_sha256', side_effect=sneaky):
+            self.assertEqual(lm_sidecar.write_sidecar(self.model, 'loras', SHA), 'exists')
+        with open(path, encoding='utf-8') as handle:
+            self.assertEqual(handle.read(), '{"written_by": "someone else"}')
+        # No leftover temp file from the losing write.
+        self.assertEqual([f for f in os.listdir(self.root) if f.endswith('.tmp')], [])
+        self.assertEqual(self.notified, [])  # a discarded write never notifies Lora Manager
+
+    def test_malformed_preview_fields_do_not_block_the_sidecar(self):
+        """A bad nsfwLevel or an unparseable image URL from CivitAI means
+        'no preview', never a crash that leaves no sidecar at all."""
+        version = dict(VERSION, images=[
+            {'url': 'https://[invalid/original=true/1.jpeg', 'nsfwLevel': 'spicy', 'type': 'image'},
+        ])
+        with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=version):
+            self.assertEqual(lm_sidecar.write_sidecar(self.model, 'loras', SHA), 'written')
+        data = self.read()
+        self.assertEqual(data['preview_url'], '')
+        self.assertEqual(data['preview_nsfw_level'], 0)
+
 
 class LoraManagerSettingsTests(unittest.TestCase):
     """settings.json is found where Lora Manager itself looks for it."""
@@ -239,3 +288,138 @@ class CivitaiMetaTests(unittest.TestCase):
         self.assertEqual(version['creator'], {'username': 'u'})
         self.assertNotIn('comfy', version['images'][1]['meta'])
         self.assertIn('comfy', VERSION['images'][1]['meta'])  # the input is not mutated
+
+
+class FakeJsonResponse:
+    """Stand-in for `requests.Response` where only `.status_code`/`.json()` matter."""
+
+    def __init__(self, status_code=200, data=None):
+        self.status_code = status_code
+        self._data = data if data is not None else {}
+
+    def json(self):
+        return self._data
+
+
+class CivitaiMetaNetworkTests(unittest.TestCase):
+    """No real network: `requests.get` is replaced for every case here."""
+
+    def test_404_means_civitai_does_not_know_the_file(self):
+        with mock.patch('requests.get', return_value=FakeJsonResponse(404)):
+            self.assertIsNone(civitai_meta.version_for_sha256(SHA))
+
+    def test_other_non_200_raises_unavailable(self):
+        with mock.patch('requests.get', return_value=FakeJsonResponse(500)):
+            with self.assertRaises(civitai_meta.CivitaiUnavailable):
+                civitai_meta.version_for_sha256(SHA)
+
+    def test_token_never_reaches_the_unavailable_message(self):
+        """
+        Regression for 40bb25a: some requests exceptions (InvalidHeader on a
+        malformed token) embed the full Authorization header, token
+        included, in str(e). civitai_meta must never let that reach a log
+        line via CivitaiUnavailable's message.
+        """
+        with mock.patch('requests.get',
+                        side_effect=requests.exceptions.InvalidHeader(
+                            "Invalid return character or leading space in header: "
+                            "Authorization: Bearer SECRET-TOKEN-VALUE")):
+            with self.assertRaises(civitai_meta.CivitaiUnavailable) as ctx:
+                civitai_meta.version_for_sha256(SHA)
+        self.assertNotIn('SECRET-TOKEN-VALUE', str(ctx.exception))
+
+
+class PreviewDownloadTests(SidecarTestCase):
+    """`download_preview`'s own guards - host, scheme, extension, and every redirect hop."""
+
+    URL = 'https://civitai.com/x/abc/original=true/1.jpeg'
+
+    class _FakeStream:
+        def __init__(self, body=b'jpg', status_code=200, url=None, history=()):
+            self.body = body
+            self.status_code = status_code
+            self.url = url
+            self.history = history
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def iter_content(self, chunk_size):
+            yield self.body
+
+    def test_refuses_a_non_civitai_host(self):
+        self.assertEqual(lm_sidecar.download_preview(self.model, {'url': 'https://evil.example/1.jpeg'}), '')
+
+    def test_refuses_plain_http(self):
+        self.assertEqual(lm_sidecar.download_preview(self.model, {'url': 'http://civitai.com/1.jpeg'}), '')
+
+    def test_refuses_an_unsaveable_extension(self):
+        self.assertEqual(
+            lm_sidecar.download_preview(self.model, {'url': 'https://civitai.com/original=true/1.mp4'}), '')
+
+    def test_refuses_a_malformed_url_without_raising(self):
+        self.assertEqual(lm_sidecar.download_preview(self.model, {'url': 'https://[invalid/1.jpeg'}), '')
+
+    def test_refuses_a_redirect_to_another_host(self):
+        with mock.patch('requests.get',
+                        return_value=self._FakeStream(url='https://evil.example/1.jpeg')):
+            self.assertEqual(lm_sidecar.download_preview(self.model, {'url': self.URL}), '')
+        self.assertFalse(os.path.isfile(os.path.splitext(self.model)[0] + '.jpeg'))
+
+    def test_refuses_a_redirect_hop_that_dropped_to_http(self):
+        hop = types.SimpleNamespace(url='http://civitai.com/x/abc/original=true/1.jpeg')
+        with mock.patch('requests.get',
+                        return_value=self._FakeStream(url='https://civitai.com/x/w=450/1.jpeg', history=[hop])):
+            self.assertEqual(lm_sidecar.download_preview(self.model, {'url': self.URL}), '')
+
+    def test_downloads_a_valid_preview_and_cleans_up_its_temp_file(self):
+        with mock.patch('requests.get', return_value=self._FakeStream(url='https://civitai.com/x/w=450/1.jpeg')):
+            path = lm_sidecar.download_preview(self.model, {'url': self.URL})
+        self.assertEqual(path, os.path.splitext(self.model)[0] + '.jpeg')
+        self.assertTrue(os.path.isfile(path))
+        self.assertEqual([f for f in os.listdir(self.root) if f.endswith('.tmp')], [])
+
+    def test_never_overwrites_a_preview_that_appeared_mid_download(self):
+        dest = os.path.splitext(self.model)[0] + '.jpeg'
+
+        class RaceStream(self._FakeStream):
+            def __enter__(self):
+                with open(dest, 'wb') as handle:
+                    handle.write(b'already here')
+                return self
+
+        with mock.patch('requests.get', return_value=RaceStream(url='https://civitai.com/x/w=450/1.jpeg')):
+            self.assertEqual(lm_sidecar.download_preview(self.model, {'url': self.URL}), '')
+        with open(dest, 'rb') as handle:
+            self.assertEqual(handle.read(), b'already here')
+        self.assertEqual([f for f in os.listdir(self.root) if f.endswith('.tmp')], [])
+
+
+class NotifyLoraManagerTests(unittest.TestCase):
+    """`notify_lora_manager` is best-effort HTTP to a locally running Lora Manager."""
+
+    def setUp(self):
+        self.model = os.path.join(tempfile.mkdtemp(prefix='model-linker-lm-notify-'), 'rebel.safetensors')
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.model), True)
+        fake_server = types.ModuleType('server')
+        fake_server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(port=8765))
+        patcher = mock.patch.dict(sys.modules, {'server': fake_server})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_400_on_the_scoped_scan_falls_back_to_a_full_scan(self):
+        calls = []
+
+        def fake_get(url, params=None, timeout=None):
+            calls.append((url, params))
+            return types.SimpleNamespace(status_code=400 if params else 200)
+
+        with mock.patch('requests.get', side_effect=fake_get), mock.patch('requests.post') as post:
+            lm_sidecar.notify_lora_manager('loras', self.model, fetch=False)
+        self.assertEqual(len(calls), 2)
+        self.assertIn('roots', calls[0][1])
+        self.assertIsNone(calls[1][1])
+        post.assert_not_called()

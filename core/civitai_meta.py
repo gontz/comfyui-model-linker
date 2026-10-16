@@ -29,7 +29,10 @@ def _get_json(url: str) -> Optional[Dict[str, Any]]:
     try:
         response = requests.get(url, headers=settings.auth_headers_for_url(url), timeout=20)
     except requests.RequestException as e:
-        raise CivitaiUnavailable(str(e))
+        # Never str(e): some request exceptions (e.g. InvalidHeader on a
+        # malformed token) embed the full header value, token included - the
+        # same reasoning as settings.check_token's guard against the same leak.
+        raise CivitaiUnavailable(type(e).__name__)
     if response.status_code == 404:
         return None
     if response.status_code != 200:

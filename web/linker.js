@@ -45,13 +45,16 @@ export class ModelLinker {
         }
     }
 
-    openExport() {
+    async openExport() {
         try {
             if (!this.dialog) this.dialog = new LinkerManagerDialog();
             // show() starts an analysis; openExport() starts a newer one, which
-            // supersedes it and is the one the Export dialog is built from
+            // supersedes it and is the one the Export dialog is built from.
+            // Awaited, not fired-and-forgotten: dialog.openExport() is async,
+            // and a rejection from a call nobody awaits becomes an unhandled
+            // promise rejection instead of reaching this catch.
             this.dialog.show();
-            this.dialog.openExport();
+            await this.dialog.openExport();
         } catch (error) {
             console.error("🔗 Model Linker: Error opening Export:", error);
             notifyError("Could not open Export", error);
@@ -63,8 +66,12 @@ export class ModelLinker {
     // is announced once per session. A workflow the Export dialog was built
     // from is one of these, so it is closed immediately rather than left
     // open to write by node id into a tab that is no longer the one on screen.
+    // Aborting the dialog's in-flight analysis too covers openExport(): while
+    // it awaits loadWorkflowData(), a tab switch must not let that request
+    // land afterwards and open Export with the old tab's rows.
     onGraphLoaded() {
         this.dialog?.exportDialog?.close();
+        this.dialog?.analyzeAbort?.abort();
         clearTimeout(this.loadTimer);
         this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
     }

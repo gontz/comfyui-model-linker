@@ -30,8 +30,11 @@ CATEGORY_ORDER = [
 # shared workflow
 SECRET_PARAMS = {
     'token', 'key', 'api_key', 'apikey', 'access_token', 'auth', 'hf_token', 'sig', 'signature',
+    'access-token',
     # AWS presigned URLs (S3-backed hosts hand these out for a time-limited GET)
     'x-amz-signature', 'x-amz-credential', 'x-amz-security-token',
+    # Google Cloud Storage's own presigned-URL equivalent
+    'x-goog-signature',
 }
 
 _hash_jobs: Dict[str, Dict[str, Any]] = {}
@@ -39,13 +42,27 @@ _hash_cache: Dict[tuple, str] = {}
 _hash_lock = threading.Lock()
 
 
+def _strip_path_params(path: str) -> str:
+    """
+    Drop every `;name=value` path parameter, not only the last segment's.
+
+    `urlparse` only ever recognizes one - on the final path segment - so
+    `;token=...` ahead of a later `/segment` would otherwise pass straight
+    through untouched (`parsed.params` stays empty, and the whole thing sits
+    inside `parsed.path`).
+    """
+    return '/'.join(segment.split(';', 1)[0] for segment in path.split('/'))
+
+
 def strip_secrets(url: str) -> str:
     """
     Remove every credential a URL can carry, not only `?token=...`:
 
     - userinfo (`user:pass@host`)
-    - secret query parameters (the set above, case-insensitive)
-    - an old-style path parameter (`;token=...` on the last segment)
+    - secret query parameters (the set above, case-insensitive) - `;` is
+      treated as a pair separator alongside `&`, an older but still-seen form
+    - an old-style path parameter (`;token=...`), on any path segment, not
+      only the final one
     - any fragment - nothing downstream needs one, and a token hidden there
       would otherwise survive untouched
     """
@@ -58,12 +75,13 @@ def strip_secrets(url: str) -> str:
         return url
     if parsed.scheme not in ('http', 'https'):
         return url
-    query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+    query = [(k, v) for k, v in parse_qsl(parsed.query.replace(';', '&'), keep_blank_values=True)
              if k.lower() not in SECRET_PARAMS]
     # netloc is "user:pass@host:port" (or "user:pass@[::1]:port"); everything
     # after the last '@' is the host and port, brackets and all - keep only that
     netloc = parsed.netloc.rsplit('@', 1)[-1]
-    return urlunparse(parsed._replace(netloc=netloc, params='', query=urlencode(query), fragment=''))
+    path = _strip_path_params(parsed.path)
+    return urlunparse(parsed._replace(netloc=netloc, path=path, params='', query=urlencode(query), fragment=''))
 
 
 def _category_sort_key(category: str):

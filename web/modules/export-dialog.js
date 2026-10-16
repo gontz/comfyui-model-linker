@@ -90,6 +90,9 @@ export class ExportDialog {
 
     close() {
         this.element.style.display = "none";
+        // Nothing still running - apply(), findByHash() - may still believe
+        // it is working on this dialog's rows once it is closed
+        this.rows = [];
     }
 
     option(id) {
@@ -198,18 +201,35 @@ export class ExportDialog {
     }
 
     /**
+     * The existing `properties.models` entry a reference's widget value
+     * resolves to, matched the same way the analyzer builds its own lookup
+     * (`core/workflow_analyzer.py` - exact value first, falling back to
+     * basename on both sides): otherwise the scrub below would miss an entry
+     * the analyzer itself attributed to this reference, leaving a credential
+     * in place and letting a brand-new entry get pushed alongside it.
+     */
+    static findModelEntry(models, name) {
+        let at = models.findIndex((m) => m?.name === name);
+        if (at < 0) {
+            const base = basename(name);
+            at = models.findIndex((m) => basename(m?.name) === base);
+        }
+        return at;
+    }
+
+    /**
      * Resolve every row's link through the server (found, pasted or the
      * workflow's own, http or https - strip_secrets cleans any of them), then
      * write the result into the workflow: a "Model links" note, the loader
      * nodes' own `properties.models`, and a muted marker node.
      *
-     * A link only ever reaches the note or a node's properties once it is
-     * https - the one scheme every written link is checked against - so a
-     * row whose resolved link turns out to be http, cleared, or never found
-     * is treated exactly like one with no link at all: nothing new is
-     * written for it, and anything stale already sitting in a node's
-     * properties for that file is removed, whatever "write links into the
-     * loader nodes" is set to. That option only gates ADDING a new entry.
+     * Two different things both need "the link", and they are not the same
+     * value: an EXISTING `properties.models` entry is always updated (or
+     * cleared) to the server's stripped answer, whatever its scheme - an
+     * `http://` mirror with no credential is not a reason to delete it. A
+     * BRAND-NEW entry, and the note, are restricted to https - the one scheme
+     * ever added fresh. Only adding a new entry is gated by "write links
+     * into the loader nodes"; scrubbing an existing one never is.
      */
     async apply() {
         if (this._applying) return;   // ignore a double press
@@ -230,8 +250,14 @@ export class ExportDialog {
                 if (rows !== this.rows) return;
                 candidates.forEach((row, n) => resolved.set(row.key, safeHttpUrl(links?.[n]?.url) || ""));
             }
+            // Whatever the server sent back for this row - any scheme, or ""
+            // when there was nothing to resolve - what an EXISTING entry gets
+            // written (or cleared) to.
+            const resolvedUrl = (row) => resolved.get(row.key) || "";
+            // The https-only view of the same answer: what a brand-new entry,
+            // or the note, may ever carry.
             const finalUrl = (row) => {
-                const url = resolved.get(row.key) || "";
+                const url = resolvedUrl(row);
                 return url.startsWith("https://") ? url : "";
             };
             const linked = rows.filter((row) => finalUrl(row)).map((row) => ({ ...row, url: finalUrl(row) }));
@@ -253,41 +279,47 @@ export class ExportDialog {
                 const minY = Math.min(...nodes.map((n) => n.pos?.[1] ?? 0), 0);
                 const existingNote = nodes.find((n) => n.properties?.model_linker_note);
                 let note = existingNote || null;
-                if (markdown) {
-                    note = existingNote || LG.createNode("MarkdownNote") || LG.createNode("Note");
-                    if (!note.graph) {
-                        note.pos = [minX - 480, minY];
-                        note.size = [440, 560];
-                        note.title = "Model links";
-                        note.color = "#222";
-                        note.bgcolor = "#000";
-                        note.properties = { ...(note.properties || {}), model_linker_note: true };
-                        graph.add(note);
+                // Touching the note at all - creating, updating or clearing
+                // it - is exactly what the "note" option governs; off means
+                // leave whatever is already there alone.
+                if (this.option("note")) {
+                    if (markdown) {
+                        note = existingNote || LG.createNode("MarkdownNote") || LG.createNode("Note");
+                        if (!note.graph) {
+                            note.pos = [minX - 480, minY];
+                            note.size = [440, 560];
+                            note.title = "Model links";
+                            note.color = "#222";
+                            note.bgcolor = "#000";
+                            note.properties = { ...(note.properties || {}), model_linker_note: true };
+                            graph.add(note);
+                        }
+                        if (note.widgets?.[0]) note.widgets[0].value = markdown;
+                        note.widgets_values = [markdown];
+                    } else if (existingNote) {
+                        // The option is on but nothing is linked any more:
+                        // leave no stale note (or stale credential inside one)
+                        if (existingNote.widgets?.[0]) existingNote.widgets[0].value = "";
+                        existingNote.widgets_values = [""];
                     }
-                    if (note.widgets?.[0]) note.widgets[0].value = markdown;
-                    note.widgets_values = [markdown];
-                } else if (existingNote) {
-                    // A re-apply that now finds no links leaves no stale note
-                    // (and no stale credential inside one) behind
-                    if (existingNote.widgets?.[0]) existingNote.widgets[0].value = "";
-                    existingNote.widgets_values = [""];
                 }
 
-                // Always scrub: a credential already sitting in a node's
-                // properties.models must never survive export. Adding a new
-                // entry is the only part the "properties" option gates.
+                // Always scrub a matched existing entry; adding a brand-new
+                // one is the only part "write links into the loader nodes"
+                // gates, and the only part restricted to https.
                 for (const row of rows) {
-                    const url = finalUrl(row);
+                    const writeUrl = resolvedUrl(row);
+                    const addUrl = finalUrl(row);
                     for (const ref of row.refs) {
                         for (const node of this.linker.liveNodesFor(ref)) {
                             const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
-                            const at = models.findIndex((m) => m?.name === ref.original_path);
+                            const at = ExportDialog.findModelEntry(models, ref.original_path);
                             if (at >= 0) {
                                 const { url: _stale, ...rest } = models[at];
-                                models[at] = url ? { ...rest, url } : rest;
+                                models[at] = writeUrl ? { ...rest, url: writeUrl } : rest;
                                 node.properties = { ...(node.properties || {}), models };
-                            } else if (this.option("properties") && url) {
-                                models.push({ name: ref.original_path, url, directory: row.category });
+                            } else if (this.option("properties") && addUrl) {
+                                models.push({ name: ref.original_path, url: addUrl, directory: row.category });
                                 node.properties = { ...(node.properties || {}), models };
                             }
                         }

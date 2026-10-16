@@ -167,6 +167,190 @@ export default async function run() {
     check('nothing is added while every option is off', graph._nodes.length === 0);
   });
 
+  // Scenario 3 (item 1): the analyzer attributes a properties.models entry to
+  // a widget by its exact value OR by basename on both sides
+  // (core/workflow_analyzer.py:85, :302-303). A widget holding "sub/x..."
+  // with an entry filed only under the bare "x..." must be found the same
+  // way here, both to scrub it and to avoid pushing a duplicate.
+  await withFakeCanvas(async ({ graph }) => {
+    // 3a: options off, the row's link cleared - the basename-matched entry's
+    // credential must still be removed, and nothing duplicated.
+    const refY = { node_id: 20, widget_index: 0, original_path: 'sub/x.safetensors', category: 'loras' };
+    const nodeY = { properties: { models: [{ name: 'x.safetensors', url: 'https://h/x?token=OLD', directory: 'loras' }] } };
+    const linkerY = { liveNodesFor: (ref) => (ref === refY ? [nodeY] : []) };
+    const rowY = { key: 'loras|sub/x.safetensors', name: 'x.safetensors', category: 'loras', original_path: 'sub/x.safetensors',
+      url: '', sha256: '', present: true, refs: [refY] };
+    const dialogY = Object.create(ExportDialog.prototype);
+    dialogY.rows = [rowY];
+    dialogY.linker = linkerY;
+    dialogY.option = () => false;
+    dialogY.close = () => {};
+    dialogY.request = async (path) => { throw new Error('nothing to resolve: ' + path); };
+    await dialogY.apply();
+    check('a basename-matched entry is scrubbed with options off',
+          nodeY.properties.models.length === 1 && !('url' in nodeY.properties.models[0]));
+
+    // 3b: options on, a new link resolved - the SAME basename-matched entry
+    // is updated in place (its own name kept), not duplicated under the
+    // widget's full (subfoldered) value.
+    const refZ = { node_id: 21, widget_index: 0, original_path: 'sub/x.safetensors', category: 'loras' };
+    const nodeZ = { properties: { models: [{ name: 'x.safetensors', url: 'https://h/x?token=OLD', directory: 'loras' }] } };
+    const linkerZ = { liveNodesFor: (ref) => (ref === refZ ? [nodeZ] : []) };
+    const rowZ = { key: 'loras|sub/x.safetensors', name: 'x.safetensors', category: 'loras', original_path: 'sub/x.safetensors',
+      url: 'https://user:pw@host/newx?token=NEW', sha256: '', present: true, refs: [refZ] };
+    const dialogZ = Object.create(ExportDialog.prototype);
+    dialogZ.rows = [rowZ];
+    dialogZ.linker = linkerZ;
+    dialogZ.option = () => true;
+    dialogZ.close = () => {};
+    dialogZ.request = async (path, body) => {
+      if (path === '/model_linker/export/lookup') {
+        return { links: body.models.map(() => ({ url: 'https://host/newx', source: 'workflow', url_source: 'workflow' })) };
+      }
+      if (path === '/model_linker/export/markdown') return { markdown: '## Model links' };
+      throw new Error('unexpected request: ' + path);
+    };
+    await dialogZ.apply();
+    check('a basename-matched entry is updated in place, not duplicated',
+          nodeZ.properties.models.length === 1);
+    check('the matched entry keeps its own stored name', nodeZ.properties.models[0]?.name === 'x.safetensors');
+    check('the matched entry\'s link is the server\'s clean one',
+          nodeZ.properties.models[0]?.url === 'https://host/newx');
+  });
+
+  // Scenario 4 (item 2a, real close()): closing the dialog - as a tab switch
+  // now does - while apply() is still awaiting the lookup must stop it from
+  // writing anything, and must release the in-flight guard.
+  await withFakeCanvas(async ({ graph }) => {
+    const refC = { node_id: 30, widget_index: 0, original_path: 'c.safetensors', category: 'loras' };
+    const nodeC = { properties: {} };
+    const linker = { liveNodesFor: (ref) => (ref === refC ? [nodeC] : []) };
+    const rowC = { key: 'loras|c.safetensors', name: 'c.safetensors', category: 'loras', original_path: 'c.safetensors',
+      url: 'https://host/c?token=T', sha256: '', present: false, refs: [refC] };
+    const dialog = Object.create(ExportDialog.prototype);   // real close(), from the prototype
+    dialog.rows = [rowC];
+    dialog.linker = linker;
+    dialog.option = () => true;
+    dialog.element = { style: {} };
+    // Only the lookup is held open under test control; anything else (e.g. a
+    // markdown request an unfixed apply() might still reach) resolves right
+    // away, so this cannot hang regardless of which code is under test.
+    let release;
+    dialog.request = (path) => path === "/model_linker/export/lookup"
+      ? new Promise((resolve) => { release = () => resolve({ links: [{ url: 'https://host/c' }] }); })
+      : Promise.resolve({ markdown: '## Model links' });
+
+    const applying = dialog.apply();
+    dialog.close();        // e.g. onGraphLoaded(), mid-flight
+    release();
+    await applying;
+
+    check('closing mid-apply clears the dialog\'s rows', dialog.rows.length === 0);
+    check('an apply superseded by close() writes nothing to the loader node',
+          !(Array.isArray(nodeC.properties?.models) && nodeC.properties.models.length > 0));
+    check('the in-flight guard is released even when superseded', dialog._applying === false);
+  });
+
+  // Scenario 5 (item 4): an existing http mirror link, with no credential,
+  // must survive even with "write links into the loader nodes" off - that
+  // option is about ADDING a new entry, not about keeping an existing one.
+  await withFakeCanvas(async () => {
+    const refM = { node_id: 40, widget_index: 0, original_path: 'y.safetensors', category: 'checkpoints' };
+    const nodeM = { properties: { models: [{ name: 'y.safetensors', url: 'http://mirror.lan/y.safetensors', directory: 'checkpoints' }] } };
+    const linker = { liveNodesFor: (ref) => (ref === refM ? [nodeM] : []) };
+    const rowM = { key: 'checkpoints|y.safetensors', name: 'y.safetensors', category: 'checkpoints', original_path: 'y.safetensors',
+      url: 'http://mirror.lan/y.safetensors', sha256: '', present: true, refs: [refM] };
+    const dialog = Object.create(ExportDialog.prototype);
+    dialog.rows = [rowM];
+    dialog.linker = linker;
+    dialog.option = () => false;   // "write links" off
+    dialog.close = () => {};
+    dialog.request = async (path, body) => {
+      if (path === '/model_linker/export/lookup') {
+        return { links: body.models.map((m) => ({ url: m.existing_url, source: 'workflow', url_source: 'workflow' })) };
+      }
+      throw new Error('unexpected request: ' + path);
+    };
+    await dialog.apply();
+    check('an existing http mirror link survives with "write links" off',
+          nodeM.properties.models[0].url === 'http://mirror.lan/y.safetensors');
+  });
+
+  // Scenario 6 (item 5): an existing note must be left alone - not emptied -
+  // when the "note" option itself is off, whatever is or isn't linked.
+  await withFakeCanvas(async ({ graph }) => {
+    const existingNote = { type: 'MarkdownNote', pos: [0, 0], size: [1, 1], properties: { model_linker_note: true },
+      widgets: [{ value: 'old content' }], widgets_values: ['old content'], mode: 0, graph: null };
+    graph.add(existingNote);
+    const refN = { node_id: 50, widget_index: 0, original_path: 'z.safetensors', category: 'loras' };
+    const nodeN = { properties: {} };
+    const linker = { liveNodesFor: (ref) => (ref === refN ? [nodeN] : []) };
+    const rowN = { key: 'loras|z.safetensors', name: 'z.safetensors', category: 'loras', original_path: 'z.safetensors',
+      url: '', sha256: '', present: false, refs: [refN] };
+    const dialog = Object.create(ExportDialog.prototype);
+    dialog.rows = [rowN];
+    dialog.linker = linker;
+    dialog.option = () => false;   // note (and everything else) off
+    dialog.close = () => {};
+    dialog.request = async (path) => { throw new Error('nothing to resolve: ' + path); };
+    await dialog.apply();
+    check('an existing note is left untouched when the "note" option is off',
+          existingNote.widgets_values[0] === 'old content');
+  });
+
+  // Scenario 7 (item 2b, faithful transcription - LinkerManagerDialog needs a
+  // live DOM this harness does not have, same reason test_analyze_race.mjs
+  // uses a stub rather than the real class): a tab switch while openExport()
+  // is still awaiting loadWorkflowData() must abort that request, so the
+  // Export dialog is never shown with the old tab's rows.
+  {
+    const dialog = {
+      analyzeAbort: null,
+      exportDialog: null,
+      async loadWorkflowData() {
+        if (this.analyzeAbort) this.analyzeAbort.abort();
+        const abort = new AbortController();
+        this.analyzeAbort = abort;
+        try {
+          const data = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => resolve({ tag: 'stale-tab-data' }), 30);
+            abort.signal.addEventListener('abort', () => {
+              clearTimeout(timer);
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+            });
+          });
+          if (this.analyzeAbort !== abort) return null;
+          return data;
+        } catch (error) {
+          if (error.name === 'AbortError' || this.analyzeAbort !== abort) return null;
+          throw error;
+        } finally {
+          if (this.analyzeAbort === abort) this.analyzeAbort = null;
+        }
+      },
+      show() {},
+      async openExport() {
+        const data = await this.loadWorkflowData();
+        if (!data) return;
+        if (!this.exportDialog) this.exportDialog = { shown: 0, show(d) { this.shown++; this.data = d; } };
+        this.exportDialog.show(data);
+      },
+    };
+    const modelLinker = {
+      dialog,
+      onGraphLoaded() {
+        this.dialog?.exportDialog?.close?.();
+        this.dialog?.analyzeAbort?.abort();
+      },
+    };
+    const opening = dialog.openExport();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    modelLinker.onGraphLoaded();   // tab switch, while the analysis is still in flight
+    await opening;
+    check('a tab switch aborts an in-flight openExport, so it never shows stale rows',
+          dialog.exportDialog === null);
+  }
+
   // --- source-level checks for what is impractical to drive end-to-end ----
   const src = readSource('modules/export-dialog.js');
   check('applying ignores a double press', /this\._applying/.test(src));
@@ -174,13 +358,20 @@ export default async function run() {
   check('findByHash bails once the row it was called for is stale', (src.match(/this\.rows\[i\] !== row/g) || []).length >= 3);
   check('an existing Model Linker node is re-muted on re-apply', /existingMarker\.mode = 2;/.test(src));
   check('a re-apply with no links empties a stale note', /existingNote\.widgets_values = \[""\];/.test(src));
+  check('touching the note at all is gated by the "note" option',
+        /if \(this\.option\("note"\)\) \{\s*if \(markdown\)/.test(src));
+  check('close() invalidates the dialog\'s rows', /close\(\) \{[\s\S]{0,200}?this\.rows = \[\];/.test(src));
   check('names and urls are escaped', /escapeHtml\(row\.name\)/.test(src) && /escapeHtml\(row\.url/.test(src));
   check('lookups can be asked for by hand', /lookUp\(\{ manual: true \}\)/.test(src));
 
   const linkerSrc = readSource('linker.js');
   check('the export dialog is closed when another workflow loads',
         /onGraphLoaded\(\)\s*\{\s*this\.dialog\?\.exportDialog\?\.close\(\);/.test(linkerSrc));
+  check('a tab switch also aborts the dialog\'s in-flight analysis',
+        /onGraphLoaded\(\)\s*\{[\s\S]{0,300}?analyzeAbort\?\.abort\(\)/.test(linkerSrc));
   check('opening Export reports a failure instead of throwing', /notifyError\("Could not open Export"/.test(linkerSrc));
+  check('opening Export is async and awaits the dialog, so a rejection cannot escape unhandled',
+        /async openExport\(\)[\s\S]{0,700}?await this\.dialog\.openExport\(\)/.test(linkerSrc));
 
   const dialog = readSource('modules/linker-dialog.js');
   check('export analyses the workflow on screen', /const data = await this\.loadWorkflowData\(\);/.test(dialog));

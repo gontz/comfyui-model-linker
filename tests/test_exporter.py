@@ -38,6 +38,17 @@ class LinkTests(unittest.TestCase):
             exporter.strip_secrets('https://user:pass@host/path;token=abc?X-Amz-Signature=x&foo=bar#token=FRAG'),
             'https://host/path?foo=bar')
 
+    def test_a_path_param_on_a_non_final_segment_is_stripped(self):
+        self.assertEqual(exporter.strip_secrets('https://h/a;token=x/b.safetensors'), 'https://h/a/b.safetensors')
+
+    def test_semicolon_separated_query_pairs_are_split(self):
+        self.assertEqual(exporter.strip_secrets('https://host/path?a=1;token=x'), 'https://host/path?a=1')
+
+    def test_access_token_and_google_signature_are_stripped(self):
+        self.assertEqual(
+            exporter.strip_secrets('https://host/path?access-token=abc&X-Goog-Signature=def&foo=bar'),
+            'https://host/path?foo=bar')
+
     def test_existing_link_wins_and_is_stripped(self):
         # No **kwargs: a leftover fetch_size=False raises TypeError here, which
         # lookup_links swallows into None - and this test fails on it

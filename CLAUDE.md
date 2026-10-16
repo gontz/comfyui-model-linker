@@ -18,11 +18,13 @@ The repo began as a fork of [kianxyzw/comfyui-model-linker](https://github.com/k
   sync brought in a download subsystem whose frontend was written against the monolithic
   `web/linker.js` this project has since split into `web/modules/`; reconciling the two
   cost a full manual merge and lost upstream's UI layer anyway.
-- **There is deliberately no download feature.** Upstream's came across in that merge with
-  its backend intact and its UI lost, and was then removed on purpose — see below.
+- **Downloads were reinstated on 2026-10-14 by the user's decision**, redesigned so the
+  objections below no longer hold — see `docs/superpowers/specs/2026-10-14-upstream-parity-design.md`
+  and the plans beside it. Upstream code for it is ported file-by-file with
+  `git show bec5c80:<path>`; that is "porting by hand", not a merge.
 - Wanting something from upstream means porting that specific change by hand.
 
-### The removed download subsystem
+### Why downloads were once removed (history)
 
 `core/downloader.py`, `core/sources/*` (HuggingFace, CivitAI, popular, model-list),
 `metadata/*.json` and six `/model_linker/` routes (`search`, `download`, `progress`×2,
@@ -36,6 +38,11 @@ dormant:
 > sent workflow filenames to both services. There was no setting to disable it.
 
 Recover any of it with `git show <that commit>^:core/downloader.py` and so on.
+
+The reinstated design answers both points: `/analyze` only reads a persistent lookup
+store and queues work for a background thread, so it stays as fast as before; lookups
+can be switched off (`auto_lookup` in ⚙ Settings); and nothing contacts a workflow's own
+URL during lookup. Plan C Task 5 completes this documentation.
 
 **Not to be confused with the download link we do offer:** `properties.models[].url` from
 the workflow itself is surfaced as `source_url` and rendered by the dialog. That is local,

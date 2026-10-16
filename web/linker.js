@@ -7,6 +7,7 @@
  */
 
 import { app } from "../../scripts/app.js";
+import { api } from "../../scripts/api.js";
 
 import { LinkerManagerDialog } from "./modules/linker-dialog.js";
 import { notifyError } from "./modules/util.js";
@@ -15,6 +16,9 @@ import { notifyError } from "./modules/util.js";
 class ModelLinker {
     constructor() {
         this.dialog = null;
+        this.notified = new Set();
+        this.loadTimer = null;
+        this.loadGeneration = 0;
     }
 
     // Model Linker is reached from the View menu, the command palette, the
@@ -40,6 +44,58 @@ class ModelLinker {
             notifyError("Could not open Model Linker", error);
         }
     }
+
+    // ComfyUI fires afterConfigureGraph for every graph it loads, including
+    // tab switches, so the check is debounced and each workflow's missing set
+    // is announced once per session.
+    onGraphLoaded() {
+        clearTimeout(this.loadTimer);
+        this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
+    }
+
+    async checkLoadedWorkflow() {
+        // The first workflow can load before setup() has created the dialog
+        if (!this.dialog) this.dialog = new LinkerManagerDialog();
+        if (this.dialog.isOpen()) return;
+        const workflow = this.dialog.getCurrentWorkflow();
+        if (!workflow?.nodes?.length) return;
+        // A slow analysis must not announce stale results once another
+        // workflow has loaded in the meantime - the same kind of guard
+        // loadWorkflowData uses against a superseded analysis, via a
+        // generation counter instead of an AbortController since this
+        // request has no dialog UI waiting on it to cancel.
+        const generation = ++this.loadGeneration;
+        let data;
+        try {
+            const response = await api.fetchApi("/model_linker/analyze", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ workflow }),
+            });
+            if (!response.ok) return;
+            data = await response.json();
+        } catch (error) {
+            return;  // a background courtesy; the dialog reports real errors
+        }
+        if (generation !== this.loadGeneration) return;
+        const count = data.total_missing || 0;
+        if (!count) return;
+        const signature = `${workflow.id || ""}:${(data.missing_models || []).map(m => m.original_path).sort().join("|")}`;
+        if (this.notified.has(signature)) return;
+        this.notified.add(signature);
+
+        if (app.extensionManager?.setting?.get?.("ModelLinker.OpenOnMissing")) {
+            this.openLinkerManager();
+            return;
+        }
+        const searching = data.lookups_pending ? " Looking for downloads in the background." : "";
+        app.extensionManager?.toast?.add({
+            severity: "warn",
+            summary: "Model Linker",
+            detail: `${count} model${count === 1 ? " is" : "s are"} missing. Press Alt+L to relink.${searching}`,
+            life: 8000,
+        });
+    }
 }
 
 const modelLinker = new ModelLinker();
@@ -48,7 +104,17 @@ const modelLinker = new ModelLinker();
 app.registerExtension({
     name: "Model Linker",
     setup: modelLinker.setup,
-
+    afterConfigureGraph: () => modelLinker.onGraphLoaded(),
+    settings: [
+        {
+            id: "ModelLinker.OpenOnMissing",
+            category: ["Model Linker", "Workflow loading", "Open on missing models"],
+            name: "Open Model Linker when a loaded workflow has missing models",
+            tooltip: "Otherwise a notification says how many are missing.",
+            type: "boolean",
+            defaultValue: false,
+        },
+    ],
 
     // Registered as a command so it appears in the command palette and can be
     // bound to a key, rather than existing only as a button in the page

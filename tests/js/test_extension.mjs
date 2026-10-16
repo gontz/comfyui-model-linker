@@ -53,5 +53,21 @@ export default async function run() {
   check('ComfyUI markup is not scraped for an injection point',
         !/\[class\*=.menu.\]|app\.menu\?\.settingsGroup/.test(source));
 
+  check('a loaded workflow is checked through the extension hook',
+        typeof config.afterConfigureGraph === 'function');
+  const openSetting = config.settings?.find?.(s => s.id === 'ModelLinker.OpenOnMissing');
+  check('opening on load is an opt-in setting', openSetting?.type === 'boolean' && openSetting?.defaultValue === false);
+  check('ComfyUI\'s Missing Models popup is not observed',
+        !/MutationObserver/.test(readAllSources()));
+  check('the same workflow is announced once per session', /notified\.has\(/.test(source));
+  check('a workflow loaded before setup is still checked',
+        /if \(!this\.dialog\) this\.dialog = new LinkerManagerDialog\(\);\s*if \(this\.dialog\.isOpen\(\)\) return;/.test(source));
+  // Deviation from the brief's literal snippet: the brief's dedupe alone
+  // does not stop a slow analysis from toasting about a workflow another
+  // tab has since replaced, so a generation counter guards it the same way
+  // loadWorkflowData drops a superseded analysis via analyzeAbort.
+  check('a superseded background analysis is dropped',
+        /generation !== this\.loadGeneration/.test(source));
+
   return check.failures;
 }

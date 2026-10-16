@@ -727,6 +727,10 @@ export class LinkerManagerDialog {
         } catch (e) { }
     }
 
+    isOpen() {
+        return this.element?.style.display !== "none";
+    }
+
     close() {
         this._hidePreview();
         // Nothing is waiting for the answer any more

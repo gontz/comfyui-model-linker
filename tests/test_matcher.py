@@ -171,6 +171,20 @@ class WordOrderTests(unittest.TestCase):
         best = find_matches('qwen3vl_8b_int8.safetensors', pool)[0]
         self.assertEqual(best['filename'], 'qwen3vl_8b_bf16.safetensors')
 
+    def test_capacity_token_first_still_blocked(self):
+        # Capacity leading the filename must not escape the conflict cap.
+        # "4b qwen3vl" has no usable architecture from the prefix, so this
+        # used to return None, skipping the 4B vs 8B check.
+        self.assertLess(
+            calculate_filename_confidence('qwen3vl_8b_int8.safetensors', '4b_qwen3vl_int8.safetensors'),
+            STRONG_MATCH_CONFIDENCE)
+
+    def test_capacity_token_first_with_reorder_still_blocked(self):
+        # Same as above, but with reordering applied (most hostile case).
+        self.assertLess(
+            calculate_filename_confidence('qwen3vl_8b_int8.safetensors', 'int8_4b_qwen3vl.safetensors'),
+            STRONG_MATCH_CONFIDENCE)
+
 
 if __name__ == '__main__':
     unittest.main()

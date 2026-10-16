@@ -162,13 +162,18 @@ def get_model_signature(family_name: str) -> Optional[Tuple[str, str]]:
     Split a family name into (architecture, parameter count) when it has one.
 
     "qwen3vl 8b" -> ("qwen3vl", "8b"). Returns None when the name carries no
-    parameter count, which is normal for models like "umt5 xxl".
+    parameter count, which is normal for models like "umt5 xxl". If the capacity
+    token leads the name, falls back to the token after the capacity as architecture.
     """
     tokens = family_name.split()
     for index, token in enumerate(tokens):
         if not _CAPACITY_TOKEN_RE.fullmatch(token):
             continue
         architecture = ''.join(tokens[:index])
+        if len(architecture) >= 3 and re.search(r'[a-z]', architecture):
+            return architecture, token
+        # Capacity token is first or prefix is too short; try the token after capacity
+        architecture = ''.join(tokens[index + 1:index + 2])
         if len(architecture) >= 3 and re.search(r'[a-z]', architecture):
             return architecture, token
     return None

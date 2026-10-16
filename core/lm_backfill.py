@@ -211,6 +211,17 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     was_hf_sourced = data.get('metadata_source') == 'source:huggingface'
     was_described = bool((data.get('modelDescription') or '').strip())
 
+    if words_before:
+        # Recorded *before* the hydrate call itself, not only before the
+        # merge-back save afterward: if hydrate_huggingface raises after
+        # Lora Manager has already cleared the words on its own side (our
+        # 300s timeout, or a dropped connection while Lora Manager carries
+        # on regardless), the 'failed' outcome below must still carry
+        # something to restore from - the merge-back save never even gets
+        # attempted in that case, so recording it only there would leave
+        # nothing.
+        item['trainedWords_before'] = words_before
+
     lm_api.hydrate_huggingface(path, item['root'], repo)
     after = _read(sidecar_path(path)) or {}
 
@@ -220,11 +231,6 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     merged = words_before + [w for w in words_after if w not in words_before]
     if merged != words_after:
         extra['civitai'] = {'trainedWords': merged}
-        # If the save below fails, the words Lora Manager just cleared would
-        # otherwise be lost entirely - the outcome is just 'failed', with
-        # nothing to restore from. Recorded now, before the save is even
-        # attempted, so it survives whatever that save does.
-        item['trainedWords_before'] = words_before
 
     if info is None:
         try:
@@ -273,6 +279,15 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
         if limit:
             items = items[:limit]  # a sample run, to check results before the whole library
         _update(total=len(items), candidates_total=found)
+        # Saved once here too, not only after each model: without this, a
+        # restart before the very first per-model save leaves whatever the
+        # *previous* run last wrote (status 'done', its own stale total) on
+        # disk - this run would be entirely invisible, rather than showing
+        # up as 'running' (and, after that restart, 'interrupted').
+        try:
+            _save_report()
+        except OSError as e:
+            logger.warning(f"Model Linker: could not save the backfill report: {e}")
         hydrated = []
         for item in items:
             if _cancel.is_set():
@@ -293,9 +308,12 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
             except Exception as e:
                 extra = {'error': str(e)}
                 if item.get('trainedWords_before') is not None:
-                    # A merge-back save was pending when this failed - the
-                    # trigger words it was about to restore would otherwise
-                    # be gone with nothing to recover them from.
+                    # Set in _fill as soon as there were words to protect,
+                    # before hydrate_huggingface was even called - whether
+                    # this failed during that call (Lora Manager cleared the
+                    # words on its side regardless) or during the
+                    # merge-back save afterward, there would otherwise be
+                    # nothing left to recover the words from.
                     extra['trainedWords_before'] = item['trainedWords_before']
                 _record(item, 'failed', **extra)
             # Persisted after every model, not only at the end, so an

@@ -50,6 +50,15 @@ class BackfillTestCase(LibraryTestCase):
             self.addCleanup(patcher.stop)
 
     def tearDown(self):
+        # Joined BEFORE overrides._data_dir is restored to the real one, in
+        # case a test's own body failed an assertion (or simply never
+        # called _wait_until_done) while a `start()`-spawned worker was
+        # still mid-flight: without this, that worker's own _save_report()
+        # calls would land in the *real* data/lm-backfill.json the instant
+        # the patch below is undone - not this test's throwaway directory.
+        for thread in threading.enumerate():
+            if thread.name == 'model-linker-lm-backfill':
+                thread.join(5)
         overrides._data_dir = self._real
         shutil.rmtree(self.data_dir, ignore_errors=True)
         lm_backfill._cancel.clear()
@@ -364,6 +373,44 @@ class RunTests(BackfillTestCase):
         # already reflects the first model's own result.
         self.assertEqual(seen_after_first, [0, 1])
 
+    def test_report_is_saved_before_the_first_model_too(self):
+        """
+        Fix round 3, item 2: without a save right after `total` is known,
+        a restart before the very first per-model save leaves whatever the
+        *previous* run last wrote (status 'done', its own stale total) on
+        disk - this run would be entirely invisible rather than showing up
+        as 'running' (and, after that restart, 'interrupted').
+        """
+        # A stale, finished report from an earlier run, left on disk.
+        lm_backfill._update(status='done', started_at=1.0, finished_at=2.0, total=0, candidates_total=0,
+                             limit=None, done=0, current='', counts={}, results=[], use_ai=False,
+                             ai_error=None, error=None)
+        lm_backfill._save_report()
+        lm_backfill._state.clear()
+        lm_backfill._state['status'] = 'idle'
+
+        self.write_sidecar()  # no source_url: _fill reaches find_repo
+        seen = []
+
+        def find_repo(*args, **kwargs):
+            try:
+                with open(os.path.join(self.data_dir, 'lm-backfill.json'), encoding='utf-8') as handle:
+                    seen.append(json.load(handle))
+            except FileNotFoundError:
+                seen.append(None)
+            return None
+
+        with mock.patch.object(hf_identify, 'find_repo', side_effect=find_repo):
+            lm_backfill._run(use_ai=False)
+        # By the time the one and only candidate is being identified - the
+        # first per-model save has not happened yet - the report already
+        # reflects *this* run (status 'running', its own total), not the
+        # stale 'done' one from before.
+        self.assertIsNotNone(seen[0])
+        self.assertEqual(seen[0]['status'], 'running')
+        self.assertEqual(seen[0]['total'], 1)
+        self.assertEqual(seen[0]['done'], 0)
+
     def test_status_shows_a_restored_running_report_as_interrupted(self):
         """
         A process restart loses the whole in-memory job; the persisted
@@ -428,6 +475,24 @@ class RunTests(BackfillTestCase):
         self.assertEqual(state['results'][0]['outcome'], 'failed')
         self.assertEqual(state['results'][0]['trainedWords_before'], ['STORYBOARD8'])
 
+    def test_trigger_words_before_are_recorded_even_when_hydrate_itself_raises(self):
+        """
+        Fix round 3, item 1: trainedWords_before must be on the item
+        *before* hydrate_huggingface is even called, not only before the
+        merge-back save afterward. If hydrate_huggingface itself raises -
+        our 300s timeout, or a dropped connection while Lora Manager
+        carries on and clears the words on its side regardless - there
+        would otherwise be no restore trail at all, since the merge-back
+        save is never reached in that case.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r', civitai={'trainedWords': ['STORYBOARD8']})
+        lm_backfill.lm_api.hydrate_huggingface.side_effect = lm_api.LoraManagerUnavailable('timed out')
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=False)
+        state = lm_backfill.status()
+        self.assertEqual(state['results'][0]['outcome'], 'failed')
+        self.assertEqual(state['results'][0]['trainedWords_before'], ['STORYBOARD8'])
+
     def test_an_already_hf_sourced_but_still_undescribed_sidecar_is_not_falsely_hydrated(self):
         """
         is_empty() only looks at civitai.id/modelDescription, so a sidecar
@@ -462,6 +527,13 @@ class StartStopTests(BackfillTestCase):
         """
         self.write_sidecar(source_url='https://huggingface.co/o/r')
         release = threading.Event()
+        # If an assertion below fails before release.set() is reached, the
+        # worker would otherwise stay parked on release.wait(5) for the
+        # full 5s with nothing to release it - and, per the tearDown fix
+        # above, tearDown now joins that thread before restoring the real
+        # data dir, so it must actually be released, not just eventually
+        # time out, for this test's own failure path to stay fast and safe.
+        self.addCleanup(release.set)
 
         def blocking_card(*args, **kwargs):
             release.wait(5)

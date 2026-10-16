@@ -6,7 +6,7 @@ imports - see __init__.setup_routes.
 import asyncio
 import logging
 
-from . import lookups
+from . import downloader, lookups
 
 logger = logging.getLogger(__name__)
 
@@ -44,3 +44,35 @@ def register(routes, web) -> None:
         clean = {k: missing[k] for k in fields if isinstance(missing.get(k), str)}
         key = await asyncio.to_thread(lookups.refresh, clean)
         return web.json_response({'key': key, 'state': 'pending'})
+
+    @routes.post("/model_linker/download")
+    async def start(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _bad(web, 'Body must be JSON')
+        if not isinstance(data, dict):
+            return _bad(web, 'Body must be an object')
+        url, category, filename = data.get('url'), data.get('category'), data.get('filename')
+        if not all(isinstance(v, str) and v for v in (url, category, filename)):
+            return _bad(web, 'url, category and filename are required')
+        sha256 = data.get('sha256') if isinstance(data.get('sha256'), str) else None
+        size = data.get('size') if isinstance(data.get('size'), int) and data.get('size') > 0 else None
+        try:
+            download_id = await asyncio.to_thread(downloader.start_download, url, category, filename, sha256, size)
+        except downloader.DownloadError as e:
+            return _bad(web, str(e))
+        return web.json_response({'download_id': download_id})
+
+    @routes.get("/model_linker/progress")
+    async def all_progress(request):
+        return web.json_response(downloader.get_all_progress())
+
+    @routes.get("/model_linker/progress/{download_id}")
+    async def one_progress(request):
+        record = downloader.get_progress(request.match_info['download_id'])
+        return web.json_response(record) if record else web.json_response({'error': 'Unknown download'}, status=404)
+
+    @routes.post("/model_linker/cancel/{download_id}")
+    async def cancel(request):
+        return web.json_response({'success': downloader.cancel_download(request.match_info['download_id'])})

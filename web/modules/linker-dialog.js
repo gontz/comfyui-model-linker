@@ -594,14 +594,18 @@ export class LinkerManagerDialog {
         const list = Array.isArray(this.pendingResolutions) ? this.pendingResolutions : [];
         if (i < 0 || i >= list.length) return;
         const r = list[i];
-        // A swap queues one resolution per node that loads this model. Removing
-        // only the clicked row would strand the rest of the group half-queued,
+        // A swap stamps every resolution it queues with `swap_group`, the
+        // exact key groupPresentModels grouped those references under
+        // (canonical category + separator-normalised path). Removing only
+        // the clicked row would strand the rest of the group half-queued,
         // with no bar showing them and no way back to "not queued" - so
-        // removing any swap entry removes every entry in its group.
-        const sameSwapGroup = (res) => res.record_override === false
-            && res.original_path === r.original_path
-            && res.category === r.category;
-        const removed = (r.record_override === false) ? list.filter(sameSwapGroup) : [r];
+        // removing any swap entry removes every entry sharing that key.
+        // Matching on the raw category/original_path instead would miss a
+        // group spread across category aliases (clip vs text_encoders) or
+        // across separator spellings of the same path (sub\a vs sub/a).
+        const removed = r.swap_group
+            ? list.filter((res) => res.swap_group === r.swap_group)
+            : [r];
         this.pendingResolutions = list.filter((res) => !removed.includes(res));
         this.rebuildPendingIndex();
         // Refresh the bar for every reference that just lost its resolution
@@ -1224,7 +1228,11 @@ export class LinkerManagerDialog {
 
     /** Queue a swap: the same replacement for every node that loads this model. */
     queueSwap(group, model) {
-        group.refs.forEach((ref) => this.queueResolution({ ...ref, record_override: false }, model));
+        // Stamped with the group's own key (the same one groupPresentModels
+        // computed it under) so removeQueuedByIndex can match on it exactly,
+        // instead of re-deriving category/path and drifting from the grouping.
+        group.refs.forEach((ref) =>
+            this.queueResolution({ ...ref, record_override: false, swap_group: group.key }, model));
     }
 
     /** Drop every queued entry a swap created, not just the one the UI shows. */
@@ -1760,6 +1768,9 @@ export class LinkerManagerDialog {
             adapter_id: missing.adapter_id || null,
             // A swap replaces a model that is present; /resolve must not save it as an override
             record_override: missing.record_override !== false,
+            // Only set by queueSwap; the queue panel's Remove uses it to find
+            // the rest of the group. /resolve never reads this field.
+            swap_group: missing.swap_group || null,
             node_type: missing.node_type,
             node_label: missing.subgraph_name || missing.node_type
         };

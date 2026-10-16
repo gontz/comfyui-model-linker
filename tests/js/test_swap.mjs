@@ -13,7 +13,7 @@ const ref = (id, path, category = 'loras', extra = {}) =>
 
 export default async function run() {
   const check = createChecker(name);
-  const { groupPresentModels, refKey, refSlot } = await loadModule('modules/util.js');
+  const { groupPresentModels, presentModelGroupKey, refKey, refSlot } = await loadModule('modules/util.js');
   const { LinkerManagerDialog } = await loadModule('modules/linker-dialog.js');
 
   // `updateSelectedBarForMissing` (called by queueResolution/removeQueuedResolution)
@@ -37,6 +37,8 @@ export default async function run() {
   const separatorGroups = groupPresentModels([ref(6, 'sub\\a.safetensors'), ref(7, 'sub/a.safetensors')]);
   check('a backslash and a forward-slash path group as one row',
         separatorGroups.length === 1 && separatorGroups[0].refs.length === 2);
+  check('groupPresentModels keys match the exposed helper, so the two cannot drift',
+        [...groups, ...separatorGroups].every((g) => g.refs.every((r) => presentModelGroupKey(r) === g.key)));
 
   // --- queueSwap / removeSwapGroup (extracted from the picker's onChoose) --
   const group = {
@@ -99,6 +101,33 @@ export default async function run() {
   dialog3.removeQueuedByIndex(0);
   check('removeQueuedByIndex rebuilds the reference with its list_index, so the right bar is found',
         seenSlots.length === 1 && seenSlots[0] === 1);
+
+  // --- removeQueuedByIndex matches the grouping identity, not raw fields --
+  // (a) a group spread across category aliases: clip vs text_encoders -
+  // same canonical category, different raw category.
+  const [aliasGroup] = groupPresentModels([
+    ref(30, 'clip_l.safetensors', 'clip', { canonical_category: 'text_encoders' }),
+    ref(31, 'clip_l.safetensors', 'text_encoders', { canonical_category: 'text_encoders' }),
+  ]);
+  const dialogA = Object.create(LinkerManagerDialog.prototype);
+  dialogA.pendingResolutions = [];
+  dialogA.pendingIndex = new Map();
+  dialogA.queueSwap(aliasGroup, model);
+  dialogA.removeQueuedByIndex(0); // remove the "clip" row
+  check('removing either row of a clip/text_encoders group removes both',
+        dialogA.pendingResolutions.length === 0);
+
+  // (b) a group spread across separator spellings of the same path.
+  const [sepGroup] = groupPresentModels([
+    ref(32, 'sub\\a.safetensors'), ref(33, 'sub/a.safetensors'),
+  ]);
+  const dialogB = Object.create(LinkerManagerDialog.prototype);
+  dialogB.pendingResolutions = [];
+  dialogB.pendingIndex = new Map();
+  dialogB.queueSwap(sepGroup, model);
+  dialogB.removeQueuedByIndex(1); // remove the "sub/a.safetensors" row (the other spelling)
+  check('removing either row of a sub\\a / sub/a group removes both',
+        dialogB.pendingResolutions.length === 0);
 
   // --- a queued swap survives a re-render ----------------------------------
   const fakeEl = () => {

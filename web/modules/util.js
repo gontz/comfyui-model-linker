@@ -111,22 +111,33 @@ export function isPerfectMatch(match) {
 }
 
 /**
+ * The identity `groupPresentModels` groups a reference by: canonical
+ * category (several raw category names can be one folder) plus the file's
+ * path with separators normalised ("sub\a" and "sub/a" are the same file).
+ *
+ * Exposed so a swap can stamp every resolution it queues with this same
+ * key (see `queueSwap` in linker-dialog.js) - matching on the raw
+ * `category`/`original_path` instead would disagree with this grouping
+ * for exactly the two cases it normalises, and strand part of the group.
+ */
+export function presentModelGroupKey(ref) {
+    const category = ref.canonical_category || ref.category || "unknown";
+    return `${category}|${(ref.original_path || "").replace(/[\\/]+/g, "/")}`;
+}
+
+/**
  * Present-model references grouped by file: one row per (folder, path), with
  * every reference that loads it. A swap then updates all of them at once.
  */
 export function groupPresentModels(present) {
     const groups = new Map();
     for (const ref of present || []) {
-        const category = ref.canonical_category || ref.category || "unknown";
-        // Only the key is normalised - "sub\a" and "sub/a" are the same file
-        // under two separator conventions and must group as one row, but the
-        // row itself keeps the reference's own original_path for display/use.
-        const key = `${category}|${(ref.original_path || "").replace(/[\\/]+/g, "/")}`;
+        const key = presentModelGroupKey(ref);
         if (!groups.has(key)) {
             groups.set(key, {
                 key,
                 name: (ref.original_path || "").split(/[\\/]/).pop(),
-                category,
+                category: ref.canonical_category || ref.category || "unknown",
                 refs: [],
             });
         }

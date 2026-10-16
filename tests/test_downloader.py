@@ -349,6 +349,23 @@ class TransferTests(DownloaderTestCase):
         self.assertNotIn('Authorization', self.sent[0][1])
         self.assertEqual(self.sent[1][1].get('Authorization'), 'Bearer secret-token')
 
+    def test_a_malformed_token_never_reaches_the_error_record(self):
+        # A token with an embedded newline makes requests raise InvalidHeader,
+        # whose message carries the whole Authorization value - which the
+        # record's error is shown in the UI.
+        token = 'hf_LEAKME0123456789\nX'
+
+        def invalid_header(url, headers=None, **kwargs):
+            raise requests.exceptions.InvalidHeader(
+                f"Invalid leading whitespace in header value: {headers['Authorization']!r} ({token})")
+
+        with mock.patch.object(settings, 'get_token', return_value=token), \
+             mock.patch.object(requests, 'get', invalid_header):
+            record = self.run_download()
+        self.assertEqual(record['status'], 'error')
+        self.assertNotIn('LEAKME', record['error'])
+        self.assertIn('InvalidHeader', record['error'])
+
     def test_not_enough_disk_space(self):
         self.respond(FakeResponse())
         usage = mock.Mock(free=10)

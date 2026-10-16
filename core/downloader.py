@@ -430,7 +430,9 @@ def _stream(download_id: str, job: Dict[str, Any]) -> str:
         _rename_no_clobber(part, dest)
         return sha256
     except requests.RequestException as e:
-        raise DownloadError(f'Network error: {e}')
+        # Never str(e): InvalidHeader (a token with a CR/LF in it) carries the
+        # whole Authorization value, and this message is shown in the UI.
+        raise DownloadError(f'Network error: {type(e).__name__}') from None
     finally:
         if os.path.exists(part):
             _remove(part)

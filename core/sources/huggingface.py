@@ -150,7 +150,7 @@ def search_huggingface_for_file(
                         continue
                     files = files_response.json()
                 except Exception as e:
-                    logger.debug(f"Error checking repo {repo_id}: {e}")
+                    logger.debug(f"Error checking repo {repo_id}: {type(e).__name__}")
                     continue
 
                 for file_info in files:
@@ -197,7 +197,7 @@ def search_huggingface_for_file(
         return partial_result
 
     except Exception as e:
-        logger.error(f"HuggingFace search error: {e}")
+        logger.error(f"HuggingFace search error: {type(e).__name__}")
         return None
 
 
@@ -247,7 +247,7 @@ def search_huggingface(
                 })
                 
     except Exception as e:
-        logger.error(f"HuggingFace search error: {e}")
+        logger.error(f"HuggingFace search error: {type(e).__name__}")
     
     return results
 
@@ -284,6 +284,6 @@ def get_repo_files(
                     })
                     
     except Exception as e:
-        logger.error(f"Error getting repo files: {e}")
+        logger.error(f"Error getting repo files: {type(e).__name__}")
     
     return files

@@ -3,6 +3,7 @@ Searching for similar models online: every candidate scored with the banded
 matcher, different models labelled, sources failing independently.
 """
 
+import logging
 import unittest
 from unittest import mock
 
@@ -95,6 +96,26 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(any(c['source'] == 'huggingface' for c in result['candidates']))
         self.assertTrue(any('CivitAI' in e for e in result['errors']))
 
+    def test_a_malformed_token_never_reaches_the_errors_or_the_log(self):
+        token = 'tok_LEAKME0123456789\nX'
+        # tests/run.py disables logging for the whole run; this test reads it
+        self.addCleanup(logging.disable, logging.root.manager.disable)
+        logging.disable(logging.NOTSET)
+
+        def invalid_header(url, params=None, headers=None, timeout=None):
+            raise requests.exceptions.InvalidHeader(f"Invalid header value {headers.get('Authorization')!r}")
+
+        with mock.patch.object(settings, 'get_token', return_value=token), \
+             mock.patch.object(requests, 'get', invalid_header), \
+             mock.patch.object(online_search, '_index_candidates', return_value=[]), \
+             mock.patch.object(online_search, '_model_list_candidates', return_value=[]), \
+             self.assertLogs('core.online_search', level='DEBUG') as logs:
+            online_search.logger.debug('marker')  # assertLogs needs at least one record
+            result = online_search.search_candidates('qwen3vl_8b_int8.safetensors', 'checkpoints')
+        self.assertEqual(len(result['errors']), 2, result['errors'])  # HuggingFace and CivitAI both failed
+        for text in result['errors'] + logs.output:
+            self.assertNotIn('LEAKME', text)
+
     def test_tokens_go_only_to_their_own_host(self):
         with mock.patch.object(settings, 'get_token', side_effect=lambda p: f'{p}-token'):
             self.search({**HF_ROUTES, **CIVITAI_ROUTE})
@@ -177,7 +198,9 @@ class HuggingFaceQueryFailureTests(unittest.TestCase):
         has to see that as a real error - not as "HuggingFace found nothing".
         """
         with mock.patch.object(requests, 'get', side_effect=requests.ConnectionError('down')):
-            with self.assertRaises(requests.ConnectionError):
+            # online_search._get re-raises a request failure as a bare
+            # RuntimeError naming only its type (never its token-bearing text)
+            with self.assertRaises(RuntimeError):
                 online_search._huggingface_candidates('foo_fp8.safetensors')
 
     def test_a_total_outage_is_reported_by_search_candidates(self):

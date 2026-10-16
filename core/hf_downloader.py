@@ -165,6 +165,21 @@ def _pipe_reader(pipe, out_queue):
         out_queue.put(None)  # sentinel: pipe closed
 
 
+def _redact(text: str, token: str) -> str:
+    """
+    `text` with `token` removed - including a token with a CR/LF in it, which
+    an HTTP client reports via repr() (a backslash and an 'n'), so the raw
+    token never matches. Each printable run of the token is redacted too.
+    """
+    text = text.replace(token, '***')
+    for fragment in re.split(r'[^\x21-\x7e]+', token):
+        # Short runs are left: replacing a 1-3 character fragment everywhere
+        # would garble the message while hiding nothing worth hiding.
+        if len(fragment) >= 4:
+            text = text.replace(fragment, '***')
+    return text
+
+
 def download_hf_model(
     repo_id: str,
     filename: str,
@@ -455,8 +470,8 @@ def download_hf_model(
         # token in half, leaving the remaining fragment unredacted below.
         if isinstance(token, str) and token:
             if error_msg:
-                error_msg = error_msg.replace(token, '***')
-            stderr_tail = stderr_tail.replace(token, '***')
+                error_msg = _redact(error_msg, token)
+            stderr_tail = _redact(stderr_tail, token)
         final_error = error_msg or (stderr_tail[-500:] if stderr_tail else None) or "Download failed for an unknown reason"
         with download_lock:
             download_progress[download_id]['status'] = 'error'

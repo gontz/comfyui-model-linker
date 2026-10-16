@@ -176,7 +176,7 @@ def search_civitai_for_file(
         return None
         
     except Exception as e:
-        logger.error(f"CivitAI search error: {e}")
+        logger.error(f"CivitAI search error: {type(e).__name__}")
         return None
 
 
@@ -269,7 +269,7 @@ def search_civitai(
                     results.append(result)
                     
     except Exception as e:
-        logger.error(f"CivitAI search error: {e}")
+        logger.error(f"CivitAI search error: {type(e).__name__}")
     
     return results
 
@@ -315,6 +315,6 @@ def search_civitai_by_hash(
             }
             
     except Exception as e:
-        logger.error(f"CivitAI hash lookup error: {e}")
+        logger.error(f"CivitAI hash lookup error: {type(e).__name__}")
     
     return None

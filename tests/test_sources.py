@@ -3,15 +3,17 @@ Download sources. Network calls are replaced with fakes; the bundled
 HuggingFace index is read as shipped.
 """
 
+import logging
 import unittest
+from unittest import mock
 
 try:
-    import requests  # noqa: F401
+    import requests
 except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
 from core.matcher import is_variant_token
-from core.sources import civarchive, hf_index
+from core.sources import civarchive, civitai, hf_index, huggingface
 from core.sources.civitai import parse_civitai_url
 from core.sources.huggingface import build_search_queries, parse_huggingface_url
 
@@ -75,6 +77,56 @@ class IndexTests(unittest.TestCase):
 
     def test_folder_prefix_is_ignored(self):
         self.assertIsNotNone(hf_index.lookup_by_filename('FLUX\\flux1-dev-fp8.safetensors'))
+
+
+class MalformedTokenTests(unittest.TestCase):
+    """A token with a CR/LF makes requests raise InvalidHeader with the whole
+    Authorization value in its message - which must never reach the log."""
+
+    TOKEN = 'tok_LEAKME0123456789\r\nX'
+
+    def setUp(self):
+        huggingface._search_cache.clear()
+        civitai._search_cache.clear()
+        self.addCleanup(huggingface._search_cache.clear)
+        self.addCleanup(civitai._search_cache.clear)
+        # tests/run.py disables logging for the whole run; these tests read it
+        self.addCleanup(logging.disable, logging.root.manager.disable)
+        logging.disable(logging.NOTSET)
+
+    @staticmethod
+    def invalid_header(url, params=None, headers=None, **kwargs):
+        raise requests.exceptions.InvalidHeader(f"Invalid header value {(headers or {}).get('Authorization')!r}")
+
+    def test_no_source_logs_the_token(self):
+        calls = (
+            lambda: huggingface.search_huggingface_for_file('a.safetensors', token=self.TOKEN),
+            lambda: huggingface.search_huggingface('a', token=self.TOKEN),
+            lambda: civitai.search_civitai_for_file('a.safetensors', api_key=self.TOKEN),
+            lambda: civitai.search_civitai('a', api_key=self.TOKEN),
+            lambda: civitai.search_civitai_by_hash(SHA, api_key=self.TOKEN),
+        )
+        with mock.patch.object(requests, 'get', self.invalid_header):
+            for call in calls:
+                with self.assertLogs('core.sources', level='DEBUG') as logs:
+                    logging.getLogger('core.sources').debug('marker')
+                    call()
+                self.assertTrue(len(logs.output) > 1, 'the failure was not logged at all')
+                for line in logs.output:
+                    self.assertNotIn('LEAKME', line)
+
+    def test_a_failed_repo_listing_does_not_log_the_token(self):
+        def get(url, params=None, headers=None, **kwargs):
+            if '/tree/' in url:
+                self.invalid_header(url, headers=headers)
+            return FakeResponse(200, [{'id': 'org/repo'}])
+
+        with mock.patch.object(requests, 'get', get), \
+             self.assertLogs('core.sources', level='DEBUG') as logs:
+            huggingface.search_huggingface_for_file('a.safetensors', token=self.TOKEN)
+        self.assertTrue(any('org/repo' in line for line in logs.output))
+        for line in logs.output:
+            self.assertNotIn('LEAKME', line)
 
 
 class CivArchiveTests(unittest.TestCase):

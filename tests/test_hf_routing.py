@@ -220,6 +220,38 @@ class EngineGuaranteesTests(LibraryTestCase):
         self.assertIn('***', record['error'])
         self.assertNotIn('hf_SECRETTOKEN', record['error'])
 
+    def test_token_straddling_the_500_character_cut_is_still_redacted(self):
+        # No error event, so the record falls back to the last 500
+        # characters of stderr. Placed so the cut lands mid-token: slicing
+        # before redacting would leave the token's tail unredacted.
+        download_id, _ = self._seed('cut.safetensors')
+        token = 'hf_' + 'S' * 20 + 'TAILSECRET'
+        self.hf.get_token.return_value = token
+        stderr = 'x' * 1000 + 'Bearer ' + token + ' ' + 'y' * (500 - 15)
+        self.assertLess(len(stderr) - 500, stderr.index(token) + len(token))
+        self.assertGreater(len(stderr) - 500, stderr.index(token))
+        proc = _FakeProc([], [stderr])
+
+        self.assertFalse(self._run(download_id, proc, 'cut.safetensors'))
+
+        error = downloader.get_progress(download_id)['error']
+        self.assertNotIn('TAILSECRET', error)
+        self.assertNotIn('SSSSS', error)
+
+    def test_a_token_with_a_newline_is_redacted_in_its_escaped_form_too(self):
+        # HTTP clients report a bad header value with repr(), so a CR/LF in
+        # the token comes back as the two characters '\\n' - which a literal
+        # replace of the raw token never matches.
+        download_id, _ = self._seed('nl.safetensors')
+        token = 'hf_NEWLINESECRET01\nX'
+        self.hf.get_token.return_value = token
+        message = f"Illegal header value {('Bearer ' + token).encode()!r}"
+        proc = _FakeProc([_line('error', message=message)], [message + '\n'])
+
+        self.assertFalse(self._run(download_id, proc, 'nl.safetensors'))
+
+        self.assertNotIn('NEWLINESECRET', downloader.get_progress(download_id)['error'])
+
     # -- ruling 2: never clobber a destination that appeared meanwhile ------
 
     def test_done_with_existing_destination_does_not_overwrite(self):

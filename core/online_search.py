@@ -44,7 +44,13 @@ def _is_model_file(name: str) -> bool:
 
 def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     import requests
-    response = requests.get(url, params=params, headers=settings.auth_headers_for_url(url), timeout=TIMEOUT)
+    try:
+        response = requests.get(url, params=params, headers=settings.auth_headers_for_url(url), timeout=TIMEOUT)
+    except Exception as e:
+        # Never str(e): InvalidHeader (a token with a CR/LF in it) carries the
+        # whole Authorization value - and this text reaches the log and the
+        # /search response's `errors`. Same guard as hf_identify._get.
+        raise RuntimeError(type(e).__name__) from None
     if response.status_code != 200:
         raise RuntimeError(f'HTTP {response.status_code}')
     return response.json()

@@ -340,13 +340,24 @@ export class DownloadController {
     }
 
     async reconnect() {
+        // Identifies *this* render, not just "is the controller live": two
+        // afterRender() calls close enough together (a quick reopen, or two
+        // renders racing in a test) both set live = true, so that flag
+        // alone cannot tell a reconnect() left over from an earlier render
+        // apart from the current one. this.missing is replaced wholesale by
+        // every afterRender(), so comparing against the Map captured here -
+        // the same pattern searchSimilar() uses for its own stale-response
+        // guard - catches exactly that case: if some other afterRender() has
+        // run by the time this resolves, this reconnect's answer is for a
+        // render nobody is looking at any more.
+        const snapshot = this.missing;
         let all;
         try {
             all = await this.request("/model_linker/progress");
         } catch (error) {
             return;
         }
-        if (!this.live) return;
+        if (!this.live || this.missing !== snapshot) return;
         // Only a record whose file key matches something actually rendered
         // right now - an unrelated download (another tab, an earlier
         // workflow, someone else's model) must not be adopted just because

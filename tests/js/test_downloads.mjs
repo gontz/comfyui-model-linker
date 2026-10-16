@@ -575,12 +575,6 @@ export default async function run() {
     const cont = fakeContainer();
     const m = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
     c.afterRender(cont, { missing_models: [m] });
-    // Let this first afterRender's own reconnect() (using whatever mock the
-    // previous block left behind) fully settle before anything else - a
-    // stale, still-in-flight reconnect() can otherwise survive the
-    // stop()/reopen below (it only checks `this.live`, which flips back to
-    // true the instant the second afterRender runs) and race the real one.
-    await sleep(20);
     c.track('loras|missing.safetensors', 'gone', { status: 'downloading', progress: 40 });
     check('sanity check: the card really was showing progress before the reopen',
           /progress|Cancel/.test(c.blockHtml(m)), c.blockHtml(m));
@@ -608,7 +602,6 @@ export default async function run() {
     const cont = fakeContainer();
     const m = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
     c.afterRender(cont, { missing_models: [m] });
-    await sleep(20);  // let this afterRender's own reconnect() settle first - see test 17
     c.track('loras|missing.safetensors', 'went-bad', { status: 'downloading', progress: 40 });
     check('sanity check: the card really was showing progress before the reopen',
           /progress|Cancel/.test(c.blockHtml(m)), c.blockHtml(m));
@@ -625,6 +618,48 @@ export default async function run() {
           /connection closed/.test(html) && !/progress|Cancel/.test(html), html);
     check('the stale id stays tracked (refreshed, not pruned) since the server still reports it',
           c.byFile.get('loras|missing.safetensors') === 'went-bad');
+    c.stop();
+  }
+
+  // 19. (Fix round 3) Two overlapping reconnect() calls - one from an older
+  // render, one from a newer render close enough behind it that both still
+  // saw this.live === true when they started - must not let the older
+  // one's answer, resolving after the newer one's, change anything. `live`
+  // alone cannot tell them apart: the second afterRender() sets it back to
+  // true before the first reconnect()'s request has even resolved.
+  {
+    const resolvers = [];
+    api.fetchApi = async (path) => {
+      if (path !== '/model_linker/progress') return reply({});
+      return new Promise((resolve) => resolvers.push(resolve));
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const cardA = mk(1, 'a.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+
+    c.afterRender(cont, { missing_models: [cardA] });  // older reconnect() - call #1, pending
+    c.afterRender(cont, { missing_models: [cardA] });  // newer reconnect() - call #2, pending
+    check('sanity check: two reconnects are actually in flight at once',
+          resolvers.length === 2, `resolvers=${resolvers.length}`);
+
+    // A download starts after both reconnects were dispatched but before
+    // either resolves - e.g. the user clicked Download between the two
+    // renders completing.
+    c.track('loras|a.safetensors', 'X', { status: 'downloading', progress: 10 });
+
+    // The newer reconnect (#2) resolves first, confirming "X" is still there.
+    resolvers[1](reply({ X: { status: 'downloading', progress: 10, filename: 'a.safetensors', category: 'loras' } }));
+    await sleep(10);
+    check('X is tracked once the newer reconnect resolves',
+          c.byFile.get('loras|a.safetensors') === 'X');
+
+    // The older reconnect (#1) resolves last, with an answer fetched before
+    // "X" ever existed - it must change nothing now that a newer render has
+    // since run, not prune "X" out from under the newer, correct state.
+    resolvers[0](reply({}));
+    await sleep(10);
+    check('the stale, late-arriving older reconnect leaves the newer state alone',
+          c.byFile.get('loras|a.safetensors') === 'X', `byFile=${[...c.byFile.keys()]}`);
     c.stop();
   }
 

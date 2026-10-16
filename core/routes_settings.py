@@ -28,7 +28,10 @@ def register(routes, web) -> None:
         updates = {}
         for key, value in data.items():
             if key in _TOKEN_KEYS and isinstance(value, str):
-                updates[key] = value.strip()
+                stripped = value.strip()
+                if any(ord(c) < 32 or ord(c) == 127 for c in stripped):
+                    return web.json_response({'error': 'Token contains invalid characters'}, status=400)
+                updates[key] = stripped
             elif key in settings.OPTION_DEFAULTS and isinstance(value, bool):
                 updates[key] = value
             else:

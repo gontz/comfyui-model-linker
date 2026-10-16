@@ -95,6 +95,8 @@ def public_view() -> Dict[str, Any]:
     view = {}
     for provider, (key, env_var) in PROVIDERS.items():
         saved = settings.get(key)
+        if not isinstance(saved, str):
+            saved = None
         env = os.environ.get(env_var)
         token = saved or env
         view[provider] = {
@@ -156,7 +158,11 @@ def check_token(provider: str) -> Dict[str, Any]:
     try:
         response = requests.get(url, headers={'Authorization': f'Bearer {token}'}, timeout=10)
     except Exception as e:
-        return {'ok': False, 'error': f'Could not reach {provider}: {e}'}
+        # Never str(e): a malformed token (e.g. an embedded newline that
+        # slipped past .strip()) makes requests raise with the full header,
+        # token included, in the exception's message.
+        logger.warning(f"Model Linker: could not reach {provider}: {type(e).__name__}")
+        return {'ok': False, 'error': f'Could not reach {provider}'}
 
     if response.status_code in (401, 403):
         return {'ok': False, 'error': 'Token was rejected'}

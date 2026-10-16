@@ -41,6 +41,15 @@ class SummaryTests(unittest.TestCase):
                       'subgraph_name', 'is_top_level'):
             self.assertIn(field, entry)
 
+    def test_the_workflow_link_is_kept_for_export(self):
+        # Export reuses the author's link rather than searching for another
+        refs = [{'original_path': 'x.safetensors', 'exists': True, 'category': 'loras',
+                 'source_url': 'https://h/x', 'source_hash': 'ab' * 32, 'source_hash_type': 'sha256'}]
+        entry = summarize_present_models(refs)[0]
+        self.assertEqual(entry['source_url'], 'https://h/x')
+        self.assertEqual(entry['source_hash'], 'ab' * 32)
+        self.assertEqual(entry['source_hash_type'], 'sha256')
+
 
 class AnalyzeIncludesInventoryTests(LibraryTestCase):
     def workflow(self):

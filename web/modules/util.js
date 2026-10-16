@@ -39,7 +39,9 @@ export function isSelectableModel(model) {
  */
 export function refSlot(ref) {
     const list = (ref.list_index === undefined || ref.list_index === null) ? 'n' : ref.list_index;
-    return `${ref.node_id}-${ref.widget_index}-${list}-${ref.subgraph_id || 'top'}`;
+    // Used in id="…" attributes and #… selectors, from workflow-supplied ids
+    return `${ref.node_id}-${ref.widget_index}-${list}-${ref.subgraph_id || 'top'}`
+        .replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
 /** Stable key for a reference, used to deduplicate queued selections. */
@@ -97,4 +99,50 @@ export function notifyError(summary, error) {
         // fall through to the console
     }
     console.error(`Model Linker: ${summary}`, error);
+}
+
+/**
+ * A match that can be linked without a second look: exact by name and from a
+ * folder the node actually loads from. A 100% match in another category would
+ * leave the workflow failing at prompt time, so it is never auto-linked.
+ */
+export function isPerfectMatch(match) {
+    return match?.confidence === 100 && !match?.category_mismatch;
+}
+
+/**
+ * The identity `groupPresentModels` groups a reference by: canonical
+ * category (several raw category names can be one folder) plus the file's
+ * path with separators normalised ("sub\a" and "sub/a" are the same file).
+ *
+ * Exposed so a swap can stamp every resolution it queues with this same
+ * key (see `queueSwap` in linker-dialog.js) - matching on the raw
+ * `category`/`original_path` instead would disagree with this grouping
+ * for exactly the two cases it normalises, and strand part of the group.
+ */
+export function presentModelGroupKey(ref) {
+    const category = ref.canonical_category || ref.category || "unknown";
+    return `${category}|${(ref.original_path || "").replace(/[\\/]+/g, "/")}`;
+}
+
+/**
+ * Present-model references grouped by file: one row per (folder, path), with
+ * every reference that loads it. A swap then updates all of them at once.
+ */
+export function groupPresentModels(present) {
+    const groups = new Map();
+    for (const ref of present || []) {
+        const key = presentModelGroupKey(ref);
+        if (!groups.has(key)) {
+            groups.set(key, {
+                key,
+                name: (ref.original_path || "").split(/[\\/]/).pop(),
+                category: ref.canonical_category || ref.category || "unknown",
+                refs: [],
+            });
+        }
+        groups.get(key).refs.push(ref);
+    }
+    return [...groups.values()].sort((a, b) =>
+        a.category.localeCompare(b.category) || a.name.localeCompare(b.name));
 }

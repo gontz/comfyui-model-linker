@@ -145,5 +145,70 @@ class FindMatchesTests(unittest.TestCase):
         self.assertEqual(matches[0]['confidence'], 100.0)
 
 
+class WordOrderTests(unittest.TestCase):
+    """Token order carries no meaning in a model filename."""
+
+    def test_reordered_tokens_score_as_a_strong_match(self):
+        # The case that made upstream and Model-Resolver both add this
+        self.assertGreaterEqual(
+            calculate_filename_confidence('yue2_convrot_int8.safetensors',
+                                          'yue2_3b_int8_convrot.safetensors'),
+            90.0)
+
+    def test_pure_reorder_never_reaches_100(self):
+        score = calculate_filename_confidence('flux1_dev_fp8.safetensors', 'dev_flux1_fp8.safetensors')
+        self.assertGreaterEqual(score, 94.0)
+        self.assertLess(score, 100.0)
+
+    def test_reorder_cannot_lift_a_capacity_conflict(self):
+        # The acceptance case for every matcher change: 4B is not 8B
+        self.assertLess(
+            calculate_filename_confidence('qwen3vl_8b_int8.safetensors', 'int8_qwen3vl_4b.safetensors'),
+            STRONG_MATCH_CONFIDENCE)
+
+    def test_same_model_still_outranks_reordered_other_size(self):
+        pool = candidates('int8_qwen3vl_4b.safetensors', 'qwen3vl_8b_bf16.safetensors')
+        best = find_matches('qwen3vl_8b_int8.safetensors', pool)[0]
+        self.assertEqual(best['filename'], 'qwen3vl_8b_bf16.safetensors')
+
+    def test_capacity_token_first_still_blocked(self):
+        # Capacity leading the filename must not escape the conflict cap.
+        # "4b qwen3vl" has no usable architecture from the prefix, so this
+        # used to return None, skipping the 4B vs 8B check.
+        self.assertLess(
+            calculate_filename_confidence('qwen3vl_8b_int8.safetensors', '4b_qwen3vl_int8.safetensors'),
+            STRONG_MATCH_CONFIDENCE)
+
+    def test_capacity_token_first_with_reorder_still_blocked(self):
+        # Same as above, but with reordering applied (most hostile case).
+        self.assertLess(
+            calculate_filename_confidence('qwen3vl_8b_int8.safetensors', 'int8_4b_qwen3vl.safetensors'),
+            STRONG_MATCH_CONFIDENCE)
+
+
+class CategoryMismatchTests(unittest.TestCase):
+    def test_match_from_another_folder_is_flagged(self):
+        pool = candidates('flux1_dev.safetensors', category='vae')
+        match = find_matches('flux1_dev.safetensors', pool, preferred_category='checkpoints')[0]
+        self.assertTrue(match['category_mismatch'])
+
+    def test_aliased_folder_is_not_flagged(self):
+        # models/clip and models/text_encoders are one folder on most installs
+        pool = candidates('t5xxl_fp16.safetensors', category='clip')
+        match = find_matches('t5xxl_fp16.safetensors', pool, preferred_category='text_encoders')[0]
+        self.assertFalse(match['category_mismatch'])
+
+    def test_unknown_expected_category_flags_nothing(self):
+        pool = candidates('a.safetensors', category='vae')
+        for expected in (None, 'unknown', ''):
+            match = find_matches('a.safetensors', pool, preferred_category=expected)[0]
+            self.assertFalse(match['category_mismatch'], expected)
+
+    def test_candidate_without_category_is_not_flagged(self):
+        pool = [{'filename': 'a.safetensors', 'path': '/m/a.safetensors'}]
+        match = find_matches('a.safetensors', pool, preferred_category='checkpoints')[0]
+        self.assertFalse(match['category_mismatch'])
+
+
 if __name__ == '__main__':
     unittest.main()

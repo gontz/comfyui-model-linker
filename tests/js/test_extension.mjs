@@ -1,5 +1,6 @@
 // How the extension registers itself with the ComfyUI frontend.
-import { createChecker, loadExtension, readAllSources } from './harness.mjs';
+import { createChecker, loadExtension, loadModule, readAllSources, readSource } from './harness.mjs';
+import { app } from './stubs/scripts/app.js';
 
 export const name = 'extension registration';
 
@@ -52,6 +53,73 @@ export default async function run() {
   // markup for somewhere to inject a persistent control.
   check('ComfyUI markup is not scraped for an injection point',
         !/\[class\*=.menu.\]|app\.menu\?\.settingsGroup/.test(source));
+
+  check('a loaded workflow is checked through the extension hook',
+        typeof config.afterConfigureGraph === 'function');
+  const openSetting = config.settings?.find?.(s => s.id === 'ModelLinker.OpenOnMissing');
+  check('opening on load is an opt-in setting', openSetting?.type === 'boolean' && openSetting?.defaultValue === false);
+  check('ComfyUI\'s Missing Models popup is not observed',
+        !/MutationObserver/.test(readAllSources()));
+  check('the same workflow is announced once per session', /notified\.has\(/.test(source));
+  check('a workflow loaded before setup is still checked',
+        /if \(!this\.dialog\) this\.dialog = new LinkerManagerDialog\(\);\s*if \(this\.dialog\.isOpen\(\)\) return;/.test(source));
+  // Deviation from the brief's literal snippet: the brief's dedupe alone
+  // does not stop a slow analysis from toasting about a workflow another
+  // tab has since replaced, so a generation counter guards it the same way
+  // loadWorkflowData drops a superseded analysis via analyzeAbort.
+  check('a superseded background analysis is dropped',
+        /generation !== this\.loadGeneration/.test(source));
+
+  // --- per-workflow dedupe round 1 fix: app.graph.serialize() has no id for
+  // the open tab (LiteGraph's serialized graph carries none), so the dedupe
+  // signature used to be keyed on an always-empty string, colliding every
+  // workflow with the same missing set into one notification. The fix reads
+  // the frontend's own workflow store, which keys every open tab by its own
+  // (disambiguated) path. ---
+  const linkerSource = readSource('linker.js');
+  check('the dead workflow.id fallback is gone', !/workflow\.id/.test(linkerSource));
+  check('the dedupe key comes from the workflow store, not the serialized graph',
+        /app\.extensionManager\?\.workflow\?\.activeWorkflow\?\.path/.test(linkerSource));
+  check('a background-check failure is logged quietly on both paths',
+        (linkerSource.match(/console\.debug\(.Model Linker: background check failed./g) || []).length === 2);
+
+  // Behavioural: stub the workflow store on the real app stub (the same
+  // object linker.js's "../../scripts/app.js" import resolves to) and drive
+  // the real reader (workflowKey()) and the real dedupe (announce()).
+  // ModelLinker is exported for exactly this - its own dialog can't be
+  // constructed here, since LinkerManagerDialog's constructor needs a DOM
+  // this harness has none of.
+  const linkerModule = await loadModule('linker.js');
+  check('ModelLinker is exported', typeof linkerModule.ModelLinker === 'function');
+  if (typeof linkerModule.ModelLinker === 'function') {
+    const { ModelLinker } = linkerModule;
+    const hadWorkflowStore = Object.prototype.hasOwnProperty.call(app.extensionManager, 'workflow');
+    const originalWorkflowStore = app.extensionManager.workflow;
+    const originalToasts = globalThis.__toasts;
+    try {
+      const data = { total_missing: 1, missing_models: [{ original_path: 'model.safetensors' }] };
+
+      globalThis.__toasts = [];
+      const linkerA = new ModelLinker();
+      app.extensionManager.workflow = { activeWorkflow: { path: 'workflows/a.json' } };
+      linkerA.announce(linkerA.workflowKey(), data);
+      app.extensionManager.workflow = { activeWorkflow: { path: 'workflows/b.json' } };
+      linkerA.announce(linkerA.workflowKey(), data);
+      check('two different workflow identities with the same missing set both notify',
+            globalThis.__toasts.length === 2);
+
+      globalThis.__toasts = [];
+      const linkerB = new ModelLinker();
+      app.extensionManager.workflow = { activeWorkflow: { path: 'workflows/c.json' } };
+      linkerB.announce(linkerB.workflowKey(), data);
+      linkerB.announce(linkerB.workflowKey(), data);
+      check('the same identity twice notifies once', globalThis.__toasts.length === 1);
+    } finally {
+      if (hadWorkflowStore) app.extensionManager.workflow = originalWorkflowStore;
+      else delete app.extensionManager.workflow;
+      globalThis.__toasts = originalToasts;
+    }
+  }
 
   return check.failures;
 }

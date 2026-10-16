@@ -277,6 +277,9 @@ _PRESENT_MODEL_FIELDS = (
     'node_id', 'node_type', 'widget_index', 'original_path', 'category',
     'nested_key', 'list_index', 'adapter_id',
     'subgraph_id', 'subgraph_name', 'is_top_level',
+    # The workflow's own properties.models link and hash: Export keeps the
+    # author's URL instead of searching for, and writing over it with, another
+    'source_url', 'source_hash', 'source_hash_type',
 )
 
 

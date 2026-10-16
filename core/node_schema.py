@@ -14,6 +14,12 @@ in the hand-written table.
 
 Both node APIs are covered by one path: V3 nodes expose `INPUT_TYPES()` through
 a compatibility shim over `define_schema()`.
+
+The patch is process-wide but the question it changes the answer to is only
+meant for the one thread doing the introspecting - routes now run analyses in
+worker threads, and ComfyUI's own prompt executor is a thread too, so the
+stand-in answers every other thread truthfully and reserves the sentinel for
+the introspecting thread alone.
 """
 
 import logging
@@ -35,6 +41,12 @@ _INTROSPECTION_LOCK = threading.RLock()
 # node type -> {'categories': {input_name: category}, 'widget_names': [...]}
 _SCHEMA_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
 
+# Set only while an introspection is in flight: which thread it is, and the
+# real function it swapped out - so every other thread asking in the meantime
+# gets the truth instead of the sentinel meant for the introspecting thread.
+_tracing_thread: Optional[int] = None
+_real_get_filename_list: Optional[Any] = None
+
 
 def _get_node_class(node_type: str) -> Any:
     """Look up an installed node class by its workflow type name."""
@@ -49,8 +61,25 @@ def _get_node_class(node_type: str) -> Any:
 
 
 def _traced_get_filename_list(category: Any, *args: Any, **kwargs: Any) -> List[str]:
-    """Stand-in that reports which folder was asked for instead of its contents."""
-    return [f"{_SENTINEL}{category}"]
+    """
+    Stand-in that reports which folder was asked for instead of its contents.
+
+    Reserved for the thread currently introspecting, identified by
+    `_tracing_thread`. Any other caller - a concurrent analysis in another
+    worker thread, or ComfyUI's own prompt executor - gets the real file list,
+    since the patch is process-wide but the question is only meant for one
+    thread's INPUT_TYPES() call.
+    """
+    if threading.get_ident() == _tracing_thread:
+        return [f"{_SENTINEL}{category}"]
+
+    real = _real_get_filename_list
+    if real is None:
+        # No introspection is actually in flight (or we raced the cleanup);
+        # folder_paths.get_filename_list itself is then the real function.
+        import folder_paths
+        real = folder_paths.get_filename_list
+    return real(category, *args, **kwargs)
 
 
 def _patch_function_globals(func: Any, original: Any, patched: List[Any]) -> None:
@@ -126,9 +155,13 @@ def _introspect(node_type: str) -> Optional[Dict[str, Any]]:
     if not callable(original):
         return None
 
+    global _tracing_thread, _real_get_filename_list
+
     patched: List[Any] = []
     with _INTROSPECTION_LOCK:
         try:
+            _tracing_thread = threading.get_ident()
+            _real_get_filename_list = original
             folder_paths.get_filename_list = _traced_get_filename_list
             # Reach bindings the node captured at import time
             _patch_function_globals(getattr(input_types, "__func__", input_types), original, patched)
@@ -144,6 +177,8 @@ def _introspect(node_type: str) -> Optional[Dict[str, Any]]:
             folder_paths.get_filename_list = original
             for namespace, name, value in patched:
                 namespace[name] = value
+            _tracing_thread = None
+            _real_get_filename_list = None
 
     if not isinstance(declared, dict):
         return None
@@ -182,7 +217,11 @@ def get_node_schema(node_type: str) -> Optional[Dict[str, Any]]:
     if node_type in _SCHEMA_CACHE:
         return _SCHEMA_CACHE[node_type]
     schema = _introspect(node_type)
-    _SCHEMA_CACHE[node_type] = schema
+    # A type that is not registered yet may be by the next analysis - custom
+    # nodes keep registering after startup. Only a real answer, or a failure
+    # for a class that exists, is worth remembering.
+    if schema is not None or _get_node_class(node_type) is not None:
+        _SCHEMA_CACHE[node_type] = schema
     return schema
 
 

@@ -4,9 +4,14 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 import { $el } from "./dom.js";
+import { DownloadController } from "./downloads.js";
+import { ExportDialog } from "./export-dialog.js";
 import { ManageOverridesDialog } from "./overrides-dialog.js";
+import { SettingsDialog } from "./settings-dialog.js";
 import {
     escapeHtml,
+    groupPresentModels,
+    isPerfectMatch,
     isSelectableModel,
     refKey,
     refSlot,
@@ -41,6 +46,7 @@ export class LinkerManagerDialog {
         this.fullscreen = false;
         this._dragging = false;
         this._dragStart = null;
+        this.downloads = new DownloadController(this);
 
         // Create dialog element using $el
         this.element = $el("div.comfy-modal", {
@@ -277,10 +283,48 @@ export class LinkerManagerDialog {
             ]),
             $el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
                 $el("button", {
+                    id: "model-linker-settings-btn",
+                    title: "Tokens and background lookups",
+                    textContent: "⚙ Settings",
+                    onclick: () => this.openSettings(),
+                    style: {
+                        background: "none",
+                        border: "1px solid var(--border-color)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "2px 8px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                }),
+                $el("button", {
                     id: "model-linker-overrides-btn",
                     title: "Manage overrides",
                     textContent: "Overrides",
                     onclick: () => this.openOverridesManager(),
+                    style: {
+                        background: "none",
+                        border: "1px solid var(--border-color)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "2px 8px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                }),
+                $el("button", {
+                    id: "model-linker-export-btn",
+                    title: "Add download links for sharing this workflow",
+                    textContent: "Export…",
+                    onclick: () => this.openExport(),
                     style: {
                         background: "none",
                         border: "1px solid var(--border-color)",
@@ -470,6 +514,26 @@ export class LinkerManagerDialog {
         }
     }
 
+    openSettings() {
+        if (!this.settingsDialog) this.settingsDialog = new SettingsDialog();
+        this.settingsDialog.show();
+    }
+
+    async openExport() {
+        // Always analyse the workflow on screen: apply() writes by node id, so an
+        // earlier analysis - perhaps of another tab - must never be used
+        const data = await this.loadWorkflowData();
+        if (!data) return;   // superseded, no workflow, or failed; the dialog says which
+        // Every Export path (its links, the credential scrub) goes through
+        // routes the server registers only when `requests` is installed
+        if (data.lookups_available === false) {
+            this.showNotification('Export needs the Python package "requests", which is not installed', 'error');
+            return;
+        }
+        if (!this.exportDialog) this.exportDialog = new ExportDialog(this);
+        this.exportDialog.show(data);
+    }
+
     createQueuePanel() {
         // Header row with title and clear button
         this.queueHeader = $el("div", {
@@ -565,12 +629,30 @@ export class LinkerManagerDialog {
         const list = Array.isArray(this.pendingResolutions) ? this.pendingResolutions : [];
         if (i < 0 || i >= list.length) return;
         const r = list[i];
-        // Remove
-        this.pendingResolutions.splice(i, 1);
+        // A swap stamps every resolution it queues with `swap_group`, the
+        // exact key groupPresentModels grouped those references under
+        // (canonical category + separator-normalised path). Removing only
+        // the clicked row would strand the rest of the group half-queued,
+        // with no bar showing them and no way back to "not queued" - so
+        // removing any swap entry removes every entry sharing that key.
+        // Matching on the raw category/original_path instead would miss a
+        // group spread across category aliases (clip vs text_encoders) or
+        // across separator spellings of the same path (sub\a vs sub/a).
+        const removed = r.swap_group
+            ? list.filter((res) => res.swap_group === r.swap_group)
+            : [r];
+        this.pendingResolutions = list.filter((res) => !removed.includes(res));
         this.rebuildPendingIndex();
-        // Update per-item selected bar
-        const m = { node_id: r.node_id, widget_index: r.widget_index, subgraph_id: r.subgraph_id, is_top_level: r.is_top_level };
-        this.updateSelectedBarForMissing(m);
+        // Refresh the bar for every reference that just lost its resolution
+        removed.forEach((res) => {
+            this.updateSelectedBarForMissing({
+                node_id: res.node_id,
+                widget_index: res.widget_index,
+                list_index: res.list_index,
+                subgraph_id: res.subgraph_id,
+                is_top_level: res.is_top_level,
+            });
+        });
         this.updateApplyPendingButton();
         this.updateQueuePanel();
     }
@@ -652,7 +734,15 @@ export class LinkerManagerDialog {
             }
         });
 
+        const downloadAllBtn = this.downloadAllBtn = $el("button", {
+            textContent: "☁ Download all found",
+            title: "Download every missing model a source was found for (two at a time)",
+            onclick: () => this.downloads.downloadAll(),
+            className: "model-linker-resolve-btn",
+        });
+
         footer.appendChild(this.applyPendingBtn);
+        footer.appendChild(downloadAllBtn);
         footer.appendChild(autoBtn);
         return footer;
     }
@@ -672,6 +762,10 @@ export class LinkerManagerDialog {
         } catch (e) { }
     }
 
+    isOpen() {
+        return this.element?.style.display !== "none";
+    }
+
     close() {
         this._hidePreview();
         // Nothing is waiting for the answer any more
@@ -679,6 +773,8 @@ export class LinkerManagerDialog {
             this.analyzeAbort.abort();
             this.analyzeAbort = null;
         }
+        // Downloads and lookups continue on the server; only our polling stops
+        this.downloads.stop();
         this.element.style.display = "none";
     }
 
@@ -1009,7 +1105,14 @@ export class LinkerManagerDialog {
      * Load workflow data and display missing models
      */
     async loadWorkflowData(workflow = null) {
-        if (!this.contentElement) return;
+        if (!this.contentElement) return null;
+
+        // Drop download/lookup state derived from the last render, before
+        // deciding anything about this one: the zero-missing, no-workflow
+        // and error branches below never call displayMissingModels (so
+        // never afterRender()), and would otherwise leave a stale card from
+        // the previous workflow sitting in the download controller forever.
+        this.downloads.reset();
 
         // Reopening the dialog or hitting Refresh while an analysis is in
         // flight starts a second one. Without this, both complete and whichever
@@ -1029,7 +1132,7 @@ export class LinkerManagerDialog {
 
             if (!workflow) {
                 this.contentElement.innerHTML = '<p>No workflow loaded. Please load a workflow first.</p>';
-                return;
+                return null;
             }
 
             // Call analyze endpoint
@@ -1048,13 +1151,17 @@ export class LinkerManagerDialog {
 
             // A newer analysis started while this one was in flight, or the
             // dialog was closed; either way this answer is stale.
-            if (this.analyzeAbort !== abort || !this.contentElement) return;
+            if (this.analyzeAbort !== abort || !this.contentElement) return null;
 
+            // Without online lookups (no `requests` on the server) nothing
+            // is ever found to download
+            if (this.downloadAllBtn) this.downloadAllBtn.style.display = data.lookups_available === false ? 'none' : '';
             this.displayMissingModels(this.contentElement, data);
+            return data;
 
         } catch (error) {
             // Superseding a request is normal, not a failure to report
-            if (error.name === 'AbortError' || this.analyzeAbort !== abort) return;
+            if (error.name === 'AbortError' || this.analyzeAbort !== abort) return null;
             console.error('Model Linker: Error loading workflow data:', error);
             if (this.contentElement) {
                 this.contentElement.innerHTML =
@@ -1063,6 +1170,7 @@ export class LinkerManagerDialog {
         } finally {
             if (this.analyzeAbort === abort) this.analyzeAbort = null;
         }
+        return null;
     }
 
     /**
@@ -1093,47 +1201,87 @@ export class LinkerManagerDialog {
      * not the task. A <details> element so the browser handles the toggling.
      */
     renderPresentModels(present) {
-        if (!present || !present.length) return '';
-
-        const rows = [...present].sort((a, b) => {
-            const byCategory = (a.category || '').localeCompare(b.category || '');
-            return byCategory || (a.original_path || '').localeCompare(b.original_path || '');
-        });
+        const groups = groupPresentModels(present);
+        this._presentGroups = groups;
+        if (!groups.length) return '';
 
         let html = `<details id="model-linker-present" style="margin-top:16px;">`
-            + `<summary style="cursor:pointer; opacity:.85;">Models found on disk (${rows.length})</summary>`
+            + `<summary style="cursor:pointer; opacity:.85;">Models found on disk (${groups.length}) — swap any of them</summary>`
             + `<div style="display:flex; flex-direction:column; gap:4px; margin-top:8px;">`;
 
-        rows.forEach((model, index) => {
-            const name = escapeHtml((model.original_path || '').split(/[\\/]/).pop() || '');
-            const path = escapeHtml(model.original_path || '');
-            const category = escapeHtml(model.category || 'unknown');
-            const node = escapeHtml(`${model.node_type || 'Node'} #${model.node_id}`);
-            const where = model.subgraph_name ? ` · ${escapeHtml(model.subgraph_name)}` : '';
-            html += `<div style="display:flex; align-items:center; gap:8px; padding:4px 6px; border-bottom:1px solid var(--border-color);">`
-                + `<code style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${path}">${name}</code>`
-                + `<span style="flex:0 0 auto; opacity:.75; font-size:12px;">[${category}]</span>`
-                + `<span style="flex:0 0 auto; opacity:.6; font-size:12px;">${node}${where}</span>`
+        groups.forEach((group, index) => {
+            const first = group.refs[0];
+            const users = group.refs.length === 1
+                ? escapeHtml(`${first.node_type || 'Node'} #${first.node_id}${first.subgraph_name ? ` · ${first.subgraph_name}` : ''}`)
+                : `${group.refs.length} nodes`;
+            html += `<div style="border-bottom:1px solid var(--border-color); padding:4px 6px;">`
+                + `<div style="display:flex; align-items:center; gap:8px;">`
+                + `<code style="flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(first.original_path)}">${escapeHtml(group.name)}</code>`
+                + `<span style="flex:0 0 auto; opacity:.75; font-size:12px;">[${escapeHtml(group.category)}]</span>`
+                + `<span style="flex:0 0 auto; opacity:.6; font-size:12px;">${users}</span>`
+                + `<button id="present-swap-${index}" class="model-linker-resolve-btn" style="flex:0 0 auto; padding:2px 8px;" title="Replace this model in every node that uses it">⇄ Swap</button>`
                 + `<button id="present-reveal-${index}" class="model-linker-resolve-btn" style="flex:0 0 auto; padding:2px 8px;" title="Show in the file manager">📂</button>`
-                + `</div>`;
+                + `</div>`
+                + `<div id="present-swap-panel-${index}" style="display:none; padding:6px 0;">`
+                + `<div id="selected-${refSlot(first)}" class="model-linker-selected" style="display:none; margin: 4px 0; padding: 6px; border: 1px solid var(--border-color, #444); border-radius: 4px;"></div>`
+                + `</div></div>`;
         });
 
-        html += '</div></details>';
-        this._presentRows = rows;
-        return html;
+        return html + '</div></details>';
     }
 
-    /** Wire the folder buttons in the found-on-disk list. */
+    /** Wire the folder/swap buttons in the found-on-disk list. */
     attachPresentModelHandlers(container) {
-        (this._presentRows || []).forEach((model, index) => {
-            const button = container.querySelector(`#present-reveal-${index}`);
-            if (button) {
-                button.onclick = () => this.revealModel({
-                    category: model.category,
-                    relative_path: model.original_path,
+        (this._presentGroups || []).forEach((group, index) => {
+            const first = group.refs[0];
+            const reveal = container.querySelector(`#present-reveal-${index}`);
+            if (reveal) {
+                reveal.onclick = () => this.revealModel({ category: first.category, relative_path: first.original_path });
+            }
+            const swap = container.querySelector(`#present-swap-${index}`);
+            const panel = container.querySelector(`#present-swap-panel-${index}`);
+            if (!swap || !panel) return;
+            // The bar shows the first reference only; its Remove must drop the
+            // swap from every node, not just that one
+            const bindGroupRemove = () => {
+                const remove = panel.querySelector(`#selected-remove-${refSlot(first)}`);
+                if (remove) remove.onclick = () => this.removeSwapGroup(group);
+            };
+            swap.onclick = async () => {
+                const opening = panel.style.display === 'none';
+                panel.style.display = opening ? '' : 'none';
+                if (!opening || panel.dataset.ready) return;
+                panel.dataset.ready = '1';
+                await this.ensureAllModelsLoaded();
+                // A present model has no fuzzy matches; the picker lists the folder
+                this.attachModelCombo(panel, { ...first, matches: [] }, (model) => {
+                    this.queueSwap(group, model);
+                    bindGroupRemove();
                 });
+            };
+            // A re-render (new analysis, tab switch) rebuilds this row from
+            // scratch, so a swap queued before it has no bar and no Remove
+            // wiring yet - restore both rather than leaving it invisible.
+            if (group.refs.some((ref) => this.pendingIndex && this.pendingIndex.has(refKey(ref)))) {
+                this.updateSelectedBarForMissing(first);
+                bindGroupRemove();
+                panel.style.display = '';
             }
         });
+    }
+
+    /** Queue a swap: the same replacement for every node that loads this model. */
+    queueSwap(group, model) {
+        // Stamped with the group's own key (the same one groupPresentModels
+        // computed it under) so removeQueuedByIndex can match on it exactly,
+        // instead of re-deriving category/path and drifting from the grouping.
+        group.refs.forEach((ref) =>
+            this.queueResolution({ ...ref, record_override: false, swap_group: group.key }, model));
+    }
+
+    /** Drop every queued entry a swap created, not just the one the UI shows. */
+    removeSwapGroup(group) {
+        group.refs.forEach((ref) => this.removeQueuedResolution(ref));
     }
 
     displayMissingModels(container, data) {
@@ -1162,8 +1310,8 @@ export class LinkerManagerDialog {
             const bFiltered = bMatches.filter(m => m.confidence >= 70);
 
             // Check if they have 100% matches
-            const aHas100 = aFiltered.some(m => m.confidence === 100);
-            const bHas100 = bFiltered.some(m => m.confidence === 100);
+            const aHas100 = aFiltered.some(isPerfectMatch);
+            const bHas100 = bFiltered.some(isPerfectMatch);
 
             // If one has 100% and the other doesn't, prioritize the one with 100%
             if (aHas100 && !bHas100) return -1;
@@ -1194,8 +1342,8 @@ export class LinkerManagerDialog {
             const filteredMatches = allMatches.filter(m => m.confidence >= 70);
 
             // Filter to only 100% matches if available, otherwise use filtered matches (>=70%)
-            const perfectMatches = filteredMatches.filter(m => m.confidence === 100);
-            const otherMatches = filteredMatches.filter(m => m.confidence < 100 && m.confidence >= 70);
+            const perfectMatches = filteredMatches.filter(isPerfectMatch);
+            const otherMatches = filteredMatches.filter(m => !isPerfectMatch(m));
 
             // Match the same logic as renderMissingModel
             const savedMatches = filteredMatches.filter(m => m.is_override);
@@ -1219,8 +1367,8 @@ export class LinkerManagerDialog {
 
             // Sort: 100% matches first, then by confidence descending (same as renderMissingModel)
             const sortedMatches = matchesToShow.sort((a, b) => {
-                if (a.confidence === 100 && b.confidence !== 100) return -1;
-                if (a.confidence !== 100 && b.confidence === 100) return 1;
+                if (isPerfectMatch(a) && !isPerfectMatch(b)) return -1;
+                if (!isPerfectMatch(a) && isPerfectMatch(b)) return 1;
                 return b.confidence - a.confidence;
             });
 
@@ -1250,21 +1398,30 @@ export class LinkerManagerDialog {
             // Refresh selected UI for this item based on queued selections
             this.updateSelectedBarForMissing(missing);
 
-            // Wire Locate button (only available for top-level items)
+            // Wire Locate button
             const locateId = `locate-${refSlot(missing)}`;
             const locateBtn = container.querySelector(`#${locateId}`);
-            if (locateBtn && missing.is_top_level !== false) {
-                locateBtn.addEventListener('click', () => this.locateNodeInGraph(missing.node_id));
+            if (locateBtn) {
+                locateBtn.addEventListener('click', () => this.locateRef(missing));
             }
 
             // Model combo is already attached above
         });
+
+        this.downloads.afterRender(container, data);
     }
 
     /**
      * Render a single missing model entry
      */
     renderMissingModel(missing) {
+        // Everything below except our own markup comes from the workflow file
+        const subgraphName = escapeHtml(missing.subgraph_name);
+        const nodeType = escapeHtml(missing.node_type);
+        const originalPath = escapeHtml(missing.original_path);
+        const categoryText = escapeHtml(missing.category || 'unknown');
+        const nodeId = escapeHtml(missing.node_id);
+
         const allMatches = missing.matches || [];
 
         // Filter out matches below 70% confidence threshold
@@ -1281,36 +1438,24 @@ export class LinkerManagerDialog {
         if (missing.subgraph_name) {
             // Show subgraph name as primary identifier
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
-            html += `<span><strong>Subgraph:</strong> ${missing.subgraph_name} (ID: ${missing.node_id})</span>`;
-            if (missing.is_top_level === false) {
-                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
-            } else {
-                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
-            }
+            html += `<span><strong>Subgraph:</strong> ${subgraphName} (ID: ${nodeId})</span>`;
+            html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
             html += `</div>`;
         } else if (isSubgraphNode) {
             // Node type is a UUID (subgraph) but we don't have the name (shouldn't happen, but handle gracefully)
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
-            html += `<span><strong>Node:</strong> <em>Subgraph</em> (ID: ${missing.node_id})</span>`;
-            if (missing.is_top_level === false) {
-                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
-            } else {
-                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
-            }
+            html += `<span><strong>Node:</strong> <em>Subgraph</em> (ID: ${nodeId})</span>`;
+            html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
             html += `</div>`;
         } else {
             // Regular node
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
-            html += `<span><strong>Node:</strong> ${missing.node_type} (ID: ${missing.node_id})</span>`;
-            if (missing.is_top_level === false) {
-                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
-            } else {
-                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
-            }
+            html += `<span><strong>Node:</strong> ${nodeType} (ID: ${nodeId})</span>`;
+            html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
             html += `</div>`;
         }
-        html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${missing.original_path}</code></div>`;
-        html += `<div style="margin-bottom: 8px;"><strong>Category:</strong> ${missing.category || 'unknown'}</div>`;
+        html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${originalPath}</code></div>`;
+        html += `<div style="margin-bottom: 8px;"><strong>Category:</strong> ${categoryText}</div>`;
 
         // Where the workflow says this model came from. Worth showing whatever
         // the matches look like: when nothing on disk resembles the model, the
@@ -1325,6 +1470,10 @@ export class LinkerManagerDialog {
                 + `style="color: var(--primary-color, #4aa3ff);">Download ↗</a>`
                 + `<span style="opacity:.7; font-size: 12px;"> — save to <code>${escapeHtml(target)}</code></span></div>`;
         }
+
+        // Background lookups and downloads (web/modules/downloads.js)
+        html += this.downloads.renderBlock(missing);
+
         // Selected state placeholder (filled dynamically when user queues a selection)
         const selectedId = `selected-${refSlot(missing)}`;
         html += `<div id="${selectedId}" class="model-linker-selected" style="display:none; margin: 8px 0; padding: 8px; border: 1px solid var(--border-color, #444); border-radius: 4px; background: rgba(10,169,110,0.08);"></div>`;
@@ -1334,8 +1483,8 @@ export class LinkerManagerDialog {
             const filteredMatches = allMatches.filter(m => m.confidence >= 70);
 
             // Separate 100% matches from others (from filtered list)
-            const perfectMatches = filteredMatches.filter(m => m.confidence === 100);
-            const otherMatches = filteredMatches.filter(m => m.confidence < 100 && m.confidence >= 70);
+            const perfectMatches = filteredMatches.filter(isPerfectMatch);
+            const otherMatches = filteredMatches.filter(m => !isPerfectMatch(m));
 
             // If we have 100% matches, show them AND always include saved matches as well.
             const savedMatches = filteredMatches.filter(m => m.is_override);
@@ -1360,8 +1509,8 @@ export class LinkerManagerDialog {
 
             // Sort: 100% matches first, then by confidence descending
             const sortedMatches = matchesToShow.sort((a, b) => {
-                if (a.confidence === 100 && b.confidence !== 100) return -1;
-                if (a.confidence !== 100 && b.confidence === 100) return 1;
+                if (isPerfectMatch(a) && !isPerfectMatch(b)) return -1;
+                if (!isPerfectMatch(a) && isPerfectMatch(b)) return 1;
                 return b.confidence - a.confidence;
             });
 
@@ -1375,8 +1524,14 @@ export class LinkerManagerDialog {
                 const label = match.filename || match.model?.relative_path || '';
                 const isSaved = !!match.is_override;
                 // Name only - the containing folder is printed just below
-                html += `<code title="${match.model?.relative_path || label}">${label}</code> `;
-                html += `<span style="color: ${match.confidence === 100 ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
+                html += `<code title="${escapeHtml(match.model?.relative_path || label)}">${escapeHtml(label)}</code> `;
+                html += `<span style="color: ${isPerfectMatch(match) ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
+                if (match.category_mismatch) {
+                    const foundIn = escapeHtml(match.model?.category || 'another folder');
+                    const expected = escapeHtml(missing.category || 'its own folder');
+                    html += ` <span style="color:#e0a030; font-weight:600;" `
+                        + `title="Found in '${foundIn}', but this node loads from '${expected}'. Move the file there, or link it knowing the node may fail to load it.">⚠ wrong folder</span>`;
+                }
                 if (isSaved) {
                     html += ` <span style="color:#0aa96e; font-weight:600;">(saved)</span>`;
                 }
@@ -1388,7 +1543,7 @@ export class LinkerManagerDialog {
                 // Show folder location (UI-only, not sent to nodes)
                 const folderPath = this._getModelFolder(match.model);
                 if (folderPath) {
-                    html += `<div style="font-size:11px; color:#888; opacity:0.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${folderPath}">📁 ${folderPath}</div>`;
+                    html += `<div style="font-size:11px; color:#888; opacity:0.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(folderPath)}">📁 ${escapeHtml(folderPath)}</div>`;
                 }
                 html += `</li>`;
             }
@@ -1655,6 +1810,11 @@ export class LinkerManagerDialog {
             nested_key: missing.nested_key || null,
             list_index: (missing.list_index ?? null),
             adapter_id: missing.adapter_id || null,
+            // A swap replaces a model that is present; /resolve must not save it as an override
+            record_override: missing.record_override !== false,
+            // Only set by queueSwap; the queue panel's Remove uses it to find
+            // the rest of the group. /resolve never reads this field.
+            swap_group: missing.swap_group || null,
             node_type: missing.node_type,
             node_label: missing.subgraph_name || missing.node_type
         };
@@ -1706,7 +1866,7 @@ export class LinkerManagerDialog {
             const resolutions = [];
             for (const missing of missingModels) {
                 const matches = missing.matches || [];
-                const perfectMatch = matches.find((m) => m.confidence === 100);
+                const perfectMatch = matches.find(isPerfectMatch);
 
                 if (perfectMatch && perfectMatch.model) {
                     resolutions.push({
@@ -1825,7 +1985,7 @@ export class LinkerManagerDialog {
 
     // Build and wire a node-like combo picker, scoped by default to the folder
     // the node actually loads from
-    attachModelCombo(container, missing) {
+    attachModelCombo(container, missing, onChoose = (model) => this.queueResolution(missing, model)) {
         const category = (missing.category && missing.category !== 'unknown') ? missing.category : null;
         const inputId = `combo-input-${refSlot(missing)}`;
         const listId = `combo-list-${refSlot(missing)}`;
@@ -2058,7 +2218,7 @@ export class LinkerManagerDialog {
                 if (activeIndex >= 0 && activeIndex < currentItems.length) {
                     const chosen = currentItems[activeIndex];
                     if (chosen) {
-                        this.queueResolution(missing, chosen);
+                        onChoose(chosen);
                         inputEl.value = chosen.filename || chosen.relative_path || '';
                         inputEl.title = chosen.relative_path || '';
                         closeList();
@@ -2073,7 +2233,7 @@ export class LinkerManagerDialog {
             const idx = parseInt(item.getAttribute('data-idx'), 10);
             const chosen = currentItems[idx];
             if (chosen) {
-                this.queueResolution(missing, chosen);
+                onChoose(chosen);
                 inputEl.value = chosen.filename || chosen.relative_path || '';
                 inputEl.title = chosen.relative_path || '';
                 closeList();
@@ -2105,45 +2265,59 @@ export class LinkerManagerDialog {
         }
     }
 
-    // Center and select a node in the current graph by ID
-    locateNodeInGraph(nodeId) {
+    /** The live canvas node(s) a reference points at. Subgraph instances share one definition. */
+    liveNodesFor(ref) {
+        if (!app?.graph) return [];
+        const node = ref.is_top_level === false
+            ? this.findLiveNodeInSubgraphs(app.graph, ref.subgraph_id, ref.node_id)
+            : (app.graph.getNodeById?.(ref.node_id) || app.graph._nodes_by_id?.[ref.node_id]);
+        return node ? [node] : [];
+    }
+
+    /**
+     * Move the viewport onto a live node, entering its subgraph first when the
+     * canvas shows another graph. Ported from upstream, which mirrors the
+     * frontend's useFocusNode (the locate button in ComfyUI's workflow
+     * overview). Older frontends lack setGraph/animateToBounds; both degrade.
+     */
+    async focusNode(node) {
+        const canvas = app.canvas;
+        const graph = node.graph;
+        if (graph && canvas.graph !== graph && typeof canvas.setGraph === 'function') {
+            const isRoot = graph.isRootGraph ?? (graph === (app.rootGraph || app.graph));
+            canvas.subgraph = isRoot ? undefined : graph;
+            canvas.setGraph(graph);
+            // LiteGraph needs a full frame in the new graph before measuring
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        }
+        if (typeof canvas.animateToBounds === 'function' && node.boundingRect) {
+            canvas.animateToBounds(node.boundingRect);
+        } else {
+            canvas.centerOnNode?.(node);
+        }
+        if (typeof canvas.selectNode === 'function') canvas.selectNode(node);
+        else canvas.selectNodes?.([node]);
+        canvas.setDirty?.(true, true);
+    }
+
+    async locateRef(ref) {
+        if (!app?.graph || !app?.canvas) {
+            this.showNotification('Canvas not available', 'error');
+            return;
+        }
+        const [node] = this.liveNodesFor(ref);
+        if (!node) {
+            const where = ref.subgraph_name || ref.subgraph_id;
+            this.showNotification(where
+                ? `Node #${ref.node_id} not found - subgraph "${where}" has no live instance on the canvas`
+                : `Node #${ref.node_id} not found on the canvas`, 'error');
+            return;
+        }
+        this.close();  // the canvas has to be visible to be of any use
         try {
-            if (!app || !app.graph) {
-                this.showNotification('Graph not available', 'error');
-                return;
-            }
-            let node = null;
-            if (typeof app.graph.getNodeById === 'function') {
-                try { node = app.graph.getNodeById(nodeId); } catch (e) { /* ignore */ }
-            }
-            if (!node && app.graph._nodes_by_id) {
-                node = app.graph._nodes_by_id[nodeId];
-            }
-            if (!node) {
-                this.showNotification('Node not found in current view', 'error');
-                return;
-            }
-            const canvas = app.canvas;
-            if (canvas) {
-                // Deselect other nodes
-                if (typeof canvas.deselectAllNodes === 'function') {
-                    try { canvas.deselectAllNodes(); } catch (e) { }
-                }
-                // Select this node
-                if (typeof canvas.selectNode === 'function') {
-                    try { canvas.selectNode(node, true); } catch (e) { }
-                } else if (typeof canvas.selectNodes === 'function') {
-                    try { canvas.selectNodes([node], true); } catch (e) { }
-                }
-                // Center on node
-                if (typeof canvas.centerOnNode === 'function') {
-                    try { canvas.centerOnNode(node); } catch (e) { }
-                } else if (typeof canvas.scrollToCenter === 'function') {
-                    try { canvas.scrollToCenter(); } catch (e) { }
-                }
-            }
+            await this.focusNode(node);
         } catch (error) {
-            console.error('Model Linker: locateNodeInGraph error', error);
+            console.error('Model Linker: locate failed', error);
         }
     }
 
@@ -2229,24 +2403,33 @@ export class LinkerManagerDialog {
             // Previous approach used graph.configure() which clears the entire graph and
             // rebuilds from scratch — causing all nodes to disappear on newer ComfyUI versions.
             if (resolutions && resolutions.length > 0) {
+                app.canvas?.emitBeforeChange?.();
+                try {
                 let updatedCount = 0;
 
                 for (const res of resolutions) {
                     const nodeId = res.node_id;
                     const widgetIndex = res.widget_index;
 
-                    // Get the new value from the updated workflow returned by backend
+                    // Get the new value from the updated workflow returned by backend.
+                    // A node inside a subgraph can share an id with a top-level node -
+                    // ids are only unique within their own graph - so a resolution that
+                    // says is_top_level === false must never be answered from the
+                    // top-level nodes, or it silently picks up the wrong node's value.
                     let newValue = undefined;
                     const workflowNodes = workflow?.nodes || [];
-                    for (const wn of workflowNodes) {
-                        if (wn.id === nodeId) {
-                            const wv = wn.widgets_values;
-                            if (Array.isArray(wv) && widgetIndex >= 0 && widgetIndex < wv.length) {
-                                newValue = wv[widgetIndex];
-                            } else if (wv && typeof wv === 'object' && widgetIndex in wv) {
-                                newValue = wv[widgetIndex];
+                    const insideSubgraph = res.is_top_level === false && !!res.subgraph_id;
+                    if (!insideSubgraph) {
+                        for (const wn of workflowNodes) {
+                            if (wn.id === nodeId) {
+                                const wv = wn.widgets_values;
+                                if (Array.isArray(wv) && widgetIndex >= 0 && widgetIndex < wv.length) {
+                                    newValue = wv[widgetIndex];
+                                } else if (wv && typeof wv === 'object' && widgetIndex in wv) {
+                                    newValue = wv[widgetIndex];
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
 
@@ -2340,6 +2523,9 @@ export class LinkerManagerDialog {
                     app.graph.setDirtyCanvas(true, true);
                 }
                 return;
+                } finally {
+                    app.canvas?.emitAfterChange?.();
+                }
             }
 
             // Fallback: if no resolutions provided, use loadGraphData

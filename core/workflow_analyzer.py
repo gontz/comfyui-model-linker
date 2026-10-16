@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional
 
 from .node_adapters import get_adapter
 from .node_schema import get_model_widget_categories, get_widget_category
+from .scanner import NON_MODEL_CATEGORIES
 
 # Import folder_paths lazily - it may not be available until ComfyUI is initialized
 try:
@@ -77,11 +78,25 @@ def _basename(value: str) -> str:
     return value.rsplit('/', 1)[-1].rsplit('\\', 1)[-1]
 
 
-def _lookup_model_metadata(model_metadata: Dict[str, Dict[str, Any]], value: str) -> Optional[Dict[str, Any]]:
-    """Find the properties.models entry describing a stored widget value."""
-    if not model_metadata or not isinstance(value, str):
+def _lookup_model_metadata(entries: List[Dict[str, Any]], value: str, claimed=frozenset()) -> Optional[Dict[str, Any]]:
+    """
+    Find the properties.models entry describing a stored widget value: the one
+    named exactly that, else the first sharing its basename that no other
+    widget on the node (`claimed`) names exactly. Without that guard
+    DualCLIPLoader's `flux/t5.safetensors` and `sd3/t5.safetensors`, with an
+    entry for flux only, would hand flux's download link to sd3. The Export
+    dialog's findModelEntry applies the same rule.
+    """
+    if not entries or not isinstance(value, str):
         return None
-    return model_metadata.get(value) or model_metadata.get(_basename(value))
+    for pm in entries:
+        if pm['name'] == value:
+            return pm
+    base = _basename(value)
+    for pm in entries:
+        if pm['name'] not in claimed and _basename(pm['name']) == base:
+            return pm
+    return None
 
 
 def _source_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -152,9 +167,9 @@ def try_resolve_model_path(value: str, categories: List[str] = None) -> Optional
     if categories is None:
         categories = list(folder_paths.folder_names_and_paths.keys())
     
-    # Skip non-model categories
-    skip_categories = {'custom_nodes', 'configs'}
-    categories = [c for c in categories if c not in skip_categories]
+    # Skip non-model categories - the same set core/scanner.py and
+    # core/downloader.py use, so the three can't drift apart.
+    categories = [c for c in categories if c not in NON_MODEL_CATEGORIES]
     
     for category in categories:
         try:
@@ -288,18 +303,11 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     #
     # `name` is the model FILENAME - the value stored in the widget - not the
     # input name, so this is keyed by value and looked up per widget value below.
-    # Entries are indexed by bare filename too, so a widget holding
+    # Entries also match by bare filename, so a widget holding
     # "subfolder/model.safetensors" still finds its metadata.
     properties_models = (node.get('properties') or {}).get('models') or []
-    model_metadata: Dict[str, Dict[str, Any]] = {}
-    for pm in properties_models:
-        if not isinstance(pm, dict):
-            continue
-        name = pm.get('name')
-        if not isinstance(name, str) or not name:
-            continue
-        model_metadata[name] = pm
-        model_metadata.setdefault(_basename(name), pm)
+    model_metadata = [pm for pm in properties_models
+                      if isinstance(pm, dict) and isinstance(pm.get('name'), str) and pm['name']]
 
     # Handle both array and dict format for widgets_values
     if isinstance(widgets_values, dict):
@@ -309,11 +317,17 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
     else:
         return model_refs
 
+    # Every value a widget on this node holds: an entry named exactly one of
+    # them belongs to that widget, never to another by basename
+    claimed = {v for _, v in items if isinstance(v, str)}
+    claimed |= {v[k] for _, v in items if isinstance(v, dict)
+                for k in NESTED_MODEL_KEYS if isinstance(v.get(k), str)}
+
     for idx, value in items:
         # Case 1: Direct string value — detected either by file extension
         # or by properties.models declaring this exact value to be a model
         if isinstance(value, str) and value.strip():
-            metadata = _lookup_model_metadata(model_metadata, value)
+            metadata = _lookup_model_metadata(model_metadata, value, claimed)
             declared_category = (metadata or {}).get('directory') or None
 
             # What the node class says this particular widget loads from. More
@@ -362,7 +376,7 @@ def get_node_model_info(node: Dict[str, Any]) -> List[Dict[str, Any]]:
                 if not nested_value or not is_model_filename(nested_value):
                     continue
 
-                metadata = _lookup_model_metadata(model_metadata, nested_value)
+                metadata = _lookup_model_metadata(model_metadata, nested_value, claimed)
                 value_category = (metadata or {}).get('directory') or nested_category_hint or category_hint
                 categories_to_try = [value_category] if value_category else None
 

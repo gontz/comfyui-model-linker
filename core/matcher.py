@@ -20,7 +20,7 @@ from functools import lru_cache
 from typing import List, Dict, Optional, Tuple
 from difflib import SequenceMatcher
 
-from .categories import categories_match
+from .categories import canonical_category, categories_match
 
 try:
     from rapidfuzz import fuzz as _rapidfuzz
@@ -126,6 +126,13 @@ _VARIANT_TOKEN_RE = re.compile(r'(?:q\d+(?:_?[a-z0-9]+)*|fp\d+|int\d+|nf\d+|e\d+
 _VARIANT_TAIL_TOKENS = {'0', '1', 's', 'm', 'l', 'k', 'ks', 'km', 'kl'}
 _VARIANT_HEAD_RE = re.compile(r'q\d+$')
 
+
+def is_variant_token(token: str) -> bool:
+    """True for a precision/quantisation token (fp8, bf16, q4, e4m3fn, int8, ...)."""
+    token = (token or '').lower()
+    return token in _VARIANT_TOKENS or bool(_VARIANT_TOKEN_RE.match(token))
+
+
 # Parameter counts: 8b, 4b, 1.5b, 700m. These identify *which* model it is and
 # must never be stripped.
 _CAPACITY_TOKEN_RE = re.compile(r'\d+(?:\.\d+)?[bm]$')
@@ -162,13 +169,18 @@ def get_model_signature(family_name: str) -> Optional[Tuple[str, str]]:
     Split a family name into (architecture, parameter count) when it has one.
 
     "qwen3vl 8b" -> ("qwen3vl", "8b"). Returns None when the name carries no
-    parameter count, which is normal for models like "umt5 xxl".
+    parameter count, which is normal for models like "umt5 xxl". If the capacity
+    token leads the name, falls back to the token after the capacity as architecture.
     """
     tokens = family_name.split()
     for index, token in enumerate(tokens):
         if not _CAPACITY_TOKEN_RE.fullmatch(token):
             continue
         architecture = ''.join(tokens[:index])
+        if len(architecture) >= 3 and re.search(r'[a-z]', architecture):
+            return architecture, token
+        # Capacity token is first or prefix is too short; try the token after capacity
+        architecture = ''.join(tokens[index + 1:index + 2])
         if len(architecture) >= 3 and re.search(r'[a-z]', architecture):
             return architecture, token
     return None
@@ -230,6 +242,14 @@ def calculate_filename_confidence(target_filename: str, candidate_filename: str)
         return 100.0
 
     similarity = calculate_similarity(target_norm, candidate_norm)
+    # Word order carries no meaning in a filename: `convrot_int8` and
+    # `int8_convrot` name the same thing. This only raises raw similarity,
+    # which orders candidates within a band; the family and capacity caps
+    # below still decide which band a candidate lands in.
+    similarity = max(similarity, calculate_similarity(
+        ' '.join(sorted(target_norm.split())),
+        ' '.join(sorted(candidate_norm.split())),
+    ))
 
     target_family = normalize_model_family(target_filename)
     candidate_family = normalize_model_family(candidate_filename)
@@ -251,7 +271,8 @@ def calculate_filename_confidence(target_filename: str, candidate_filename: str)
         if (conflicting_size and target_architecture == candidate_architecture) or conflicting_generation:
             return round(min(similarity, _CAPACITY_CONFLICT_SIMILARITY) * 100, 1)
 
-    if target_family == candidate_family:
+    # A reordered name is the same model, so the family comparison ignores order too
+    if sorted(target_family.split()) == sorted(candidate_family.split()):
         # Identical once precision and quantisation are set aside. Raw
         # similarity only orders candidates within this band, so the closest
         # spelling of the same model comes first.
@@ -319,6 +340,9 @@ def find_matches(
     heap: List[Tuple[Tuple[bool, float], int, Dict]] = []
     counter = 0
 
+    # Only a known expected category can make a match "wrong folder"
+    expected_known = canonical_category(preferred_category) is not None
+
     for candidate in candidate_models:
         # Get filename from candidate (prefer 'filename' key, fallback to extracting from 'path' or 'relative_path')
         candidate_filename = candidate.get('filename')
@@ -351,6 +375,7 @@ def find_matches(
         if similarity < threshold:
             continue
 
+        same_category = categories_match(preferred_category, candidate.get('category'))
         match = {
             'model': candidate,
             'filename': candidate_filename,
@@ -358,7 +383,10 @@ def find_matches(
             'confidence': confidence,
             # Compared canonically, so a node expecting `text_encoders` still
             # counts a model catalogued under `clip` as its own category.
-            'same_category': categories_match(preferred_category, candidate.get('category')),
+            'same_category': same_category,
+            # The node resolves paths against its own category's folders only,
+            # so linking this would still fail at prompt time.
+            'category_mismatch': expected_known and bool(candidate.get('category')) and not same_category,
         }
         # Plausible matches from the expected category outrank the rest; see the
         # preferred_category note above.

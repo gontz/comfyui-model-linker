@@ -2,21 +2,41 @@
 @author: Model Linker Team
 @title: ComfyUI Model Linker
 @nickname: Model Linker
-@version: 1.0.0
+@version: 1.2.0
 @description: Extension for relinking missing models in ComfyUI workflows using fuzzy matching
 """
 
+import asyncio
 import logging
 import json
 
 # Web directory for JavaScript interface
 WEB_DIRECTORY = "./web"
 
-# Empty NODE_CLASS_MAPPINGS - we don't provide custom nodes, only web extension
-# This prevents ComfyUI from showing "IMPORT FAILED" message
-NODE_CLASS_MAPPINGS = {}
+class ModelLinkerNode:
+    """
+    Marks a shared workflow as prepared with Model Linker and carries its
+    buttons (added by web/linker.js). No inputs and no outputs, so ComfyUI
+    never executes it. Export adds it muted, so a workflow carrying it still
+    runs where this extension is not installed.
+    """
 
-__all__ = ["WEB_DIRECTORY"]
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "noop"
+    CATEGORY = "utils"
+
+    def noop(self):
+        return ()
+
+
+NODE_CLASS_MAPPINGS = {"ModelLinker": ModelLinkerNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"ModelLinker": "Model Linker"}
+
+__all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 
 class ModelLinkerExtension:
@@ -64,11 +84,37 @@ class ModelLinkerExtension:
                     delete_override,
                     clear_overrides,
                     replace_overrides,
+                    resolutions_to_record,
                 )
             except ImportError as e:
                 self.logger.error(f"Model Linker: Could not import core modules: {e}")
                 return False
-            
+
+            # Downloads and online lookups need `requests`; without it the
+            # extension still relinks models from disk. Any other failure in
+            # the download stack is a bug - logged in full, but it must never
+            # take relinking (/analyze, /resolve) down with it.
+            try:
+                import requests  # noqa: F401
+                from .core import lookups, routes_downloads
+                routes_downloads.register(routes, web)
+                lookups_available = True
+            except Exception as e:
+                lookups = None
+                lookups_available = False
+                if isinstance(e, ImportError):
+                    self.logger.warning(f"Model Linker: downloads and online lookups are disabled ({e})")
+                else:
+                    self.logger.error(f"Model Linker: downloads and online lookups failed to load: {e}",
+                                      exc_info=True)
+            # Separately: a failure in Export must not take lookups down too
+            if lookups_available:
+                try:
+                    from .core import routes_export
+                    routes_export.register(routes, web)
+                except Exception as e:
+                    self.logger.error(f"Model Linker: Export failed to load: {e}", exc_info=True)
+
             @routes.post("/model_linker/analyze")
             async def analyze_workflow(request):
                 """Analyze workflow and return missing models with matches."""
@@ -83,8 +129,23 @@ class ModelLinkerExtension:
                         )
                     
                     # Analyze and find matches
-                    result = analyze_and_find_matches(workflow_json)
-                    
+                    result = await asyncio.to_thread(analyze_and_find_matches, workflow_json)
+                    # Without it the frontend hides what needs `requests`
+                    # (Download all found, Export) instead of letting it 404
+                    result['lookups_available'] = lookups_available
+
+                    if lookups_available:
+                        # Only reads the store and queues work; never waits on the
+                        # network. A bug here (a corrupt store row slipping past
+                        # LookupStore's own guard, or anything else) must never
+                        # take relinking down with it - log it and answer without
+                        # lookup data instead of failing the whole analysis.
+                        try:
+                            result['lookups_pending'] = await asyncio.to_thread(
+                                lookups.attach_cached, result['missing_models'])
+                        except Exception as e:
+                            self.logger.error(f"Model Linker: lookup attach failed: {e}", exc_info=True)
+
                     return web.json_response(result)
                 except Exception as e:
                     self.logger.error(f"Model Linker analyze error: {e}", exc_info=True)
@@ -120,7 +181,7 @@ class ModelLinkerExtension:
                         workflow_before = None
 
                     # Apply resolutions
-                    updated_workflow = apply_resolution(workflow_json, resolutions)
+                    updated_workflow = await asyncio.to_thread(apply_resolution, workflow_json, resolutions)
 
                     # Persist user choices as overrides (so next time we know the correct match)
                     try:
@@ -164,7 +225,7 @@ class ModelLinkerExtension:
                                 return None
 
                         selections = []
-                        for res in resolutions:
+                        for res in resolutions_to_record(resolutions):
                             # Expect original_path from client; otherwise derive from pre-update workflow
                             original_path = res.get('original_path')
                             if not original_path:
@@ -207,7 +268,7 @@ class ModelLinkerExtension:
             async def get_models(request):
                 """Get list of all available models (for debugging/UI display)."""
                 try:
-                    models = list_available_models()
+                    models = await asyncio.to_thread(list_available_models)
                     return web.json_response(models)
                 except Exception as e:
                     self.logger.error(f"Model Linker get_models error: {e}", exc_info=True)
@@ -348,6 +409,9 @@ class ModelLinkerExtension:
                 except Exception as e:
                     self.logger.debug(f"Model Linker preview error: {e}")
                     return web.Response(status=404)
+
+            from .core import routes_settings
+            routes_settings.register(routes, web)
 
             self.routes_setup = True
             self.logger.info("Model Linker: API routes registered successfully")

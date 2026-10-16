@@ -1,13 +1,14 @@
 [project]
 name = "comfyui-model-linker"
-version = "1.1.0"
+version = "1.2.0"
 description = "A ComfyUI extension that helps users relink missing models in workflows"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "aiohttp>=3.8.0",
+    "requests>=2.28.0",
 ]
 
 [project.urls]

@@ -47,6 +47,7 @@ class ExtensionFilterTests(LibraryTestCase):
     def test_non_model_categories_are_skipped(self):
         self.add_models('configs', ['something.safetensors'])
         self.add_models('custom_nodes', ['other.safetensors'])
+        self.add_models('datasets', ['another.safetensors'])
         self.assertEqual(get_model_files(), [])
 
 
@@ -168,6 +169,32 @@ class ScanCacheTests(LibraryTestCase):
 
         self.assertIsNot(second, first)
         self.assertEqual({m['filename'] for m in second}, {'flux1_dev.safetensors'})
+
+
+class ConcurrentScanTests(LibraryTestCase):
+    def test_concurrent_cold_calls_scan_once(self):
+        import threading
+        from core import scanner
+
+        self.add_models('checkpoints', ['a.safetensors'], ['.safetensors'])
+        calls = []
+        real = scanner.scan_all_directories
+
+        def slow_scan(visited_dirs=None):
+            calls.append(1)
+            threading.Event().wait(0.2)  # long enough for the other thread to arrive
+            return real(visited_dirs)
+
+        scanner.scan_all_directories = slow_scan
+        try:
+            threads = [threading.Thread(target=scanner.get_model_files) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            scanner.scan_all_directories = real
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == '__main__':

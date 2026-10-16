@@ -137,6 +137,28 @@ class WorkflowMetadataTests(LibraryTestCase):
                                            'directory': 'diffusion_models'}]}}
         self.assertEqual(get_node_model_info(node)[0]['category'], 'diffusion_models')
 
+    def test_a_basename_match_never_takes_an_entry_another_widget_names_exactly(self):
+        # DualCLIPLoader's shape: two t5 encoders from different folders, an
+        # entry for flux only. sd3 must not inherit flux's download link -
+        # Export would write it into the shared workflow as sd3's
+        node = {'id': 1, 'type': 'SomeUnknownLoader',
+                'widgets_values': ['flux/t5.safetensors', 'sd3/t5.safetensors'],
+                'properties': {'models': [{'name': 'flux/t5.safetensors', 'directory': 'text_encoders',
+                                           'url': 'https://h/flux/t5.safetensors'}]}}
+        refs = {r['original_path']: r for r in get_node_model_info(node)}
+        self.assertEqual(refs['flux/t5.safetensors']['source_url'], 'https://h/flux/t5.safetensors')
+        self.assertIsNone(refs['sd3/t5.safetensors']['source_url'])
+
+    def test_a_basename_match_skips_a_claimed_entry_for_an_unclaimed_one(self):
+        node = {'id': 1, 'type': 'SomeUnknownLoader',
+                'widgets_values': ['flux/t5.safetensors', 'sd3/t5.safetensors'],
+                'properties': {'models': [
+                    {'name': 'flux/t5.safetensors', 'directory': 'text_encoders', 'url': 'https://h/flux'},
+                    {'name': 't5.safetensors', 'directory': 'text_encoders', 'url': 'https://h/bare'}]}}
+        refs = {r['original_path']: r for r in get_node_model_info(node)}
+        self.assertEqual(refs['flux/t5.safetensors']['source_url'], 'https://h/flux')
+        self.assertEqual(refs['sd3/t5.safetensors']['source_url'], 'https://h/bare')
+
     def test_a_declared_model_without_a_model_extension_is_still_found(self):
         node = self.node_with_metadata('some_model_without_extension', 'checkpoints')
         self.assertEqual(len(get_node_model_info(node)), 1)

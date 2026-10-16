@@ -8,6 +8,7 @@ Answers persist in data/lookups.json, so a lookup that finishes after the
 dialog was closed is waiting there the next time it opens.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -30,6 +31,9 @@ NEGATIVE_TTL = 24 * 3600
 
 _SHA256 = re.compile(r'^[0-9a-f]{64}$')
 
+# Sentinel put on the queue to ask the worker thread to exit (tests only).
+_STOP = object()
+
 
 def _basename(path: str) -> str:
     return re.split(r'[/\\]', path or '')[-1]
@@ -41,28 +45,48 @@ def _sha256_of(missing: Dict[str, Any]) -> str:
     return value if hash_type == 'sha256' and _SHA256.match(value) else ''
 
 
+def _safe_https_url(url: Optional[str]) -> str:
+    """The URL, or '' when it is not an https link - the only kind ever sent anywhere."""
+    url = url or ''
+    try:
+        if urlparse(url).scheme != 'https':
+            return ''
+    except ValueError:
+        return ''
+    return url
+
+
 def lookup_key(missing: Dict[str, Any]) -> str:
-    """Identity of what is being looked for: its hash when known, else category and name."""
+    """
+    Identity of what is being looked for: its hash when known, else category
+    and name - but scoped to the workflow's own claimed URL when it has one.
+
+    A workflow can claim any filename, category or hash it likes for its own
+    URL, so a URL-carrying lookup must never be allowed to answer - or be
+    answered by - another workflow that happens to share that filename or
+    hash. The URL prefix isolates it into its own corner of the store while
+    still letting that lookup resolve (e.g. to the workflow's own link).
+    """
     sha256 = _sha256_of(missing)
     if sha256:
-        return f'sha256:{sha256}'
-    category = canonical_category(missing.get('category')) or 'unknown'
-    return f'{category}:{_basename(missing.get("original_path")).lower()}'
+        base = f'sha256:{sha256}'
+    else:
+        category = canonical_category(missing.get('category')) or 'unknown'
+        base = f'{category}:{_basename(missing.get("original_path")).lower()}'
+    url = _safe_https_url(missing.get('source_url'))
+    if url:
+        url_hash = hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]
+        return f'url:{url_hash}:{base}'
+    return base
 
 
 def _request_for(missing: Dict[str, Any]) -> Dict[str, str]:
     """What the source chain is asked, built only from fields that are safe to send."""
-    url = missing.get('source_url') or ''
-    try:
-        if urlparse(url).scheme != 'https':
-            url = ''
-    except ValueError:
-        url = ''
     category = missing.get('category')
     return {
         'filename': _basename(missing.get('original_path')),
         'category': category if canonical_category(category) else '',
-        'workflow_url': url,
+        'workflow_url': _safe_https_url(missing.get('source_url')),
         'sha256': _sha256_of(missing),
     }
 
@@ -93,24 +117,36 @@ class LookupStore:
         return self._data
 
     def get(self, key: str) -> Optional[Dict[str, Any]]:
-        """The stored answer, or None when unknown or a negative answer has expired."""
+        """
+        The stored answer, or None when unknown, unreadable (not a dict, or a
+        checked_at that cannot be parsed as a number), or a negative answer
+        that has expired. An entry that cannot be read must be treated as
+        absent rather than raising - a single corrupt row must never fail
+        /analyze or /model_linker/lookups for every model.
+        """
         with self._lock:
             entry = self._load().get(key)
         if not isinstance(entry, dict):
             return None
-        if entry.get('result') is None and time.time() - float(entry.get('checked_at') or 0) > NEGATIVE_TTL:
+        try:
+            checked_at = float(entry.get('checked_at') or 0)
+        except (TypeError, ValueError):
+            return None
+        if entry.get('result') is None and time.time() - checked_at > NEGATIVE_TTL:
             return None
         return entry
 
     def put(self, key: str, result: Optional[Dict[str, Any]]) -> None:
+        """Write a copy to disk, and only adopt it in memory once the write succeeds."""
         with self._lock:
-            data = self._load()
+            data = dict(self._load())
             data[key] = {'result': result, 'checked_at': time.time()}
             path = self._path()
             tmp = path + '.tmp'
             with open(tmp, 'w', encoding='utf-8') as handle:
                 json.dump(data, handle, indent=1)
             os.replace(tmp, path)
+            self._data = data
 
 
 class LookupWorker:
@@ -142,18 +178,31 @@ class LookupWorker:
                 self._thread.start()
         return True
 
-    def wait_idle(self, timeout: float) -> None:
-        """Block until the queue is empty (tests only)."""
+    def wait_idle(self, timeout: float) -> bool:
+        """Block until the queue is empty. Returns whether it became idle in time (tests only)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._lock:
                 if not self._pending:
-                    return
+                    return True
             time.sleep(0.01)
+        with self._lock:
+            return not self._pending
+
+    def stop(self) -> None:
+        """Ask a running worker thread to exit once idle, and wait for it (tests only)."""
+        with self._lock:
+            thread = self._thread
+        if thread is not None and thread.is_alive():
+            self._queue.put(_STOP)
+            thread.join(timeout=5)
 
     def _run(self) -> None:
         while True:
             key = self._queue.get()
+            if key is _STOP:
+                self._queue.task_done()
+                return
             with self._lock:
                 request = self._pending.get(key)
             try:
@@ -194,15 +243,11 @@ def _find(request: Dict[str, str]) -> Optional[Dict[str, Any]]:
     )
 
 
+# Constructed at module load, not lazily: a lazy "create on first use" getter
+# raced two threads into building two different worker instances. The
+# constructor only sets up state - it starts no thread.
 _store = LookupStore()
-_worker: Optional[LookupWorker] = None
-
-
-def worker() -> LookupWorker:
-    global _worker
-    if _worker is None:
-        _worker = LookupWorker(_store, _find)
-    return _worker
+_worker = LookupWorker(_store, _find)
 
 
 def attach_cached(missing_models: List[Dict[str, Any]]) -> int:
@@ -219,7 +264,7 @@ def attach_cached(missing_models: List[Dict[str, Any]]) -> int:
         if entry is not None:
             missing['download_source'] = entry.get('result')
             missing['lookup_state'] = 'found' if entry.get('result') else 'not_found'
-        elif worker().is_pending(key) or (auto and worker().enqueue(key, _request_for(missing))):
+        elif _worker.is_pending(key) or (auto and _worker.enqueue(key, _request_for(missing))):
             missing['lookup_state'] = 'pending'
             pending += 1
         else:
@@ -230,7 +275,7 @@ def attach_cached(missing_models: List[Dict[str, Any]]) -> int:
 def results_for(keys: List[str]) -> Dict[str, Dict[str, Any]]:
     results = {}
     for key in keys:
-        if worker().is_pending(key):
+        if _worker.is_pending(key):
             results[key] = {'state': 'pending', 'source': None}
             continue
         entry = _store.get(key)
@@ -245,5 +290,5 @@ def results_for(keys: List[str]) -> Dict[str, Dict[str, Any]]:
 def refresh(missing: Dict[str, Any]) -> str:
     """Ask again now, whatever the store says - the user pressed the button."""
     key = lookup_key(missing)
-    worker().enqueue(key, _request_for(missing), force=True)
+    _worker.enqueue(key, _request_for(missing), force=True)
     return key

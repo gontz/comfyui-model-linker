@@ -105,9 +105,16 @@ class ModelLinkerExtension:
                     result = await asyncio.to_thread(analyze_and_find_matches, workflow_json)
 
                     if lookups_available:
-                        # Only reads the store and queues work; never waits on the network
-                        result['lookups_pending'] = await asyncio.to_thread(
-                            lookups.attach_cached, result['missing_models'])
+                        # Only reads the store and queues work; never waits on the
+                        # network. A bug here (a corrupt store row slipping past
+                        # LookupStore's own guard, or anything else) must never
+                        # take relinking down with it - log it and answer without
+                        # lookup data instead of failing the whole analysis.
+                        try:
+                            result['lookups_pending'] = await asyncio.to_thread(
+                                lookups.attach_cached, result['missing_models'])
+                        except Exception as e:
+                            self.logger.error(f"Model Linker: lookup attach failed: {e}", exc_info=True)
 
                     return web.json_response(result)
                 except Exception as e:

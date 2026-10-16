@@ -343,7 +343,7 @@ imports work with no build step. Import paths climb one level further from `web/
 - `$el()` is defined **locally**; `scripts/ui.js` is deprecated (announced for removal in
   frontend v1.34) and must not be imported. Only `scripts/app.js` and `scripts/api.js` are
 - Registers `commands`, `menuCommands`, `keybindings`, `settings`, `getCanvasMenuItems`,
-  `afterConfigureGraph` and `nodeCreated`. Never scrape the DOM for a place to inject UI —
+  `afterConfigureGraph`, `afterLoadGraph` and `nodeCreated`. Never scrape the DOM for a place to inject UI —
   the frontend is Vue-rendered. `afterConfigureGraph` (fired for every graph ComfyUI loads,
   including a reload) replaces any popup-injection approach for the load-time missing-model
   notice; it is deduped per workflow via
@@ -360,10 +360,13 @@ imports work with no build step. Import paths climb one level further from `web/
   for saved overrides too — an override *records* a workflow-supplied name, so the overrides
   manager renders untrusted text however local the file looks. Use `escapeHtml()`, and pass
   URLs through `safeHttpUrl()`
-- Queued selections belong to the workflow they were picked on: `ModelLinker.onGraphLoaded`
+- Queued selections belong to the workflow they were picked on: `ModelLinker.onWorkflowLoaded`
   clears them (and their selected bars) whenever `workflowKey()` changes, and re-analyses
   an open dialog. Reloading the same workflow (an undo does) keeps them; with no workflow
-  identity, every load clears them
+  identity, every load clears them. It runs on **`afterLoadGraph`, not
+  `afterConfigureGraph`**: frontend 1.55.17's `loadGraphData` fires `afterConfigureGraph`
+  while the workflow store still names the workflow being left, then makes the new one
+  active (`workflowService.afterLoadNewGraph`), then fires `afterLoadGraph`
 - Only one analysis may render: a new one aborts the request in flight, and a superseded
   answer is discarded. Without that, two overlapping analyses both complete and whichever
   *arrives* last wins

@@ -75,20 +75,32 @@ export class ModelLinker {
     // own first line) before issuing a new one, so the pending openExport()
     // still gets null from the one it was awaiting, while an open dialog
     // re-renders for the workflow now on screen instead of hanging.
-    //
+    onGraphLoaded() {
+        this.dialog?.exportDialog?.close();
+        if (this.dialog?.analyzeAbort) this.dialog.loadWorkflowData();
+        clearTimeout(this.loadTimer);
+        this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
+    }
+
     // Queued selections are node ids in the workflow they were picked on, so
     // they are dropped whenever another workflow loads - never applied to it.
     // Reloading the same workflow (an undo does) keeps them; with no workflow
     // identity to compare, every load counts as a switch.
-    onGraphLoaded() {
-        this.dialog?.exportDialog?.close();
+    //
+    // Runs on afterLoadGraph, not afterConfigureGraph: frontend 1.55's
+    // loadGraphData fires afterConfigureGraph, then makes the loaded
+    // workflow active in its store (workflowService.afterLoadNewGraph), then
+    // fires afterLoadGraph - so only here does workflowKey() name the
+    // workflow just loaded rather than the one being left.
+    onWorkflowLoaded() {
         const key = this.workflowKey();
         const switched = key === undefined || key !== this.loadedWorkflowKey;
         this.loadedWorkflowKey = key;
-        if (switched) this.dialog?.clearAllQueued();
-        if (this.dialog?.analyzeAbort || (switched && this.dialog?.isOpen())) this.dialog.loadWorkflowData();
-        clearTimeout(this.loadTimer);
-        this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
+        if (!switched || !this.dialog) return;
+        this.dialog.clearAllQueued();
+        // An analysis already in flight started after the new graph was
+        // configured (onGraphLoaded restarts any older one), so it is current
+        if (this.dialog.isOpen() && !this.dialog.analyzeAbort) this.dialog.loadWorkflowData();
     }
 
     // app.graph.serialize() carries no id for the open tab - LiteGraph's
@@ -167,6 +179,7 @@ app.registerExtension({
     name: "Model Linker",
     setup: modelLinker.setup,
     afterConfigureGraph: () => modelLinker.onGraphLoaded(),
+    afterLoadGraph: () => modelLinker.onWorkflowLoaded(),
     nodeCreated(node) {
         if (node.comfyClass !== "ModelLinker") return;
         for (const [label, action] of [["Open Model Linker", () => modelLinker.openLinkerManager()],

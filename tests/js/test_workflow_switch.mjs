@@ -1,7 +1,7 @@
 // A queue of selections belongs to the workflow it was built on, and what
 // needs `requests` is hidden when the server has no online lookups.
 // Behavioural, against the real ModelLinker and LinkerManagerDialog methods.
-import { createChecker, loadModule } from './harness.mjs';
+import { createChecker, loadModule, readSource } from './harness.mjs';
 import { app } from './stubs/scripts/app.js';
 import { api } from './stubs/scripts/api.js';
 
@@ -34,10 +34,14 @@ export default async function run() {
 
     const linker = new ModelLinker();
     linker.dialog = dialog;
+    // In the order frontend 1.55's loadGraphData uses: afterConfigureGraph
+    // while the store still names the workflow being left, then the store
+    // switches, then afterLoadGraph.
     const load = (path) => {
-      app.extensionManager.workflow = { activeWorkflow: { path } };
       linker.onGraphLoaded();
       clearTimeout(linker.loadTimer);   // the background check needs a real graph
+      app.extensionManager.workflow = { activeWorkflow: { path } };
+      linker.onWorkflowLoaded();
     };
 
     load('workflows/a.json');
@@ -62,16 +66,19 @@ export default async function run() {
     dialog.element.style.display = 'flex';
     queueOne();
     delete app.extensionManager.workflow;   // a frontend with no workflow store
-    linker.onGraphLoaded();
-    clearTimeout(linker.loadTimer);
+    linker.onWorkflowLoaded();
     check('with no workflow identity any load clears the queue', dialog.pendingResolutions.length === 0);
 
     const fresh = new ModelLinker();   // the first graph can load before the dialog exists
     app.extensionManager.workflow = { activeWorkflow: { path: 'workflows/a.json' } };
     let threw = false;
-    try { fresh.onGraphLoaded(); } catch (e) { threw = true; }
+    try { fresh.onGraphLoaded(); fresh.onWorkflowLoaded(); } catch (e) { threw = true; }
     clearTimeout(fresh.loadTimer);
     check('a load before the dialog exists does not throw', !threw);
+
+    // (registerExtension already ran when another suite imported linker.js)
+    check('the switch check runs on afterLoadGraph, once the store names the new workflow',
+          /afterLoadGraph:\s*\(\)\s*=>\s*modelLinker\.onWorkflowLoaded\(\)/.test(readSource('linker.js')));
 
     // --- M2: without online lookups, hide what needs them ---------------
     const shown = Object.create(LinkerManagerDialog.prototype);

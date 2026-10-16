@@ -749,9 +749,7 @@ export default async function run() {
       dialog,
       onGraphLoaded() {
         this.dialog?.exportDialog?.close?.();
-        const switched = true;   // a tab switch; the key comparison is tested in test_workflow_switch.mjs
-        if (switched) this.dialog?.clearAllQueued?.();
-        if (this.dialog?.analyzeAbort || (switched && this.dialog?.isOpen?.())) this.dialog.loadWorkflowData();
+        if (this.dialog?.analyzeAbort) this.dialog.loadWorkflowData();
       },
     };
     const opening = dialog.openExport();
@@ -788,7 +786,7 @@ export default async function run() {
   check('the export dialog is closed when another workflow loads',
         /onGraphLoaded\(\)\s*\{\s*this\.dialog\?\.exportDialog\?\.close\(\);/.test(linkerSrc));
   check('a tab switch re-analyses rather than leaving the dialog stuck, when one is in flight',
-        /onGraphLoaded\(\)\s*\{[\s\S]{0,500}?if \(this\.dialog\?\.analyzeAbort \|\| \(switched && this\.dialog\?\.isOpen\(\)\)\) this\.dialog\.loadWorkflowData\(\);/
+        /onGraphLoaded\(\)\s*\{[\s\S]{0,300}?if \(this\.dialog\?\.analyzeAbort\) this\.dialog\.loadWorkflowData\(\);/
           .test(linkerSrc));
   check('opening Export reports a failure instead of throwing', /notifyError\("Could not open Export"/.test(linkerSrc));
   check('opening Export is async and awaits the dialog, so a rejection cannot escape unhandled',

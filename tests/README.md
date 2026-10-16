@@ -58,7 +58,7 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `js/test_downloads.mjs` | `DownloadController`: keyed by canonical file key, reconnect after reload, 🔎 Search similar (refuses a candidate whose basename matches any on-screen card's, by basename alone, never scoped to category), cancel |
 | `js/test_locate.mjs` | Locate, including into a nested subgraph; the empty-result notification when a subgraph has no live instance |
 | `js/test_swap.mjs` | Swap: one queued resolution per node sharing a model, `record_override: false`, queue-panel removal by `swap_group` key |
-| `js/test_workflow_switch.mjs` | queued selections are cleared when another workflow loads (kept on a reload of the same one); "Download all found" hidden and Export refused when `lookups_available` is false |
+| `js/test_workflow_switch.mjs` | queued selections are cleared when another workflow loads, checked on `afterLoadGraph` in the frontend's own hook order (kept on a reload of the same one); "Download all found" hidden and Export refused when `lookups_available` is false |
 | `js/test_export.mjs` | Export: `strip_secrets` round-trip, the "Model links" note, the muted Model Linker node, re-applying without duplicating |
 
 Suites that need `requests` (`test_sources.py`, `test_source_chain.py`, `test_downloader.py`,

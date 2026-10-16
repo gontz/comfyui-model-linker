@@ -60,9 +60,9 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
   words, base model, preview image) when CivitAI has that data, without overwriting
   anything Lora Manager already wrote
 - **🔎 Search Similar**: User-initiated — nothing is searched automatically. A chosen file
-  downloads and keeps its own filename, never the missing model's name, and a file whose
-  name already matches something on screen is refused (shared/junctioned model folders
-  would otherwise catalogue it twice)
+  downloads and keeps its own filename, never the missing model's name, and a candidate
+  whose name already matches a model shown on screen is refused (shared/junctioned model
+  folders would otherwise catalogue it twice)
 - **Fill Lora Manager Info from HuggingFace**: From ⚙ Settings, backfill empty Lora Manager
   entries (trigger words, base model, description) for models Lora Manager already
   catalogues, identifying the HuggingFace repo by the file's SHA-256. No forced library
@@ -75,7 +75,10 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
   tokens and credentials before they're written; a muted **Model Linker** node is added so
   the shared workflow still runs with this extension not installed
 - **Load-Time Notice**: Opening a workflow with missing models can open Model Linker
-  automatically (⚙ Settings → "Open on missing models"), once per workflow
+  automatically — turn on "Open Model Linker when a loaded workflow has missing models"
+  in **ComfyUI's own Settings** (gear icon, under "Model Linker" → "Workflow loading";
+  this is separate from Model Linker's own ⚙ Settings dialog below). Off by default; the
+  notice is shown at most once per open workflow either way
 - **Auto-Resolve**: One-click resolution for all perfect matches
 - **Learned Overrides**: Your manual picks are persisted and reused automatically
 
@@ -93,8 +96,10 @@ no token is saved in Settings. Tokens are never echoed back in error messages.
   never runs for a model that already carries its own download link.
 - **🔎 Search similar** sends a filename online only when you press it for that specific
   model.
-- **Export** sends nothing by default. Pressing "Find links" in the Export dialog looks up
-  download links for models that don't have one yet, same as a background lookup.
+- **Export** looks up links the same way background lookups do, for every model in the
+  workflow that doesn't have one yet, as soon as you open the dialog — unless background
+  lookups are off (`auto_lookup` in ⚙ Settings), in which case it sends nothing until you
+  press "Find links", which asks once regardless of the setting.
 - **The Lora Manager HuggingFace fill** (⚙ Settings) sends the SHA-256 and filename of
   models Lora Manager already catalogues, to identify the matching HuggingFace repo.
 - Nothing contacts a workflow's own recorded URL during any of the above — that link is
@@ -103,9 +108,9 @@ no token is saved in Settings. Tokens are never echoed back in error messages.
 ## Downloads
 
 Model Linker makes network calls only for the features above, and only when they run:
-background lookups (unless turned off), downloads you start, 🔎 Search similar, Export's
-"Find links", and the Lora Manager HuggingFace fill. See **Privacy** above for exactly what
-each one sends.
+background lookups (unless turned off), Export's own lookups (same switch, plus "Find
+links"), downloads you start, 🔎 Search similar, and the Lora Manager HuggingFace fill.
+See **Privacy** above for exactly what each one sends.
 
 ## License
 

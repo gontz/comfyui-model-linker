@@ -52,20 +52,30 @@ requires no network call during analysis, and stays.
 ### Downloads and online lookups (reinstated 2026-10-14)
 
 - **Lookups run in the background.** `/analyze` answers from disk alone and queues each
-  missing model's lookup on a worker thread; results land later via `/lookups` polling
-  and persist in `data/lookups.json` (gitignored), keyed by `core/lookups.lookup_key()` —
-  see "Workflow Metadata" below for the key format. `auto_lookup` (⚙ Settings) turns the
-  background worker off; Export still honours it, except when the user explicitly presses
-  "Find links" in the Export dialog, which is a one-time, user-initiated request.
-- **Nothing contacts a workflow's own URL during lookup.** `core/source_chain.py` looks
-  up a model by name/hash against HuggingFace and CivitAI; a workflow-supplied
-  `properties.models[].url` is never fetched to confirm or refresh it — it is only
-  surfaced to the user as-is (see "Not to be confused with" above).
+  missing model's lookup on a worker thread; results land later via `POST /lookups`
+  polling and persist in `data/lookups.json` (gitignored), keyed by
+  `core/lookups.lookup_key()`: the model's SHA-256 when known
+  (`sha256:<hash>`), else `<canonical_category>:<lowercase basename, with extension>`
+  — and prefixed `url:<16 hex chars of sha256(workflow_url)>:` when the missing model
+  carries its own `source_url`, so one workflow's claimed link can never answer for, or
+  poison, another workflow's lookup by the same name or hash. `auto_lookup`
+  (⚙ Settings) turns the background worker off; Export's automatic lookup on open
+  honours it too (`searched: false`, nothing sent), except when the user explicitly
+  presses "Find links" in the Export dialog, a one-time, user-initiated request
+  regardless of the setting.
+- **Nothing contacts a workflow's own URL during lookup.** `core/source_chain.py`'s
+  `find_download_source()` returns a workflow-supplied `properties.models[].url`
+  as-is, before any network call, when the missing model has one — so such a model's
+  lookup never searches HuggingFace/CivitAI and never fetches the URL either; it is
+  only surfaced to the user (see "Not to be confused with" above).
 - **Similar-model search is user-initiated** (🔎 Search similar in the dialog) and runs
-  only on request. A chosen candidate downloads and keeps its own filename — never the
-  missing model's name — and `core/online_search.py` refuses any candidate whose basename
-  matches a model already shown on screen, since category folders are often junctions to
-  one shared directory and such a match would be a duplicate, not a new file.
+  only on request. `core/online_search.py` only scores and returns candidates; the
+  refusal lives in the frontend — `web/modules/downloads.js` compares a candidate's
+  basename (`candidateKey`) against every on-screen card's basename (`fileKey`,
+  regardless of category) and refuses a match, since category folders are often
+  junctions to one shared directory and such a match would catalogue a duplicate, not a
+  new file. A chosen candidate downloads and keeps its own filename — never the missing
+  model's name.
 - **Filling empty Lora Manager info from HuggingFace** is a server job started from
   ⚙ Settings (not automatic), implemented in `core/lm_backfill.py`; its last report
   persists in `data/lm-backfill.json` (gitignored). See "Lora Manager sidecars" below.
@@ -83,15 +93,18 @@ requires no network call during analysis, and stays.
 
 ### Lora Manager sidecars
 
-- **Format contract:** implemented from
-  [Lora Manager's published metadata format](https://github.com/willmiao/ComfyUI-Lora-Manager)
-  (its sidecar JSON schema, v1.2.5 at the time this was written). Lora Manager is
-  GPL-3.0; this extension is MIT, so the format is *implemented*, not copied — no code
-  was ported from it, only the documented shape (`core/lm_sidecar.py`,
+- **Format contract:** implemented from Lora Manager's sidecar JSON shape (v1.2.5 at the
+  time this was written), documented in
+  `docs/superpowers/specs/2026-10-14-upstream-parity-design.md` and validated in tests
+  against Lora Manager's own published schema when installed alongside
+  (`<LoraManagerDir>/.specs/metadata.schema.json`, read by `tests/test_lm_sidecar.py`).
+  Lora Manager is GPL-3.0; this extension is MIT, so the format is *implemented*, not
+  copied — no code was ported from it, only the documented shape (`core/lm_sidecar.py`,
   `core/civitai_meta.py`).
 - **`autov3` is OMITTED, never written as `null`,** when CivitAI has no AutoV3 hash for
-  a version. This is a deliberate deviation from the upstream spec: a `null` tells Lora
-  Manager "checked, unavailable" and stops it computing the hash itself from the
+  a version. This is a deliberate deviation from this project's own design spec (which
+  called for `null` in that case) made during implementation review: a `null` tells
+  Lora Manager "checked, unavailable" and stops it computing the hash itself from the
   safetensors header on its own next pass — omitting the key instead leaves that door
   open (`autov3_for()` in `core/lm_sidecar.py`).
 - **`file_path` uses the registered directory, not `realpath`** — the one deliberate
@@ -173,7 +186,7 @@ machine.
 
 Registered only when `requests` imports (`core/routes_downloads.py`,
 `core/routes_export.py` — see "Downloads and online lookups" above):
-- `GET /lookups`, `POST /lookups/refresh`
+- `POST /lookups`, `POST /lookups/refresh`
 - `POST /download`, `GET /progress`, `GET /progress/{download_id}`,
   `POST /cancel/{download_id}`
 - `POST /search` — user-initiated similar-model search

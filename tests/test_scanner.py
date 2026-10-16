@@ -47,6 +47,7 @@ class ExtensionFilterTests(LibraryTestCase):
     def test_non_model_categories_are_skipped(self):
         self.add_models('configs', ['something.safetensors'])
         self.add_models('custom_nodes', ['other.safetensors'])
+        self.add_models('datasets', ['another.safetensors'])
         self.assertEqual(get_model_files(), [])
 
 

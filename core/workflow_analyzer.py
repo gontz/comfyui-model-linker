@@ -10,6 +10,7 @@ from typing import List, Dict, Any, Optional
 
 from .node_adapters import get_adapter
 from .node_schema import get_model_widget_categories, get_widget_category
+from .scanner import NON_MODEL_CATEGORIES
 
 # Import folder_paths lazily - it may not be available until ComfyUI is initialized
 try:
@@ -152,9 +153,9 @@ def try_resolve_model_path(value: str, categories: List[str] = None) -> Optional
     if categories is None:
         categories = list(folder_paths.folder_names_and_paths.keys())
     
-    # Skip non-model categories
-    skip_categories = {'custom_nodes', 'configs'}
-    categories = [c for c in categories if c not in skip_categories]
+    # Skip non-model categories - the same set core/scanner.py and
+    # core/downloader.py use, so the three can't drift apart.
+    categories = [c for c in categories if c not in NON_MODEL_CATEGORIES]
     
     for category in categories:
         try:

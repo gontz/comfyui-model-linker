@@ -273,20 +273,46 @@ def _rename_no_clobber(src: str, dst: str) -> None:
     in the gap between the last existence check and now.
 
     `os.replace` overwrites unconditionally on every platform, which is
-    exactly what must never happen here, so it is never used for this last
-    step. `os.rename` raises `FileExistsError` on Windows when the
-    destination exists; POSIX `rename` would silently replace it instead, so
-    POSIX takes a hardlink-then-unlink, which raises the same error from
-    `os.link` when the destination exists and never touches it otherwise.
+    exactly what must never happen here, so it is never used to land on an
+    existing destination. `os.rename` raises `FileExistsError` on Windows
+    when the destination exists. POSIX `rename` would silently replace it
+    instead, so POSIX takes a hardlink first - which raises that same error
+    from `os.link` when the destination exists - and only unlinks `src`
+    once the link has landed.
+
+    Not every filesystem supports hard links (FAT/exFAT, some SMB/NFS/FUSE
+    mounts): there `os.link` raises some other `OSError` (`EPERM`,
+    `ENOTSUP`, ...) even though the transfer completed cleanly and `src`
+    holds the whole file. For that case, the name is reserved exclusively
+    with `O_CREAT | O_EXCL` first - which itself raises `FileExistsError` if
+    someone beat us to it - and only then does `os.replace` land the file
+    over that placeholder, which cannot clobber anyone else's file because
+    this call already holds the name. If that replace still fails for some
+    other reason, the placeholder is removed so no empty model-named file is
+    ever left behind.
     """
+    name = os.path.basename(dst)
     try:
         if sys.platform == 'win32':
             os.rename(src, dst)
-        else:
+            return
+        try:
             os.link(src, dst)
-            os.unlink(src)
+        except FileExistsError:
+            raise
+        except OSError:
+            os.close(os.open(dst, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            try:
+                os.replace(src, dst)
+            except OSError:
+                _remove(dst)
+                raise
+            return
+        os.unlink(src)
     except FileExistsError:
-        raise DownloadError(f'{os.path.basename(dst)} appeared during the download; not overwritten')
+        raise DownloadError(f'{name} appeared during the download; not overwritten')
+    except OSError as e:
+        raise DownloadError(f'Could not save {name}: {e}')
 
 
 def _check_disk(directory: str, size: Optional[int]) -> None:
@@ -336,10 +362,13 @@ def _stream(download_id: str, job: Dict[str, Any]) -> str:
     try:
         # requests drops Authorization when a redirect leaves the host
         with requests.get(url, headers=headers, stream=True, timeout=30, allow_redirects=True) as response:
-            # A redirect can leave https entirely (http, or something else);
-            # refused before a single byte is written.
+            # A redirect can leave https entirely (http, or something else),
+            # for the final URL or for any hop along the way - refused
+            # before a single byte is written either way.
             final_url = getattr(response, 'url', None) or url
-            if urlparse(final_url).scheme != 'https':
+            history = getattr(response, 'history', None) or ()
+            insecure_hop = any(urlparse(getattr(hop, 'url', '') or '').scheme != 'https' for hop in history)
+            if urlparse(final_url).scheme != 'https' or insecure_hop:
                 raise DownloadError('The download redirected away from https')
             if response.status_code in (401, 403):
                 raise DownloadError(_auth_message(provider, bool(headers), response.status_code),
@@ -375,8 +404,14 @@ def _stream(download_id: str, job: Dict[str, Any]) -> str:
 
         sha256 = digest.hexdigest()
         if job.get('expected_sha256') and sha256 != job['expected_sha256']:
-            removed = _remove(part)
-            raise DownloadError(_deleted_or_not(removed, 'The downloaded file does not match the expected hash'))
+            # Not claiming "...and was deleted" here: the only cleanup of
+            # `part` on this path is the `finally` below, and claiming an
+            # outcome before it has run (or retried) would risk saying
+            # "deleted" when the first attempt failed, or "could not be
+            # removed" when a later retry inside `finally` actually
+            # succeeded. Making no claim is the one phrasing that's always
+            # true.
+            raise DownloadError('The downloaded file does not match the expected hash')
 
         _rename_no_clobber(part, dest)
         return sha256
@@ -409,10 +444,11 @@ def _run_hf(download_id: str, job: Dict[str, Any], engine) -> str:
     hf.download_hf_model(parsed['repo'], parsed['filename'], os.path.dirname(dest),
                          os.path.basename(dest), download_id,
                          revision=parsed.get('branch', 'main'), display_url=job['url'])
-    # The engine updates the record in place (Task 5), so `path` - which the
-    # duplicate-download guard in start_download relies on - survived the run.
-    # Re-assert what this module owns in case an older engine replaced it.
-    _set(download_id, category=job['category'], path=dest)
+    # The engine updates the record in place (Task 5), so `identity` - which
+    # the duplicate-download guard in start_download now keys on - survived
+    # the run. Re-assert what this module owns in case an older engine
+    # replaced it.
+    _set(download_id, category=job['category'], path=dest, identity=_identity(dest))
     record = get_progress(download_id)
     if record.get('status') == 'cancelled':
         raise _Cancelled()

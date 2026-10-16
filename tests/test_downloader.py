@@ -3,6 +3,7 @@ Downloads: where files may land, what is sent where, and that nothing
 model-named is left behind by a failure.
 """
 
+import errno
 import hashlib
 import os
 import queue
@@ -22,7 +23,7 @@ BODY = b'model weights' * 1000
 
 
 class FakeResponse:
-    def __init__(self, body=BODY, status_code=200, length=None, url=None):
+    def __init__(self, body=BODY, status_code=200, length=None, url=None, history=None):
         self.body = body
         self.status_code = status_code
         self.headers = {'content-length': str(len(body) if length is None else length)}
@@ -30,6 +31,10 @@ class FakeResponse:
         # fill in the URL that was actually requested (the common case);
         # a test exercising a redirect away from https sets this explicitly.
         self.url = url
+        # Each hop's own response, as `requests` would populate `.history`;
+        # a test exercising an insecure intermediate hop passes a list of
+        # simple objects exposing just the `.url` the check reads.
+        self.history = history or []
 
     def __enter__(self):
         return self
@@ -239,11 +244,87 @@ class TransferTests(DownloaderTestCase):
         self.assertFalse(os.path.exists(dest))
         self.assertFalse(os.path.exists(dest + '.part'))
 
+    def test_hash_mismatch_never_names_the_file(self):          # item 3
+        dest = os.path.join(self.loras, 'new.safetensors')
+        named, real = [], {n: getattr(os, n) for n in ('replace', 'rename', 'link')}
+        def spy(name):
+            def f(src, dst, *a, **k):
+                named.append(dst)
+                return real[name](src, dst, *a, **k)
+            return f
+        self.respond(FakeResponse())
+        with mock.patch.object(os, 'replace', spy('replace')), \
+                mock.patch.object(os, 'rename', spy('rename')), \
+                mock.patch.object(os, 'link', spy('link')):
+            record = self.run_download(expected_sha256='00' * 32)
+        self.assertEqual(record['status'], 'error')
+        self.assertNotIn(dest, named)
+
+    def test_rename_no_clobber_both_branches(self):              # item 6, unit
+        for platform in ('win32', 'linux'):
+            src = os.path.join(self.loras, 'src.part')
+            dst = os.path.join(self.loras, 'dst.safetensors')
+            for p, body in ((src, b'ours'), (dst, b'theirs')):
+                with open(p, 'wb') as h:
+                    h.write(body)
+            with mock.patch.object(downloader.sys, 'platform', platform):
+                with self.assertRaises(downloader.DownloadError, msg=platform):
+                    downloader._rename_no_clobber(src, dst)
+            with open(dst, 'rb') as h:
+                self.assertEqual(h.read(), b'theirs', platform)
+            self.assertTrue(os.path.exists(src), platform)
+            os.remove(src); os.remove(dst)
+
     def test_refuses_a_redirect_to_non_https(self):
         self.respond(FakeResponse(url='http://evil.example/redirected'))
         record = self.run_download()
         self.assertEqual(record['status'], 'error')
         self.assertEqual(os.listdir(self.loras), [])
+
+    def test_refuses_an_insecure_hop_even_if_the_final_url_is_https(self):
+        # The final URL can be https while an earlier hop in the redirect
+        # chain was not - still a point where the token (and now the whole
+        # transfer) could have gone over an insecure connection.
+        hop = mock.Mock(url='http://civitai.com/redirected-through-here')
+        self.respond(FakeResponse(history=[hop]))
+        record = self.run_download()
+        self.assertEqual(record['status'], 'error')
+        self.assertEqual(os.listdir(self.loras), [])
+
+    def test_posix_without_hardlinks_still_completes(self):
+        # Not every filesystem supports hard links (FAT/exFAT, some
+        # SMB/NFS/FUSE mounts) - os.link raises some other OSError there,
+        # not FileExistsError, even though the transfer itself is fine.
+        self.respond(FakeResponse())
+        with mock.patch.object(downloader.sys, 'platform', 'linux'), \
+                mock.patch.object(os, 'link', side_effect=PermissionError(errno.EPERM, 'x')):
+            record = self.run_download()
+        self.assertEqual(record['status'], 'completed')
+        with open(os.path.join(self.loras, 'new.safetensors'), 'rb') as handle:
+            self.assertEqual(handle.read(), BODY)
+
+    def test_posix_without_hardlinks_never_overwrites(self):
+        # Same no-hardlink setup, but the destination appears mid-transfer -
+        # the O_CREAT|O_EXCL fallback must refuse exactly like the normal
+        # os.link path does, not silently replace it.
+        dest = os.path.join(self.loras, 'new.safetensors')
+
+        class Racing(FakeResponse):
+            def iter_content(self, size):
+                for i, chunk in enumerate(super().iter_content(size)):
+                    if i == 1:
+                        with open(dest, 'wb') as handle:
+                            handle.write(b'theirs')
+                    yield chunk
+
+        self.respond(Racing())
+        with mock.patch.object(downloader.sys, 'platform', 'linux'), \
+                mock.patch.object(os, 'link', side_effect=PermissionError(errno.EPERM, 'x')):
+            record = self.run_download()
+        self.assertEqual(record['status'], 'error')
+        with open(dest, 'rb') as handle:
+            self.assertEqual(handle.read(), b'theirs')
+        self.assertFalse(os.path.exists(dest + '.part'))
 
     def test_rejected_login_names_the_provider(self):
         self.respond(FakeResponse(status_code=401))
@@ -275,6 +356,21 @@ class TransferTests(DownloaderTestCase):
         self.assertEqual(downloader.get_progress(download_id)['status'], 'cancelled')
         self.assertEqual(self.sent, [])
 
+    def test_cancel_between_dequeue_and_start_is_kept(self):    # item 5
+        dest = os.path.join(self.loras, 'new.safetensors')
+        self.respond(FakeResponse())
+        box, real = {}, downloader._check_disk
+        def cancelling(directory, size):
+            if 'done' not in box:
+                box['done'] = True
+                downloader.cancel_download(box['id'])
+            return real(directory, size)
+        box['id'] = downloader.start_download('https://civitai.com/api/download/models/1', 'loras', 'new.safetensors')
+        with mock.patch.object(downloader, '_check_disk', cancelling):
+            downloader._run(box['id'])
+        self.assertEqual(downloader.get_progress(box['id'])['status'], 'cancelled')
+        self.assertFalse(os.path.exists(dest))
+
     def test_cancel_during_transfer_removes_the_part(self):
         dest = os.path.join(self.loras, 'cancelme.safetensors')
         download_id_box = {}
@@ -295,6 +391,24 @@ class TransferTests(DownloaderTestCase):
         self.assertFalse(os.path.exists(dest))
         self.assertFalse(os.path.exists(dest + '.part'))
         self.assertNotIn(download_id, downloader.cancelled_downloads)
+
+    def test_file_appearing_after_the_last_check_is_kept(self):  # item 6, integration
+        dest = os.path.join(self.loras, 'new.safetensors')
+        real_exists = os.path.exists
+        self.respond(FakeResponse())
+        download_id = downloader.start_download('https://civitai.com/api/download/models/1', 'loras', 'new.safetensors')
+        with open(dest, 'wb') as h:
+            h.write(b'theirs')
+        with mock.patch.object(os.path, 'exists', lambda p: False if p == dest else real_exists(p)):
+            downloader._run(download_id)
+        self.assertEqual(downloader.get_progress(download_id)['status'], 'error')
+        with open(dest, 'rb') as h:
+            self.assertEqual(h.read(), b'theirs')
+
+    def test_missing_category_folder_with_unknown_size(self):    # item 9
+        os.rmdir(self.loras)
+        self.respond(FakeResponse(length=0))
+        self.assertEqual(self.run_download()['status'], 'completed')
 
     def test_completion_hook_receives_the_record(self):
         seen = threading.Event()

@@ -18,7 +18,7 @@ try:
 except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
-from core import civitai_meta, lm_sidecar
+from core import civitai_meta, downloader, lm_sidecar
 
 SHA = 'ab' * 32
 LM_REQUIRED = ('file_name', 'model_name', 'file_path', 'size', 'modified', 'sha256', 'base_model', 'preview_url')
@@ -95,6 +95,29 @@ class FormatTests(SidecarTestCase):
         unmatched = dict(VERSION, files=[])
         self.assertNotIn('autov3', lm_sidecar.build_sidecar(self.model, 'loras', SHA, unmatched))
         self.assertNotIn('autov3', lm_sidecar.build_sidecar(self.model, 'loras', SHA, None))
+
+    def test_tolerates_malformed_civitai_shapes(self):
+        """
+        A non-dict files[] entry, a non-dict hashes, or a non-dict
+        version['model'] must be skipped or ignored, never raised - CivitAI
+        is a third party, and a shape it hands back in some edge case is not
+        a reason to lose the whole sidecar.
+        """
+        odd_version = dict(
+            VERSION,
+            model='not an object',
+            files=[
+                'not an object either',
+                {'name': 'x.safetensors', 'hashes': 'also not an object'},
+                {'name': 'rebel.safetensors', 'hashes': {'SHA256': SHA.upper(), 'AutoV3': 'AABBCCDDEEFF'}},
+            ],
+        )
+        data = lm_sidecar.build_sidecar(self.model, 'loras', SHA, odd_version)
+        self.assertEqual(data['model_name'], 'rebel')  # falls back to the file's own stem
+        self.assertEqual(data['tags'], [])
+        self.assertEqual(data['modelDescription'], '')
+        # The well-shaped third entry is still reachable past the two junk ones.
+        self.assertEqual(data['autov3'], 'aabbccddeeff')
 
     def test_unknown_to_civitai(self):
         data = lm_sidecar.build_sidecar(self.model, 'loras', SHA, None)
@@ -234,6 +257,44 @@ class WriteTests(SidecarTestCase):
         self.assertEqual(data['preview_url'], '')
         self.assertEqual(data['preview_nsfw_level'], 0)
 
+    def test_a_real_landing_failure_propagates_instead_of_reporting_exists(self):
+        """
+        _land_file must only treat an actual collision (DestinationExists)
+        as the benign 'exists' outcome. A real failure landing the sidecar -
+        a permissions problem, an antivirus lock, anything else
+        _rename_no_clobber can raise - must propagate, so the download
+        pipeline's own hook-exception handling records it as the failure it
+        is instead of a falsely reassuring 'exists'.
+        """
+        with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=None), \
+             mock.patch.object(downloader, '_rename_no_clobber',
+                               side_effect=downloader.DownloadError('Could not save rebel.metadata.json: '
+                                                                     '[WinError 32] file is in use')):
+            with self.assertRaises(downloader.DownloadError):
+                lm_sidecar.write_sidecar(self.model, 'loras', SHA)
+        # Nothing was left behind by the failed attempt.
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'rebel.metadata.json')))
+        self.assertEqual([f for f in os.listdir(self.root) if f.endswith('.tmp')], [])
+
+    def test_records_a_preview_that_appeared_after_losing_the_landing_race(self):
+        """
+        download_preview losing its own landing race doesn't mean there is
+        no preview now - it means someone else's (another download's, or
+        Lora Manager's own) is already sitting there. The sidecar must
+        record that file, not an empty preview_url.
+        """
+        def fake_download_preview(model_path, image):
+            path = os.path.splitext(model_path)[0] + '.jpeg'
+            with open(path, 'wb') as handle:
+                handle.write(b'already landed by someone else')
+            return ''  # as if _land_file lost the race
+
+        with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=VERSION), \
+             mock.patch.object(lm_sidecar, 'download_preview', side_effect=fake_download_preview):
+            self.assertEqual(lm_sidecar.write_sidecar(self.model, 'loras', SHA), 'written')
+        data = self.read()
+        self.assertTrue(data['preview_url'].endswith('/rebel.jpeg'))
+
 
 class LoraManagerSettingsTests(unittest.TestCase):
     """settings.json is found where Lora Manager itself looks for it."""
@@ -308,6 +369,15 @@ class CivitaiMetaNetworkTests(unittest.TestCase):
         with mock.patch('requests.get', return_value=FakeJsonResponse(404)):
             self.assertIsNone(civitai_meta.version_for_sha256(SHA))
 
+    def test_never_queries_for_the_empty_file_hash(self):
+        """A file that failed to read can hash to the SHA-256 of zero bytes.
+        That is never a real file CivitAI could usefully answer for, so no
+        request is made at all - checked case-insensitively, since the
+        downloader always lowercases hashes but nothing enforces that here."""
+        with mock.patch('requests.get') as get:
+            self.assertIsNone(civitai_meta.version_for_sha256(civitai_meta.EMPTY_FILE_SHA256.upper()))
+        get.assert_not_called()
+
     def test_other_non_200_raises_unavailable(self):
         with mock.patch('requests.get', return_value=FakeJsonResponse(500)):
             with self.assertRaises(civitai_meta.CivitaiUnavailable):
@@ -363,6 +433,13 @@ class PreviewDownloadTests(SidecarTestCase):
     def test_refuses_a_malformed_url_without_raising(self):
         self.assertEqual(lm_sidecar.download_preview(self.model, {'url': 'https://[invalid/1.jpeg'}), '')
 
+    def test_a_failure_creating_the_temp_file_returns_empty_string(self):
+        """mkstemp itself (a permissions problem, a full disk) is still just
+        a failure to download a preview - the documented 'returns "" on any
+        failure' contract, not an exception out of this function."""
+        with mock.patch.object(lm_sidecar.tempfile, 'mkstemp', side_effect=OSError('disk full')):
+            self.assertEqual(lm_sidecar.download_preview(self.model, {'url': self.URL}), '')
+
     def test_refuses_a_redirect_to_another_host(self):
         with mock.patch('requests.get',
                         return_value=self._FakeStream(url='https://evil.example/1.jpeg')):
@@ -396,6 +473,30 @@ class PreviewDownloadTests(SidecarTestCase):
         with open(dest, 'rb') as handle:
             self.assertEqual(handle.read(), b'already here')
         self.assertEqual([f for f in os.listdir(self.root) if f.endswith('.tmp')], [])
+
+
+class ApplyUmaskTests(unittest.TestCase):
+    """
+    `mkstemp` always creates 0600, ignoring the umask. `_apply_umask` must
+    bring a landed file back to a normal write's permissions on POSIX, and
+    do nothing on Windows (which has no such bits). Exercised by mocking
+    `os.name`/`os.chmod` rather than real filesystem permissions, since this
+    machine is Windows - cheap, and it is `_apply_umask`'s own arithmetic
+    being checked, not the OS's.
+    """
+
+    def test_computes_mode_from_the_process_umask_on_posix(self):
+        with mock.patch.object(lm_sidecar.os, 'name', 'posix'), \
+             mock.patch.object(lm_sidecar, '_UMASK', 0o022), \
+             mock.patch.object(lm_sidecar.os, 'chmod') as chmod:
+            lm_sidecar._apply_umask('/some/tmp/file')
+        chmod.assert_called_once_with('/some/tmp/file', 0o644)
+
+    def test_is_a_no_op_on_windows(self):
+        with mock.patch.object(lm_sidecar.os, 'name', 'nt'), \
+             mock.patch.object(lm_sidecar.os, 'chmod') as chmod:
+            lm_sidecar._apply_umask('/some/tmp/file')
+        chmod.assert_not_called()
 
 
 class NotifyLoraManagerTests(unittest.TestCase):

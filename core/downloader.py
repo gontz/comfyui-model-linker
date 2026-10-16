@@ -65,6 +65,15 @@ class DownloadError(Exception):
         self.auth_required = auth_required
 
 
+class DestinationExists(DownloadError):
+    """
+    `_rename_no_clobber` found the destination already taken - not a failure
+    to land, so a caller that treats "someone already has this name" as a
+    benign outcome (rather than a real error) can catch this subclass alone
+    and let every other `DownloadError` propagate as the failure it is.
+    """
+
+
 class _Cancelled(Exception):
     pass
 
@@ -311,7 +320,7 @@ def _rename_no_clobber(src: str, dst: str) -> None:
             return
         os.unlink(src)
     except FileExistsError:
-        raise DownloadError(f'{name} appeared during the download; not overwritten')
+        raise DestinationExists(f'{name} appeared during the download; not overwritten')
     except OSError as e:
         raise DownloadError(f'Could not save {name}: {e}')
 

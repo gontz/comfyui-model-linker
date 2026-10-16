@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 API = 'https://civitai.com/api/v1'
 _LICENCE_FIELDS = ('allowNoCredit', 'allowCommercialUse', 'allowDerivatives', 'allowDifferentLicense')
 
+# SHA-256 of zero bytes. A file that failed to read, or a broken export
+# tool, can leave this in place of a real hash; asking CivitAI by-hash for
+# it would describe whichever unrelated upload happens to collide on that
+# same placeholder, not this file, so it is never looked up at all.
+EMPTY_FILE_SHA256 = 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+
 
 class CivitaiUnavailable(Exception):
     """CivitAI could not be asked - unlike None, which means it does not know the file."""
@@ -72,6 +78,8 @@ def strip_comfy_metadata(version: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def version_for_sha256(sha256: str) -> Optional[Dict[str, Any]]:
+    if sha256.lower() == EMPTY_FILE_SHA256:
+        return None
     version = _get_json(f'{API}/model-versions/by-hash/{sha256.lower()}')
     if not version or not version.get('id'):
         return None

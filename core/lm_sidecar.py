@@ -25,6 +25,18 @@ _EXTENSION_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _LORA_MANAGER_APP = 'ComfyUI-LoRA-Manager'
 _LORA_MANAGER_FOLDER = 'comfyui-lora-manager'
 
+# `mkstemp` always creates its file 0600, regardless of the process umask -
+# deliberately, since it is meant for secrets. A landed model sidecar/preview
+# is not a secret, so it should come out at the permissions a normal write
+# would have produced. Read once at import time, the same safe way the stdlib
+# docs describe (`os.umask` sets as a side effect of reading, so the previous
+# value is restored immediately): not applicable on Windows, which has no
+# umask concept at all.
+_UMASK = 0
+if os.name != 'nt':
+    _UMASK = os.umask(0)
+    os.umask(_UMASK)
+
 
 def _discover_lora_manager_dir() -> str:
     """
@@ -122,12 +134,18 @@ def sidecar_path(model_path: str) -> str:
 
 def autov3_for(version: Dict[str, Any], sha256: str) -> Optional[str]:
     for entry in version.get('files') or []:
-        hashes = entry.get('hashes') or {}
+        if not isinstance(entry, dict):
+            continue
+        hashes = entry.get('hashes')
+        if not isinstance(hashes, dict):
+            continue
         if str(hashes.get('SHA256', '')).lower() == sha256.lower():
             value = hashes.get('AutoV3')
-            # e3b0c44298fc is the SHA-256 of zero bytes, truncated - not a
-            # real file's hash, however it got into this field.
-            if isinstance(value, str) and len(value) >= 12 and value[:12].lower() != 'e3b0c44298fc':
+            # Truncated to AutoV3's 12 hex characters, this is the same
+            # zero-byte placeholder civitai_meta.EMPTY_FILE_SHA256 guards
+            # against above - not a real file's hash, however it got here.
+            if (isinstance(value, str) and len(value) >= 12
+                    and value[:12].lower() != civitai_meta.EMPTY_FILE_SHA256[:12]):
                 return value[:12].lower()
             return None
     return None
@@ -138,7 +156,11 @@ def build_sidecar(model_path: str, category: str, sha256: str,
                   preview_nsfw_level: int = 0, now: Optional[float] = None) -> Dict[str, Any]:
     now = float(time.time() if now is None else now)
     stem = os.path.splitext(os.path.basename(model_path))[0]
-    model_info = (version or {}).get('model') or {}
+    # CivitAI's own shape, not ours to trust: a by-hash answer with no
+    # matching model (or one that simply varies) can carry 'model' as
+    # something other than an object.
+    model_info = (version or {}).get('model')
+    model_info = model_info if isinstance(model_info, dict) else {}
     data: Dict[str, Any] = {
         'file_name': stem,
         'model_name': model_info.get('name') or stem,
@@ -216,24 +238,41 @@ def _is_civitai_image_url(url: str) -> bool:
 
 
 def _remove_quietly(path: str) -> None:
-    if os.path.exists(path):
+    if path and os.path.exists(path):
         try:
             os.remove(path)
         except OSError:
             pass
 
 
+def _apply_umask(tmp: str) -> None:
+    """
+    `tempfile.mkstemp` ignores the process umask and always creates 0600.
+    Bring the about-to-be-landed file back to what a plain `open()` write
+    would have produced, so a model's sidecar/preview isn't quietly less
+    readable than the model file itself. Windows has no umask bits to
+    apply, so this is a no-op there.
+    """
+    if os.name != 'nt':
+        try:
+            os.chmod(tmp, 0o666 & ~_UMASK)
+        except OSError:
+            pass
+
+
 def _land_file(tmp: str, dest: str) -> bool:
     """
-    Move `tmp` onto `dest`, never clobbering a file someone else created
-    there since the caller last checked - Lora Manager's own scan, or
-    another download, can both land the same name. True once landed; False
-    (the caller removes `tmp`) on that collision.
+    Move `tmp` onto `dest`. True once landed. False only when `dest` was
+    already taken (`downloader.DestinationExists`) - Lora Manager's own
+    scan, or another download, got there first, which is not a failure to
+    report. Any other failure (a permissions problem, an antivirus lock,
+    ...) propagates instead of being folded into that same "someone else
+    has it" outcome, so a real failure surfaces as one.
     """
     try:
         downloader._rename_no_clobber(tmp, dest)
         return True
-    except downloader.DownloadError:
+    except downloader.DestinationExists:
         return False
 
 
@@ -247,9 +286,13 @@ def download_preview(model_path: str, image: Dict[str, Any]) -> str:
     if ext not in _SAVEABLE_PREVIEW:
         return ''
     dest = os.path.splitext(model_path)[0] + ext
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest) or '.', prefix='.model-linker-', suffix='.tmp')
-    os.close(fd)
+    tmp = None
     try:
+        # mkstemp itself - a permissions problem, a full disk - is a failure
+        # like any other here, so it sits inside the same try as everything
+        # else this function documents as "returns '' on any failure".
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(dest) or '.', prefix='.model-linker-', suffix='.tmp')
+        os.close(fd)
         with requests.get(url, stream=True, timeout=30, allow_redirects=True) as response:
             # A redirect can leave CivitAI's own host, or https, entirely -
             # for the final URL or for any hop along the way - refused
@@ -268,6 +311,7 @@ def download_preview(model_path: str, image: Dict[str, Any]) -> str:
                     if size > MAX_PREVIEW_BYTES:
                         raise ValueError('preview too large')
                     handle.write(chunk)
+        _apply_umask(tmp)
         return dest if _land_file(tmp, dest) else ''
     except Exception as e:
         logger.debug(f"Model Linker: preview download failed: {e}")
@@ -343,6 +387,7 @@ def _write_sidecar_file(path: str, data: Dict[str, Any]) -> bool:
     try:
         with open(tmp, 'w', encoding='utf-8') as handle:
             json.dump(data, handle, indent=2, ensure_ascii=False)
+        _apply_umask(tmp)
         return _land_file(tmp, path)
     finally:
         _remove_quietly(tmp)
@@ -396,7 +441,15 @@ def write_sidecar(model_path: str, category: str, sha256: str, fetch_if_unknown:
         image = pick_preview(version)
         if image:
             preview = download_preview(model_path, image)
-            nsfw = _safe_int(image.get('nsfwLevel'), 0) if preview else 0
+            if preview:
+                nsfw = _safe_int(image.get('nsfwLevel'), 0)
+            else:
+                # Losing the landing race (another download, or Lora
+                # Manager itself) doesn't mean there is no preview now - it
+                # means someone else's is already there. Record that one
+                # rather than leaving preview_url empty next to a model that
+                # in fact has an image.
+                preview = existing_preview(model_path) or ''
 
     data = build_sidecar(model_path, category, sha256, version, preview, nsfw)
     if not _write_sidecar_file(path, data):

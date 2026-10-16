@@ -12,6 +12,25 @@
 
 **Requires Plan A** — specifically `core/settings.py` (`get_token`, `provider_for_url`, `auth_headers_for_url`, `get_option('auto_lookup')`), `isPerfectMatch` in `web/modules/util.js`, the `category_mismatch` match field, `asyncio` in `__init__.py`, and the dialog's ⚙ Settings button.
 
+## Revisions (2026-10-16)
+
+Review against the current code, bec5c80 and Lora Manager v1.2.5. Every code block below was re-run in a scratch copy (Plan A settings + this plan) before these edits were accepted.
+
+- Task 1: civarchive no longer caches `None` when the request itself failed (new Step 6, test `test_a_failed_request_is_not_cached`).
+- Task 3: `lookups._find` drops the sources' in-process caches for the request first, so "Search again" and the 24 h expiry really ask again (test in `test_source_chain.py`).
+- Task 3: download-route registration catches every exception (logged), so a bug there can no longer take `/analyze` down with it.
+- Task 3: `lookup_key` deliberately keeps the lowercase *basename*, not the spec's normalized name: normalization drops the extension, which would make `x.gguf` and `x.safetensors` share one download.
+- Task 4: `resolve_destination` rejects `:` in the raw name — on Windows `basename('C:evil.safetensors')` is `evil.safetensors`, so the old check never fired.
+- Task 4: `_stream` refuses to rename over a file that appeared mid-download (test `test_file_appearing_mid_download_is_not_overwritten`); `DownloaderTestCase` redirects `overrides._data_dir`.
+- Task 4: `_hf_engine_for` imports through `importlib`, so the "library missing" fallback test no longer depends on test order.
+- Task 5: the port is no longer "no edits": the engine must update the shared record in place (it replaced it, dropping `path`, which blinded the duplicate-download guard) and must not rename over an existing file. New `RecordTests`.
+- Task 6: Lora Manager's `settings.json` is located the way Lora Manager does (`LORA_MANAGER_SETTINGS_DIR` → portable flag → per-user config folder); `write_sidecar` gains `fetch_if_unknown`; the scan after a download is scoped to the model's root; the never-matching `hunyuan video` mapping is dropped.
+- Task 7/8: `data-ml-slot` and block ids are escaped; block lookup uses `CSS.escape`.
+- Task 9: `lm_api.base_models()` reads `{"success", "data": {"models": [...]}}` (the old code returned `['success', 'data']`); `hydrate_huggingface` turns a cross-drive `relpath` `ValueError` into `LoraManagerUnavailable`; `scan` takes an optional root.
+- Task 9: `hf_identify.clear_cache()` runs at the start of every backfill; `candidates()` skips `exclude` / `skip_metadata_refresh` models; AI enrichment failure is recorded as `ai_error` and no longer fails the run.
+- Task 9: `lm_backfill.start(use_ai, limit)` and the start route take a `limit`; Step 11 now runs a 5-model sample first and stops for the user, as the hand-off requires.
+- Task 9 Step 7 is now code: HuggingFace downloads are written with `fetch_if_unknown=False`, then linked and hydrated.
+
 ## Global Constraints
 
 - Port upstream with `git show bec5c80:<path> > <path>`; fallback for a clone without that object: `gh api "repos/kianxyzw/comfyui-model-linker/contents/<path>?ref=bec5c80" -H "Accept: application/vnd.github.raw" > <path>`. Never add a remote, merge or rebase.
@@ -205,6 +224,17 @@ class CivArchiveTests(unittest.TestCase):
         self.assertIsNone(civarchive.lookup_by_sha256('not-a-hash'))
         self.assertIsNone(civarchive.lookup_by_sha256('0' * 64))
         self.assertEqual(calls, [])
+
+    def test_a_failed_request_is_not_cached(self):
+        # An outage is not an answer: the next lookup must ask again
+        def down(url, **kw):
+            raise civarchive.requests.ConnectionError('down')
+        civarchive.requests.get = down
+        self.assertIsNone(civarchive.lookup_by_sha256(SHA))
+        self.assertNotIn(SHA, civarchive._cache)
+        civarchive.requests.get = lambda url, **kw: FakeResponse(503, {})
+        self.assertIsNone(civarchive.lookup_by_sha256(SHA))
+        self.assertNotIn(SHA, civarchive._cache)
 ```
 
 - [ ] **Step 3: Run to verify they fail**
@@ -244,12 +274,32 @@ with
     parsed = urlparse(url)
 ```
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 6: Do not cache a CivArchive request that failed**
+
+Upstream caches `None` even when `_get` returned nothing (connection error, exhausted 429) or the server errored, so one outage hides a model until ComfyUI restarts. In `core/sources/civarchive.py`, in `lookup_by_sha256`, replace
+
+```python
+    result = None
+    response = _get(API_URL.format(sha256=sha256))
+    if response is not None and response.status_code == 200:
+```
+
+with
+
+```python
+    result = None
+    response = _get(API_URL.format(sha256=sha256))
+    if response is None or response.status_code not in (200, 404):
+        return None  # no answer, only a failure - ask again next time
+    if response.status_code == 200:
+```
+
+- [ ] **Step 7: Run the tests**
 
 Run: `python -m unittest discover -t . -s tests -p "test_sources.py" -v`
 Expected: PASS. If `test_precision_and_quant_tokens` fails on one token, check whether that token is in `_VARIANT_TOKENS` or matched by `_VARIANT_TOKEN_RE` (`core/matcher.py:110-122`) — adjust the **test** only if the matcher intentionally excludes it, and say so in the commit message.
 
-- [ ] **Step 7: Record the provenance of the data files**
+- [ ] **Step 8: Record the provenance of the data files**
 
 Append to `NOTICE.md`:
 
@@ -266,7 +316,7 @@ Ported from kianxyzw/comfyui-model-linker (MIT, commit `bec5c80`):
   `core/settings.py` — ported and modified; see each file's history.
 ```
 
-- [ ] **Step 8: Run the whole suite and commit**
+- [ ] **Step 9: Run the whole suite and commit**
 
 Run: `python tests/run.py` — expected: all pass.
 
@@ -409,12 +459,13 @@ git commit -m "Port the source chain; never contact a workflow's URL during look
 **Files:**
 - Create: `core/lookups.py`, `core/routes_downloads.py`
 - Modify: `__init__.py` (guarded registration; `/analyze` attaches lookups)
-- Test: `tests/test_lookups.py` (new)
+- Test: `tests/test_lookups.py` (new), `tests/test_source_chain.py` (append; it needs `requests`)
 
 **Interfaces:**
 - Consumes: `source_chain.find_download_source(...)`, `settings.get_option('auto_lookup')`, `overrides._data_dir()`, `categories.canonical_category`.
 - Produces:
-  - `lookups.lookup_key(missing: dict) -> str` — `'sha256:<hex>'` or `'<canonical category>:<lowercase basename>'`.
+  - `lookups.lookup_key(missing: dict) -> str` — `'sha256:<hex>'` or `'<canonical category>:<lowercase basename>'`. (The spec says "normalized name"; the basename is kept on purpose — normalizing drops the extension, so `x.gguf` and `x.safetensors` would share one answer, and a lookup is an exact-filename search.)
+  - The background lookup (`lookups._find`) first drops this request's entries from the sources' in-process caches (`huggingface._search_cache`, `civitai._search_cache`, `civarchive._cache`): those keep misses until restart, which would turn "Search again" and the 24-hour expiry into a replay of the old miss. The persistent store is the only cache lookups rely on.
   - `lookups.attach_cached(missing_models: list) -> int` — sets on each missing model `lookup_key`, `lookup_state` (`'found' | 'not_found' | 'pending' | 'idle' | 'not_needed'`) and, when known, `download_source` (dict or None); returns how many are pending.
   - `lookups.results_for(keys: list[str]) -> {key: {'state': 'found'|'not_found'|'pending'|'unknown', 'source': dict|None}}`
   - `lookups.refresh(missing: dict) -> str` — re-queues regardless of store and of `auto_lookup` (user-initiated); returns the key.
@@ -569,10 +620,36 @@ class AttachTests(LookupTestCase):
         self.assertEqual(request['sha256'], '')
 ```
 
+Append to `tests/test_source_chain.py` (Task 2's file, which already skips without `requests`):
+
+```python
+class InProcessCacheTests(unittest.TestCase):
+    """A background lookup must really ask again, not replay an in-memory miss."""
+
+    def test_lookup_ignores_misses_cached_by_the_sources(self):
+        from core import lookups
+        from core.sources import civarchive, civitai, huggingface
+
+        huggingface._search_cache['hf_x.safetensors_exactTrue'] = None
+        civitai._search_cache['civit_x.safetensors_exactTrue'] = None
+        civarchive._cache[SHA] = None
+        seen = {}
+
+        def chain(filename, **kwargs):
+            seen['huggingface'] = 'hf_x.safetensors_exactTrue' in huggingface._search_cache
+            seen['civitai'] = 'civit_x.safetensors_exactTrue' in civitai._search_cache
+            seen['civarchive'] = SHA in civarchive._cache
+            return None
+
+        with mock.patch.object(source_chain, 'find_download_source', chain):
+            lookups._find({'filename': 'x.safetensors', 'category': 'loras', 'workflow_url': '', 'sha256': SHA})
+        self.assertEqual(seen, {'huggingface': False, 'civitai': False, 'civarchive': False})
+```
+
 - [ ] **Step 2: Run to verify they fail**
 
-Run: `python -m unittest discover -t . -s tests -p "test_lookups.py" -v`
-Expected: ERROR — `No module named 'core.lookups'`.
+Run: `python -m unittest discover -t . -s tests -p "test_lookups.py" -v` and `... -p "test_source_chain.py" -v`
+Expected: ERROR — `No module named 'core.lookups'` (both).
 
 - [ ] **Step 3: Implement `core/lookups.py`**
 
@@ -748,8 +825,23 @@ class LookupWorker:
                 self._queue.task_done()
 
 
+def _forget_source_caches(filename: str, sha256: str) -> None:
+    """
+    The ported sources memoise misses in-process until restart (HuggingFace
+    even after a 429). The store above is the cache lookups rely on, and it
+    only sends work here when it holds no valid answer - so ask afresh.
+    """
+    from .sources import civarchive, civitai, huggingface
+    for exact in (True, False):
+        huggingface._search_cache.pop(f'hf_{filename}_exact{exact}', None)
+        civitai._search_cache.pop(f'civit_{filename}_exact{exact}', None)
+    if sha256:
+        civarchive._cache.pop(sha256.lower(), None)
+
+
 def _find(request: Dict[str, str]) -> Optional[Dict[str, Any]]:
     from .source_chain import find_download_source
+    _forget_source_caches(request['filename'], request.get('sha256') or '')
     return find_download_source(
         request['filename'],
         category=request.get('category') or '',
@@ -815,7 +907,7 @@ def refresh(missing: Dict[str, Any]) -> str:
 
 - [ ] **Step 4: Run the lookup tests**
 
-Run: `python -m unittest discover -t . -s tests -p "test_lookups.py" -v`
+Run: `python -m unittest discover -t . -s tests -p "test_lookups.py" -v` and `... -p "test_source_chain.py" -v`
 Expected: PASS.
 
 - [ ] **Step 5: Add the routes and wire `/analyze`**
@@ -875,16 +967,22 @@ In `__init__.py`, inside `setup_routes`, directly after the `except ImportError`
 
 ```python
             # Downloads and online lookups need `requests`; without it the
-            # extension still relinks models from disk.
+            # extension still relinks models from disk. Any other failure in
+            # the download stack is a bug - logged in full, but it must never
+            # take relinking (/analyze, /resolve) down with it.
             try:
                 import requests  # noqa: F401
                 from .core import lookups, routes_downloads
                 routes_downloads.register(routes, web)
                 lookups_available = True
-            except ImportError as e:
+            except Exception as e:
                 lookups = None
                 lookups_available = False
-                self.logger.warning(f"Model Linker: downloads and online lookups are disabled ({e})")
+                if isinstance(e, ImportError):
+                    self.logger.warning(f"Model Linker: downloads and online lookups are disabled ({e})")
+                else:
+                    self.logger.error(f"Model Linker: downloads and online lookups failed to load: {e}",
+                                      exc_info=True)
 ```
 
 In the `/analyze` handler, after `result = await asyncio.to_thread(analyze_and_find_matches, workflow_json)`, add:
@@ -908,7 +1006,7 @@ Restart ComfyUI. Load a workflow with a missing `flux1-dev-fp8.safetensors` (a `
 - [ ] **Step 8: Commit**
 
 ```bash
-git add core/lookups.py core/routes_downloads.py __init__.py tests/test_lookups.py
+git add core/lookups.py core/routes_downloads.py __init__.py tests/test_lookups.py tests/test_source_chain.py
 git commit -m "Look up download sources in the background and remember the answers"
 ```
 
@@ -955,7 +1053,7 @@ try:
 except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
-from core import downloader, settings
+from core import downloader, overrides, settings
 from support import LibraryTestCase
 
 BODY = b'model weights' * 1000
@@ -983,9 +1081,13 @@ class DownloaderTestCase(LibraryTestCase):
         super().setUp()
         self.loras = self.add_models('loras', [], ['.safetensors'])
         self.sent = []
-        patcher = mock.patch.object(downloader, '_ensure_workers')
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        # Tokens are read from settings.json; never the developer's real one
+        data_dir = os.path.join(self.root, 'data')
+        os.makedirs(data_dir, exist_ok=True)
+        for patcher in (mock.patch.object(downloader, '_ensure_workers'),
+                        mock.patch.object(overrides, '_data_dir', lambda: data_dir)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def respond(self, response):
         def fake_get(url, headers=None, **kwargs):
@@ -1013,7 +1115,9 @@ class DestinationTests(DownloaderTestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.loras, 'escape.safetensors')))
 
     def test_rejects_drive_relative_and_hidden_names(self):
-        for name in ('C:evil.safetensors', '.hidden.safetensors', '', 'x.exe'):
+        # On Windows basename('C:evil.safetensors') is 'evil.safetensors', so
+        # the colon must be refused in the name as given
+        for name in ('C:evil.safetensors', 'a:b.safetensors', '.hidden.safetensors', '', 'x.exe'):
             with self.assertRaises(downloader.DownloadError, msg=name):
                 downloader.start_download('https://civitai.com/x', 'loras', name)
 
@@ -1049,6 +1153,24 @@ class TransferTests(DownloaderTestCase):
         record = self.run_download()
         self.assertEqual(record['status'], 'error')
         self.assertEqual(os.listdir(self.loras), [])
+
+    def test_file_appearing_mid_download_is_not_overwritten(self):
+        dest = os.path.join(self.loras, 'new.safetensors')
+
+        class Racing(FakeResponse):
+            def iter_content(self, size):
+                for i, chunk in enumerate(super().iter_content(size)):
+                    if i == 1:
+                        with open(dest, 'wb') as handle:
+                            handle.write(b'theirs')
+                    yield chunk
+
+        self.respond(Racing())
+        record = self.run_download()
+        self.assertEqual(record['status'], 'error')
+        with open(dest, 'rb') as handle:
+            self.assertEqual(handle.read(), b'theirs')
+        self.assertFalse(os.path.exists(dest + '.part'))
 
     def test_hash_mismatch_deletes_the_file(self):
         self.respond(FakeResponse())
@@ -1127,6 +1249,7 @@ and `generate_download_id` are the interface the HuggingFace engine
 """
 
 import hashlib
+import importlib
 import logging
 import os
 import queue
@@ -1205,8 +1328,12 @@ def category_directory(category: str) -> Optional[str]:
 
 def resolve_destination(category: str, filename: str) -> str:
     """Where a download may be written, or DownloadError."""
-    name = os.path.basename((filename or '').replace('\\', '/'))
-    if not name or name.startswith('.') or ':' in name:
+    # Checked on the name as given: on Windows basename('C:evil.x') is 'evil.x',
+    # so a colon would be gone before a check on the basename could see it
+    if ':' in (filename or ''):
+        raise DownloadError(f'Invalid filename: {filename!r}')
+    name = (filename or '').replace('\\', '/').rsplit('/', 1)[-1]
+    if not name or name.startswith('.'):
         raise DownloadError(f'Invalid filename: {filename!r}')
     if os.path.splitext(name)[1].lower() not in MODEL_EXTENSIONS:
         raise DownloadError(f'Not a model file: {name}')
@@ -1391,6 +1518,9 @@ def _stream(download_id: str, job: Dict[str, Any]) -> str:
             _set(download_id, downloaded=done)
         if total and done != total:
             raise DownloadError('The connection closed before the file was complete')
+        if os.path.exists(dest):
+            # Someone else put a file there meanwhile; never overwrite it
+            raise DownloadError(f'{os.path.basename(dest)} appeared during the download; not overwritten')
         os.replace(part, dest)
         return digest.hexdigest()
     except requests.RequestException as e:
@@ -1405,7 +1535,9 @@ def _hf_engine_for(url: str):
     if settings.provider_for_url(url) != 'huggingface':
         return None
     try:
-        from . import hf_downloader
+        # Through importlib, not `from . import`: that form finds the package
+        # attribute set by an earlier import and never consults sys.modules
+        hf_downloader = importlib.import_module('.hf_downloader', __package__)
     except ImportError:
         return None
     from .sources.huggingface import parse_huggingface_url
@@ -1420,7 +1552,9 @@ def _run_hf(download_id: str, job: Dict[str, Any], engine) -> str:
     hf.download_hf_model(parsed['repo'], parsed['filename'], os.path.dirname(dest),
                          os.path.basename(dest), download_id,
                          revision=parsed.get('branch', 'main'), display_url=job['url'])
-    # The engine replaces the record; put back what this module owns
+    # The engine updates the record in place (Task 5), so `path` - which the
+    # duplicate-download guard in start_download relies on - survived the run.
+    # Re-assert what this module owns in case an older engine replaced it.
     _set(download_id, category=job['category'], path=dest)
     record = get_progress(download_id)
     if record.get('status') == 'cancelled':
@@ -1540,16 +1674,44 @@ git commit -m "Download models through a server-side queue into validated folder
 
 **Interfaces:**
 - Consumes: `downloader.download_progress`, `download_lock`, `cancelled_downloads`, `format_bytes`, `generate_download_id` (Task 4); `settings.get_token('huggingface')`.
-- Produces: `hf_downloader.download_hf_model(repo_id, filename, dest_dir, dest_filename, download_id, revision='main', display_url=None) -> None` — blocking; writes the shared progress record; flattens the repo path to `dest_dir/dest_filename`; stages in `dest_dir/.model_linker_tmp_<id>/` (the scanner skips dot-directories). Importing it raises `ImportError` when `huggingface_hub` is missing or older than 1.1, which makes `downloader._hf_engine_for` fall back to streaming.
+- Produces: `hf_downloader.download_hf_model(repo_id, filename, dest_dir, dest_filename, download_id, revision='main', display_url=None) -> None` — blocking; updates the shared progress record **in place** (keeping `path` and `category`, so `start_download`'s duplicate guard holds while it runs); never renames over a file that appeared meanwhile; flattens the repo path to `dest_dir/dest_filename`; stages in `dest_dir/.model_linker_tmp_<id>/` (the scanner skips dot-directories). Importing it raises `ImportError` when `huggingface_hub` is missing or older than 1.1, which makes `downloader._hf_engine_for` fall back to streaming.
 
-- [ ] **Step 1: Copy**
+- [ ] **Step 1: Copy, then edit**
 
 ```bash
 git show bec5c80:core/hf_downloader.py > core/hf_downloader.py
 git show bec5c80:core/_hf_worker.py > core/_hf_worker.py
 ```
 
-No edits are needed: it imports exactly the five names Task 4's `downloader` exports. Its `start_background_hf_download` is unused here — delete that function (the last one in the file) so no second, uncapped way of starting downloads exists.
+It imports exactly the five names Task 4's `downloader` exports. Three edits to `core/hf_downloader.py`:
+
+1. **Update the record, do not replace it.** Upstream assigns a fresh dict, which drops the `path` and `category` that `downloader.start_download` uses to refuse a second download of the same file — so during every HuggingFace download (the main source) that guard was blind. Replace
+
+```python
+    with download_lock:
+        download_progress[download_id] = {
+            'status': 'starting',
+```
+
+with
+
+```python
+    with download_lock:
+        # In place: the record also carries downloader's `path` and `category`
+        download_progress.setdefault(download_id, {}).update({
+            'status': 'starting',
+```
+
+and the dict's closing line directly below it (the `        }` after `'start_time': start_time,`) with `        })`.
+
+2. **Never rename over a file that appeared meanwhile.** In the success branch, directly before `os.replace(result_path, dest_path)`, add (same indentation; the surrounding `except Exception` turns it into an error record and removes the staging folder):
+
+```python
+            if os.path.exists(dest_path):
+                raise FileExistsError(f"{dest_filename} appeared during the download; not overwritten")
+```
+
+3. Its `start_background_hf_download` is unused here — delete that function (the last one in the file) so no second, uncapped way of starting downloads exists.
 
 - [ ] **Step 2: Write the tests**
 
@@ -1567,6 +1729,7 @@ except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
 from core import downloader
+from support import LibraryTestCase
 
 
 class RoutingTests(unittest.TestCase):
@@ -1587,21 +1750,70 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(engine[1]['filename'], 'sub/c.safetensors')
 
     def test_missing_library_falls_back(self):
+        # Even after the engine was imported once in this process - the case
+        # a plain `from . import hf_downloader` gets wrong
+        try:
+            import core.hf_downloader  # noqa: F401
+        except ImportError:
+            pass
         with mock.patch.dict('sys.modules', {'core.hf_downloader': None}):
             self.assertIsNone(downloader._hf_engine_for(
                 'https://huggingface.co/Comfy-Org/x/resolve/main/c.safetensors'))
+
+
+class RecordTests(LibraryTestCase):
+    """The engine shares downloader's progress record and must not drop its fields."""
+
+    def setUp(self):
+        super().setUp()
+        try:
+            from core import hf_downloader
+        except ImportError:
+            self.skipTest('huggingface_hub >= 1.1 is not installed')
+        self.hf = hf_downloader
+        self.loras = self.add_models('loras', [], ['.safetensors'])
+        for patcher in (mock.patch.object(downloader, '_ensure_workers'),
+                        mock.patch.object(hf_downloader, 'get_token', return_value=None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_duplicate_guard_holds_while_the_engine_runs(self):
+        url = 'https://huggingface.co/o/r/resolve/main/x.safetensors'
+        download_id = downloader.start_download(url, 'loras', 'x.safetensors')
+        refused = []
+
+        def popen(*args, **kwargs):
+            # The engine has written its 'starting' record by now
+            try:
+                downloader.start_download(url, 'loras', 'x.safetensors')
+            except downloader.DownloadError:
+                refused.append(True)
+            raise OSError('no worker process in tests')
+
+        with mock.patch.object(self.hf.subprocess, 'Popen', popen):
+            self.hf.download_hf_model('o/r', 'x.safetensors', self.loras, 'x.safetensors', download_id)
+        self.assertEqual(refused, [True])
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'error')
+        self.assertEqual(record['category'], 'loras')
+        self.assertTrue(record['path'].endswith('x.safetensors'))
 ```
 
-- [ ] **Step 3: Run the whole suite**
+- [ ] **Step 3: Run the engine tests**
+
+Run: `python -m unittest discover -t . -s tests -p "test_hf_routing.py" -v`
+Expected: PASS, none skipped. (Without Step 1's edit 1, `test_duplicate_guard_holds_while_the_engine_runs` fails with `[] != [True]` — the replaced record has no `path`. That is the regression it pins; check it once by reverting the edit if in doubt.)
+
+- [ ] **Step 4: Run the whole suite**
 
 Run: `python tests/run.py`
 Expected: all pass.
 
-- [ ] **Step 4: Verify in the app**
+- [ ] **Step 5: Verify in the app**
 
-Restart ComfyUI. Start a download of any public Comfy-Org file from the dialog (Task 7 adds the button; until then: `curl -s -X POST http://127.0.0.1:8188/model_linker/download -H "Content-Type: application/json" -d '{"url":"https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors","category":"checkpoints","filename":"v1-5-pruned-emaonly-fp16.safetensors"}'`). Poll `/model_linker/progress`: it moves `starting → downloading → verifying → completed` with a `sha256`, and the console logs `[Model Linker] ✓ Download complete`. Delete the file afterwards.
+Restart ComfyUI. Start a download of any public Comfy-Org file from the dialog (Task 7 adds the button; until then: `curl -s -X POST http://127.0.0.1:8188/model_linker/download -H "Content-Type: application/json" -d '{"url":"https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors","category":"checkpoints","filename":"v1-5-pruned-emaonly-fp16.safetensors"}'`). Poll `/model_linker/progress`: it moves `starting → downloading → verifying → completed` with a `sha256`, and the console logs `[Model Linker] ✓ Download complete`. While it runs, send the same `curl` again: it must answer 400 `… is already downloading`. Delete the file afterwards.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add core/hf_downloader.py core/_hf_worker.py tests/test_hf_routing.py
@@ -1622,9 +1834,11 @@ git commit -m "Download HuggingFace files over multiple connections when hugging
 - Produces:
   - `civitai_meta.version_for_sha256(sha256) -> Optional[dict]` — full CivitAI version record, enriched from `/models/{modelId}`, `images[].meta.comfy` removed; None when CivitAI does not know the file; raises `civitai_meta.CivitaiUnavailable` on network/HTTP failure.
   - `lm_sidecar.build_sidecar(model_path, category, sha256, version=None, preview_path='', preview_nsfw_level=0, now=None) -> dict`
-  - `lm_sidecar.write_sidecar(model_path, category, sha256) -> str` — `'written' | 'exists' | 'skipped'`.
+  - `lm_sidecar.write_sidecar(model_path, category, sha256, fetch_if_unknown=True) -> str` — `'written' | 'exists' | 'skipped'`. `fetch_if_unknown=False` skips asking Lora Manager to fetch from CivitAI when CivitAI did not know the file (Task 9 passes it for HuggingFace downloads, which are hydrated instead).
   - `lm_sidecar.on_download_complete(record) -> Optional[str]` — the hook.
   - `lm_sidecar.determine_base_model(base: Optional[str]) -> str`, `lm_sidecar.lm_target(category) -> Optional[(prefix, sub_type)]`.
+  - `lm_sidecar.lora_manager_settings_path() -> str` — where Lora Manager keeps `settings.json`, resolved in Lora Manager's own order: `LORA_MANAGER_SETTINGS_DIR`; else its folder when portable (`LORA_MANAGER_PORTABLE=1`, or `use_portable_settings: true` there unless `LORA_MANAGER_PORTABLE=0`); else the per-user config folder (`%LOCALAPPDATA%\ComfyUI-LoRA-Manager` on Windows). `centralized_sidecars()` reads that file.
+  - `lm_sidecar.notify_lora_manager(prefix, model_path, fetch=False)` scans only the model's folder (`?roots=`), falling back to a full scan when Lora Manager does not know that root.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1725,7 +1939,10 @@ class FormatTests(SidecarTestCase):
     def test_base_model_mapping_matches_lora_manager(self):
         cases = {None: 'Unknown', '': 'Unknown', 'SDXL 1.0': 'SDXL 1.0', 'SDXL Lightning': 'SDXL 1.0',
                  'Pony V7': 'Pony', 'Illustrious': 'Illustrious', 'Flux.1 D': 'Flux.1 D',
-                 'Flux.1 Krea': 'Flux.1 Krea', 'SD 1.5': 'SD 1.5', 'ZImageTurbo': 'ZImageTurbo'}
+                 'Flux.1 Krea': 'Flux.1 Krea', 'SD 1.5': 'SD 1.5', 'ZImageTurbo': 'ZImageTurbo',
+                 # Lora Manager's "Hunyuan Video" key is never matched (it lowercases
+                 # the input only), so the string is kept as CivitAI gave it
+                 'Hunyuan Video 1.5': 'Hunyuan Video 1.5'}
         for given, expected in cases.items():
             self.assertEqual(lm_sidecar.determine_base_model(given), expected, given)
 
@@ -1809,6 +2026,53 @@ class WriteTests(SidecarTestCase):
     def test_centralized_mode_is_left_alone(self):
         with mock.patch.object(lm_sidecar, 'centralized_sidecars', return_value=True):
             self.assertEqual(lm_sidecar.write_sidecar(self.model, 'loras', SHA), 'skipped')
+
+    def test_no_civitai_fetch_when_told_not_to(self):
+        with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=None):
+            lm_sidecar.write_sidecar(self.model, 'loras', SHA, fetch_if_unknown=False)
+        self.assertEqual(self.notified, [('loras', False)])
+
+
+class LoraManagerSettingsTests(unittest.TestCase):
+    """settings.json is found where Lora Manager itself looks for it."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix='model-linker-lm-settings-')
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.lm_dir = os.path.join(self.root, 'comfyui-lora-manager')
+        self.user_dir = os.path.join(self.root, 'user')
+        os.makedirs(self.lm_dir)
+        os.makedirs(self.user_dir)
+        env = mock.patch.dict(os.environ, {}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in ('LORA_MANAGER_SETTINGS_DIR', 'LORA_MANAGER_PORTABLE'):
+            os.environ.pop(name, None)
+        for patcher in (mock.patch.object(lm_sidecar, '_LORA_MANAGER_DIR', self.lm_dir),
+                        mock.patch.object(lm_sidecar, '_user_config_dir', return_value=self.user_dir)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, folder, data):
+        with open(os.path.join(folder, 'settings.json'), 'w', encoding='utf-8') as handle:
+            json.dump(data, handle)
+
+    def test_per_user_folder_unless_portable(self):
+        self.write(self.lm_dir, {'sidecar_storage_mode': 'centralized'})  # a stale copy
+        self.write(self.user_dir, {'sidecar_storage_mode': 'alongside'})
+        self.assertEqual(lm_sidecar.lora_manager_settings_path(), os.path.join(self.user_dir, 'settings.json'))
+        self.assertFalse(lm_sidecar.centralized_sidecars())
+
+    def test_portable_mode_uses_its_own_folder(self):
+        self.write(self.lm_dir, {'use_portable_settings': True, 'sidecar_storage_mode': 'centralized'})
+        self.assertTrue(lm_sidecar.centralized_sidecars())
+        os.environ['LORA_MANAGER_PORTABLE'] = '0'  # explicit opt-out wins over the file
+        self.assertEqual(lm_sidecar.lora_manager_settings_path(), os.path.join(self.user_dir, 'settings.json'))
+
+    def test_settings_dir_override_wins(self):
+        self.write(self.lm_dir, {'use_portable_settings': True})
+        os.environ['LORA_MANAGER_SETTINGS_DIR'] = self.root
+        self.assertEqual(lm_sidecar.lora_manager_settings_path(), os.path.join(self.root, 'settings.json'))
 
 
 class CivitaiMetaTests(unittest.TestCase):
@@ -1928,6 +2192,7 @@ fetch. Contract: docs/superpowers/specs/2026-10-14-upstream-parity-design.md.
 import json
 import logging
 import os
+import sys
 import time
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlparse
@@ -1938,7 +2203,8 @@ from .categories import canonical_category
 logger = logging.getLogger(__name__)
 
 _EXTENSION_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_LORA_MANAGER_SETTINGS = os.path.join(os.path.dirname(_EXTENSION_DIR), 'comfyui-lora-manager', 'settings.json')
+_LORA_MANAGER_DIR = os.path.join(os.path.dirname(_EXTENSION_DIR), 'comfyui-lora-manager')
+_LORA_MANAGER_APP = 'ComfyUI-LoRA-Manager'
 
 # Canonical ComfyUI category -> (Lora Manager route prefix, sub_type)
 _TARGETS = {
@@ -1954,12 +2220,14 @@ _TARGETS = {
 }
 
 # Lora Manager's base-model labels: the first case-insensitive substring hit
-# wins, otherwise CivitAI's string is kept. Order matters ("il" is last-but-two
-# on purpose in theirs, so it is here).
+# wins, otherwise CivitAI's string is kept. Order matters ("il" comes after
+# "illustrious" in theirs, so it does here). Lora Manager also lists a
+# "Hunyuan Video" key, but compares it against the lowercased input, so it can
+# never match - leaving it out reproduces its behaviour exactly.
 _BASE_MODELS = (
     ('sd_1.5', 'SD 1.5'), ('sd-v1-5', 'SD 1.5'), ('sd-v2-1', 'SD 2.1'), ('sdxl', 'SDXL 1.0'),
     ('sd-v2', 'SD 2.0'), ('flux1', 'Flux.1 D'), ('flux.1 d', 'Flux.1 D'), ('illustrious', 'Illustrious'),
-    ('il', 'Illustrious'), ('pony', 'Pony'), ('hunyuan video', 'Hunyuan Video'),
+    ('il', 'Illustrious'), ('pony', 'Pony'),
 )
 
 # Where Lora Manager looks for a preview, in its order of preference
@@ -2099,10 +2367,52 @@ def download_preview(model_path: str, image: Dict[str, Any]) -> str:
             os.remove(tmp)
 
 
+def _user_config_dir() -> str:
+    """The per-user folder Lora Manager keeps its settings in when not portable."""
+    try:
+        from platformdirs import user_config_dir  # a Lora Manager dependency
+        return user_config_dir(_LORA_MANAGER_APP, appauthor=False)
+    except ImportError:
+        if os.name == 'nt':
+            return os.path.join(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~'), _LORA_MANAGER_APP)
+        if sys.platform == 'darwin':
+            return os.path.join(os.path.expanduser('~/Library/Application Support'), _LORA_MANAGER_APP)
+        return os.path.join(os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config'),
+                            _LORA_MANAGER_APP)
+
+
+def _portable(project_settings: str) -> bool:
+    forced = os.environ.get('LORA_MANAGER_PORTABLE')
+    if forced in ('0', '1'):
+        return forced == '1'
+    try:
+        with open(project_settings, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    return isinstance(data, dict) and data.get('use_portable_settings') is True
+
+
+def lora_manager_settings_path() -> str:
+    """
+    Lora Manager's settings.json, looked for in the order Lora Manager uses:
+    the LORA_MANAGER_SETTINGS_DIR override, then its own folder when portable
+    mode is on, then the per-user config folder. A settings.json left in its
+    folder without the portable flag is a stale copy, not the live file.
+    """
+    override = os.environ.get('LORA_MANAGER_SETTINGS_DIR')
+    if override:
+        return os.path.join(os.path.abspath(os.path.expanduser(override)), 'settings.json')
+    project = os.path.join(_LORA_MANAGER_DIR, 'settings.json')
+    if _portable(project):
+        return project
+    return os.path.join(_user_config_dir(), 'settings.json')
+
+
 def centralized_sidecars() -> bool:
     """Lora Manager's optional centralized mode keeps sidecars elsewhere; leave it alone then."""
     try:
-        with open(_LORA_MANAGER_SETTINGS, 'r', encoding='utf-8') as handle:
+        with open(lora_manager_settings_path(), 'r', encoding='utf-8') as handle:
             return json.load(handle).get('sidecar_storage_mode') == 'centralized'
     except (OSError, ValueError, AttributeError):
         return False
@@ -2129,14 +2439,19 @@ def notify_lora_manager(prefix: str, model_path: str, fetch: bool = False) -> No
         return
     base = f'http://127.0.0.1:{port}/api/lm/{prefix}'
     try:
-        requests.get(f'{base}/scan', timeout=300)
+        # Only the folder the download landed in (a category root). Lora
+        # Manager answers 400 for a root it spells differently; scan all then.
+        response = requests.get(f'{base}/scan', params={'roots': lm_path(os.path.dirname(model_path))},
+                                timeout=300)
+        if response.status_code == 400:
+            requests.get(f'{base}/scan', timeout=300)
         if fetch:
             requests.post(f'{base}/fetch-civitai', json={'file_path': lm_path(model_path)}, timeout=300)
     except Exception as e:
         logger.debug(f"Model Linker: Lora Manager not notified: {e}")
 
 
-def write_sidecar(model_path: str, category: str, sha256: str) -> str:
+def write_sidecar(model_path: str, category: str, sha256: str, fetch_if_unknown: bool = True) -> str:
     target = lm_target(category)
     if not target:
         return 'skipped'
@@ -2161,7 +2476,7 @@ def write_sidecar(model_path: str, category: str, sha256: str) -> str:
             nsfw = int(image.get('nsfwLevel') or 0) if preview else 0
 
     _write_json_atomic(path, build_sidecar(model_path, category, sha256, version, preview, nsfw))
-    notify_lora_manager(target[0], model_path, fetch=version is None)
+    notify_lora_manager(target[0], model_path, fetch=version is None and fetch_if_unknown)
     return 'written'
 
 
@@ -2262,6 +2577,9 @@ export default async function run() {
   check('download all starts one download per file', /seen\.has\(/.test(src.slice(src.indexOf('async downloadAll'))));
   check('reopening reconnects to running downloads', /async reconnect\(/.test(src) && /reconnect\(\)/.test(src));
   check('source names are escaped', /escapeHtml\(where\)/.test(src));
+  check('workflow-derived slots are escaped in attributes',
+        !/data-ml-slot="\$\{slot\}"/.test(src) && /data-ml-slot="\$\{escapeHtml\(slot\)\}"/.test(src)
+        && /id="\$\{escapeHtml\(this\.blockId\(missing\)\)\}"/.test(src) && /CSS\.escape\(/.test(src));
 
   const dialog = readSource('modules/linker-dialog.js');
   check('closing the dialog stops polling', /close\(\)\s*\{[\s\S]{0,600}downloads\.stop\(\)/.test(dialog));
@@ -2349,15 +2667,17 @@ export class DownloadController {
     }
 
     renderBlock(missing) {
-        return `<div id="${this.blockId(missing)}" style="margin: 4px 0 8px;">${this.blockHtml(missing)}</div>`;
+        // Node and subgraph ids inside the slot come from the workflow file
+        return `<div id="${escapeHtml(this.blockId(missing))}" style="margin: 4px 0 8px;">${this.blockHtml(missing)}</div>`;
     }
 
     blockHtml(missing) {
         const slot = refSlot(missing);
         const record = this.records[this.byRef.get(slot)];
         const state = downloadState(missing, record);
+        // dataset.mlSlot hands back the unescaped slot, which is the map key
         const button = (action, text) =>
-            `<button data-ml-action="${action}" data-ml-slot="${slot}" class="model-linker-resolve-btn" style="padding:2px 8px;">${text}</button>`;
+            `<button data-ml-action="${action}" data-ml-slot="${escapeHtml(slot)}" class="model-linker-resolve-btn" style="padding:2px 8px;">${text}</button>`;
         switch (state.kind) {
             case "active": {
                 const label = record.status === "queued" ? "Queued"
@@ -2395,7 +2715,7 @@ export class DownloadController {
     }
 
     refresh(missing) {
-        const element = this.container?.querySelector(`#${this.blockId(missing)}`);
+        const element = this.container?.querySelector(`#${CSS.escape(this.blockId(missing))}`);
         if (element) element.innerHTML = this.blockHtml(missing);
     }
 
@@ -3046,7 +3366,7 @@ In `web/modules/downloads.js`:
                 + `<span style="color:${tone}; font-size:12px;">${escapeHtml(String(candidate.confidence))}% · ${label}</span>`
                 + `<span style="opacity:.6; font-size:12px;">${escapeHtml(where)}${size ? ` · ${escapeHtml(size)}` : ""}</span>`
                 + (page ? `<a href="${escapeHtml(page)}" target="_blank" rel="noopener noreferrer">↗</a>` : "")
-                + `<button data-ml-action="download-similar" data-ml-slot="${slot}" data-ml-index="${index}" class="model-linker-resolve-btn" style="padding:1px 6px;">☁ Download</button>`
+                + `<button data-ml-action="download-similar" data-ml-slot="${escapeHtml(slot)}" data-ml-index="${index}" class="model-linker-resolve-btn" style="padding:1px 6px;">☁ Download</button>`
                 + `</li>`;
         }).join("");
         return `<div style="margin-top:6px; font-size:12px; opacity:.8;">Similar models online — saved under their own name; link one afterwards if it is right:</div>`
@@ -3126,15 +3446,16 @@ git commit -m "Search for similar models online, scored and saved under their ow
 **Interfaces:**
 - Consumes: `lm_sidecar.lm_target`, `lm_sidecar.sidecar_path`, `downloader.sha256_file`, `linker.group_models_by_physical_file`, `scanner.get_model_files`, `sources.hf_index.lookup_by_sha256`, `sources.huggingface.build_search_queries`, `settings.auth_headers_for_url`, `settings.provider_for_url`, `overrides._data_dir`.
 - Produces:
-  - `lm_api.scan(prefix)`, `link_huggingface(model_path, repo)`, `hydrate_huggingface(model_path, model_root, repo)`, `save_metadata(prefix, model_path, fields)`, `base_models() -> list[str]`, `enrich_with_ai(model_paths)`, `available() -> bool`; all raise `lm_api.LoraManagerUnavailable` on failure.
-  - `hf_identify.repo_from_url(url) -> Optional[str]`, `hf_identify.card(repo) -> Optional[dict]`, `hf_identify.find_repo(filename, sha256) -> Optional[{'repo', 'card', 'how'}]`, `hf_identify.base_model_label(card, allowed) -> Optional[str]`, `hf_identify.card_tags(card) -> list[str]`.
-  - `lm_backfill.start(use_ai=False) -> bool`, `lm_backfill.cancel()`, `lm_backfill.status() -> dict`.
-  - Routes: `POST /model_linker/lm-backfill/start` `{use_ai: bool}` → `{started, state}`; `GET /model_linker/lm-backfill` → state; `POST /model_linker/lm-backfill/cancel`.
+  - `lm_api.scan(prefix, root=None)` (scoped to `root` when Lora Manager knows it, else a full scan), `link_huggingface(model_path, repo)`, `hydrate_huggingface(model_path, model_root, repo)` (a model outside `model_root`, including on another drive, raises `LoraManagerUnavailable`), `save_metadata(prefix, model_path, fields)`, `base_models() -> list[str]` (read from Lora Manager's `{"success", "data": {"models": [...]}}`), `enrich_with_ai(model_paths)`, `available() -> bool`; all raise `lm_api.LoraManagerUnavailable` on failure.
+  - `hf_identify.repo_from_url(url) -> Optional[str]`, `hf_identify.card(repo) -> Optional[dict]`, `hf_identify.find_repo(filename, sha256) -> Optional[{'repo', 'card', 'how'}]`, `hf_identify.base_model_label(card, allowed) -> Optional[str]`, `hf_identify.card_tags(card) -> list[str]`, `hf_identify.clear_cache()`.
+  - `lm_backfill.start(use_ai=False, limit=None) -> bool` (`limit` = fill at most that many models: the sample run), `lm_backfill.cancel()`, `lm_backfill.status() -> dict` (`status, total, candidates_total, limit, done, current, counts, results, use_ai, ai_error, error, started_at, finished_at`).
+  - Routes: `POST /model_linker/lm-backfill/start` `{use_ai: bool, limit?: int > 0}` → `{started, state}`; `GET /model_linker/lm-backfill` → state; `POST /model_linker/lm-backfill/cancel`.
+  - Models whose sidecar has `exclude` or `skip_metadata_refresh` set are never touched — the user opted them out in Lora Manager.
 
 **What the research found (Lora Manager v1.2.5, read-only; GPL-3.0, so nothing is copied):**
 - Lora Manager already turns a HuggingFace model card into sidecar data: the README as HTML in `modelDescription`, `widget:`/table/markdown/`<img>` images into `civitai.images`, `instance_prompt:` into `civitai.trainedWords`, a `<stem>.webp` preview, and `metadata_source: "source:huggingface"`, `source_platform: "huggingface"`, `source_url`/`hf_url: "https://huggingface.co/<owner>/<repo>"`, `from_civitai: false`. With its LLM configured (Ollama, on this install) its `enrich_hf_metadata` skill also sets `base_model`, `tags`, `notes` and `usage_tips`.
 - What it **cannot** do is find which repo a file came from: hydration only runs for a sidecar already linked to a repo. That identification is this task's job; the README work is delegated to Lora Manager through its own routes, so the result is exactly its format, and its cache stays consistent (externally edited sidecars are not re-read by its cache).
-- Routes used (`py/routes/handlers/model_source_handlers.py` and the agent/misc registrars): `POST /api/lm/set-hf-url` `{file_path, source_url}` links; `POST /api/lm/download-model-source` `{platform: "huggingface", repo, filename, model_root, relative_path}` hydrates when the file already exists and is linked; `POST /api/lm/{prefix}/save-metadata` `{file_path, ...fields}` merges fields (dicts shallow-merged, tags lowercased); `GET /api/lm/base-models`; `POST /api/lm/agent/execute/enrich_hf_metadata` `{model_paths}`; `GET /api/lm/{prefix}/scan`.
+- Routes used (`py/routes/handlers/model_source_handlers.py` and the agent/misc registrars): `POST /api/lm/set-hf-url` `{file_path, source_url}` links; `POST /api/lm/download-model-source` `{platform: "huggingface", repo, filename, model_root, relative_path}` hydrates when the file already exists and is linked; `POST /api/lm/{prefix}/save-metadata` `{file_path, ...fields}` merges fields (dicts shallow-merged, tags lowercased); `GET /api/lm/base-models` → `{"success": true, "data": {"models": [...], ...}}` (`py/routes/handlers/base_model_handlers.py`); `POST /api/lm/agent/execute/enrich_hf_metadata` `{model_paths}` (answers at once and runs in the background; 400 when no LLM is configured); `GET /api/lm/{prefix}/scan`, optionally `?roots=<root>` (400 for a root it does not know).
 - Quirk handled here: hydration **clears `civitai.trainedWords`** when the README has no `instance_prompt`. Existing trigger words are saved before and merged back after.
 - Never write a fake `civitai.id`/`modelId`: it turns on Lora Manager's "View on Civitai" link.
 - Measured on this machine (2026-10-15): "empty" sidecars (no `civitai.id`, empty `modelDescription`, no `source_url`/`hf_url`) — loras 270, checkpoints/diffusion_models 115, text_encoders 126, vae 77, upscale_models 143; plus 82 model files with no sidecar. Many empty LoRAs (`ars\`, `gt\`) are the user's own trainings and will correctly come back "not found". Most vae/upscaler/text-encoder sidecars have `sha256: ""` with `hash_status: "pending"`, so those are hashed here.
@@ -3286,9 +3607,10 @@ class BackfillTestCase(LibraryTestCase):
         fake.base_models.return_value = ['Flux.1 D']
         for name in ('scan', 'link_huggingface', 'hydrate_huggingface', 'save_metadata', 'enrich_with_ai'):
             getattr(fake, name).side_effect = (lambda n: lambda *a, **k: self.calls.append((n, a, k)))(name)
-        patcher = mock.patch.object(lm_backfill, 'lm_api', fake)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for patcher in (mock.patch.object(lm_backfill, 'lm_api', fake),
+                        mock.patch.object(lm_backfill, 'PAUSE_BETWEEN_MODELS', 0)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def tearDown(self):
         overrides._data_dir = self._real
@@ -3315,6 +3637,11 @@ class SelectionTests(BackfillTestCase):
     def test_linked_but_empty_is_a_candidate(self):
         self.write_sidecar(source_url='https://huggingface.co/o/r')
         self.assertEqual(len(lm_backfill.candidates()), 1)
+
+    def test_models_opted_out_in_lora_manager_are_left_alone(self):
+        for flag in ('exclude', 'skip_metadata_refresh'):
+            self.write_sidecar(**{flag: True})
+            self.assertEqual(lm_backfill.candidates(), [], flag)
 
 
 class RunTests(BackfillTestCase):
@@ -3379,11 +3706,74 @@ class RunTests(BackfillTestCase):
             lm_backfill._run(use_ai=True)
         self.assertEqual(self.names().count('enrich_with_ai'), 1)
 
+    def test_ai_failure_is_reported_without_failing_the_run(self):
+        self.write_sidecar(source_url='https://huggingface.co/o/r')
+        lm_backfill.lm_api.enrich_with_ai.side_effect = lm_api.LoraManagerUnavailable(
+            'LLM provider is not configured')
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=True)
+        state = lm_backfill.status()
+        self.assertEqual(state['status'], 'done')
+        self.assertEqual(state['counts']['hydrated'], 1)
+        self.assertIn('not configured', state['ai_error'])
+
+    def test_limit_runs_a_sample(self):
+        self.add_models('loras', ['n.safetensors'], ['.safetensors'])
+        self.write_sidecar()
+        with open(os.path.join(self.loras, 'n.metadata.json'), 'w', encoding='utf-8') as handle:
+            json.dump(sidecar(file_name='n'), handle)
+        with mock.patch.object(hf_identify, 'find_repo', return_value=None):
+            lm_backfill._run(use_ai=False, limit=1)
+        state = lm_backfill.status()
+        self.assertEqual((state['total'], state['candidates_total'], state['done']), (1, 2, 1))
+
+    def test_card_cache_lasts_one_run(self):
+        hf_identify._cards['stale/repo'] = {'cardData': {}}
+        self.write_sidecar()
+        with mock.patch.object(hf_identify, 'find_repo', return_value=None):
+            lm_backfill._run(use_ai=False)
+        self.assertNotIn('stale/repo', hf_identify._cards)
+
     def test_lora_manager_not_running(self):
         lm_backfill.lm_api.available.return_value = False
         lm_backfill._run(use_ai=False)
         self.assertEqual(lm_backfill.status()['status'], 'error')
+
+
+class LmApiTests(unittest.TestCase):
+    def test_base_models_reads_lora_managers_envelope(self):
+        answer = {'success': True, 'data': {'models': ['Flux.1 D', 'SDXL 1.0'], 'source': 'cache'}}
+        with mock.patch.object(lm_api, '_call', return_value=answer):
+            self.assertEqual(lm_api.base_models(), ['Flux.1 D', 'SDXL 1.0'])
+
+    def test_hydrating_a_model_outside_its_root_is_refused(self):
+        root = tempfile.mkdtemp(prefix='model-linker-root-')
+        self.addCleanup(shutil.rmtree, root, True)
+        outside = os.path.join(os.path.dirname(root), 'elsewhere', 'm.safetensors')
+        with mock.patch.object(lm_api, '_call', side_effect=AssertionError('must not be called')):
+            with self.assertRaises(lm_api.LoraManagerUnavailable):
+                lm_api.hydrate_huggingface(outside, root, 'o/r')
+        # Another drive makes os.path.relpath raise ValueError on Windows
+        with mock.patch.object(lm_api.os.path, 'relpath', side_effect=ValueError('different drives')), \
+             mock.patch.object(lm_api, '_call', side_effect=AssertionError('must not be called')):
+            with self.assertRaises(lm_api.LoraManagerUnavailable):
+                lm_api.hydrate_huggingface('D:/m.safetensors', root, 'o/r')
+
+    def test_scan_falls_back_to_a_full_scan(self):
+        calls = []
+
+        def call(method, route, **kwargs):
+            calls.append(kwargs.get('params'))
+            if kwargs.get('params'):
+                raise lm_api.LoraManagerUnavailable('Unknown model root(s)')
+            return {}
+
+        with mock.patch.object(lm_api, '_call', call):
+            lm_api.scan('loras', root='/models/loras')
+        self.assertEqual(calls, [{'roots': lm_api.lm_path('/models/loras')}, None])
 ```
+
+(`BackfillTestCase` zeroes `PAUSE_BETWEEN_MODELS`, which otherwise makes every run sleep a second per model.)
 
 - [ ] **Step 2: Run to verify they fail**
 
@@ -3400,7 +3790,7 @@ raised as LoraManagerUnavailable for the caller to report.
 """
 
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 TIMEOUT = 300
 
@@ -3445,7 +3835,14 @@ def available() -> bool:
         return False
 
 
-def scan(prefix: str) -> None:
+def scan(prefix: str, root: Optional[str] = None) -> None:
+    """Have Lora Manager pick up new files - only under `root` when it knows that root."""
+    if root:
+        try:
+            _call('GET', f'/{prefix}/scan', params={'roots': lm_path(root)})
+            return
+        except LoraManagerUnavailable:
+            pass  # spelled differently there ("Unknown model root"): scan everything
     _call('GET', f'/{prefix}/scan')
 
 
@@ -3455,8 +3852,19 @@ def link_huggingface(model_path: str, repo: str) -> None:
 
 
 def hydrate_huggingface(model_path: str, model_root: str, repo: str) -> None:
-    """Lora Manager reads the repo's model card into the (already linked) sidecar."""
-    relative = os.path.relpath(os.path.dirname(model_path), model_root).replace('\\', '/')
+    """
+    Lora Manager reads the repo's model card into the (already linked) sidecar.
+
+    This is Lora Manager's *download* route: it only hydrates because the file
+    already exists at model_root/relative_path/filename. A wrong path would
+    make it download the file, so a model outside its root is refused here.
+    """
+    try:
+        relative = os.path.relpath(os.path.dirname(model_path), model_root).replace('\\', '/')
+    except ValueError:  # another drive on Windows
+        raise LoraManagerUnavailable(f'{model_path} is not inside {model_root}')
+    if relative == '..' or relative.startswith('../') or not os.path.isfile(model_path):
+        raise LoraManagerUnavailable(f'{model_path} is not a file inside {model_root}')
     _call('POST', '/download-model-source', json={
         'platform': 'huggingface', 'repo': repo, 'filename': os.path.basename(model_path),
         'model_root': lm_path(model_root), 'relative_path': '' if relative == '.' else relative,
@@ -3468,16 +3876,18 @@ def save_metadata(prefix: str, model_path: str, fields: Dict[str, Any]) -> None:
 
 
 def base_models() -> List[str]:
+    """Lora Manager's base-model labels; it answers {"success", "data": {"models": [...]}}."""
     data = _call('GET', '/base-models')
-    items = data.get('base_models', data) if isinstance(data, dict) else data
-    return [b if isinstance(b, str) else b.get('name', '') for b in items or [] if b]
+    inner = data.get('data') if isinstance(data, dict) else None
+    models = inner.get('models') if isinstance(inner, dict) else None
+    return [m for m in models or [] if isinstance(m, str) and m]
 
 
 def enrich_with_ai(model_paths: List[str]) -> None:
     _call('POST', '/agent/execute/enrich_hf_metadata', json={'model_paths': [lm_path(p) for p in model_paths]})
 ```
 
-Before moving on, confirm the two payloads against the installed Lora Manager: `grep -n "relative_path\|model_root" ../comfyui-lora-manager/py/routes/handlers/model_source_handlers.py` (an empty `relative_path` for a file in the root must be accepted — if it is rejected, send `"."` or omit the key, whichever the handler takes) and `grep -n "base_models" ../comfyui-lora-manager/py/routes/handlers/misc_handlers.py` for the response shape `base_models()` parses.
+Before moving on, confirm the payloads against the installed Lora Manager: `grep -n "relative_path\|model_root" ../comfyui-lora-manager/py/routes/handlers/model_source_handlers.py` (an empty `relative_path` for a file in the root is accepted in v1.2.5 — `target_dir = base_dir`), `grep -n "def get_base_models" -A30 ../comfyui-lora-manager/py/routes/handlers/base_model_handlers.py` for the `{"success", "data": {"models": [...]}}` envelope `base_models()` parses (the route is registered in `misc_route_registrar.py`, but the handler lives there), and `grep -n "requested_roots" ../comfyui-lora-manager/py/routes/handlers/model_handlers.py` for the `roots` query `scan()` sends.
 
 - [ ] **Step 4: Implement `core/hf_identify.py`**
 
@@ -3541,6 +3951,11 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             raise RuntimeError(f'HTTP {response.status_code} from HuggingFace')
         return response.json()
     raise RuntimeError('HuggingFace is rate limiting; try again later')
+
+
+def clear_cache() -> None:
+    """Forget fetched model cards; lm_backfill calls this at the start of every run."""
+    _cards.clear()
 
 
 def card(repo: str) -> Optional[Dict[str, Any]]:
@@ -3664,6 +4079,8 @@ def candidates() -> List[Dict[str, Any]]:
         data = _read(sidecar_path(entry['path']))
         if data is None or not is_empty(data):
             continue
+        if data.get('exclude') or data.get('skip_metadata_refresh'):
+            continue  # opted out in Lora Manager; its own refresh skips these too
         roots = [r for r in folder_paths.get_folder_paths(entry['category'])
                  if os.path.abspath(entry['path']).startswith(os.path.abspath(r) + os.sep)]
         if not roots:
@@ -3748,10 +4165,11 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     return 'hydrated'
 
 
-def _run(use_ai: bool) -> None:
+def _run(use_ai: bool, limit: Optional[int] = None) -> None:
     _cancel.clear()
-    _update(status='running', started_at=time.time(), finished_at=None, total=0, done=0, current='',
-            counts={}, results=[], use_ai=use_ai, error=None)
+    hf_identify.clear_cache()  # a card fetched last run may have changed since
+    _update(status='running', started_at=time.time(), finished_at=None, total=0, candidates_total=0,
+            limit=limit, done=0, current='', counts={}, results=[], use_ai=use_ai, ai_error=None, error=None)
     try:
         if not lm_api.available():
             raise lm_api.LoraManagerUnavailable('Lora Manager is not running in this ComfyUI')
@@ -3765,7 +4183,10 @@ def _run(use_ai: bool) -> None:
         except lm_api.LoraManagerUnavailable:
             allowed = []
         items = candidates()
-        _update(total=len(items))
+        found = len(items)
+        if limit:
+            items = items[:limit]  # a sample run, to check results before the whole library
+        _update(total=len(items), candidates_total=found)
         hydrated = []
         for item in items:
             if _cancel.is_set():
@@ -3781,7 +4202,14 @@ def _run(use_ai: bool) -> None:
                 _record(item, 'failed', error=str(e))
             time.sleep(PAUSE_BETWEEN_MODELS)
         if use_ai and hydrated and not _cancel.is_set():
-            lm_api.enrich_with_ai(hydrated)
+            # One batch: Lora Manager runs each call as its own background task,
+            # so a call per model would start them all at once. Its failure
+            # (typically "LLM provider is not configured") is reported on its
+            # own - the hydration above already succeeded.
+            try:
+                lm_api.enrich_with_ai(hydrated)
+            except Exception as e:
+                _update(ai_error=str(e))
         if _state.get('status') == 'running':
             _update(status='done')
     except Exception as e:
@@ -3791,20 +4219,18 @@ def _run(use_ai: bool) -> None:
         _save_report()
 
 
-def start(use_ai: bool = False) -> bool:
+def start(use_ai: bool = False, limit: Optional[int] = None) -> bool:
     with _lock:
         if _state.get('status') == 'running':
             return False
         _state['status'] = 'running'
-    threading.Thread(target=_run, args=(use_ai,), name='model-linker-lm-backfill', daemon=True).start()
+    threading.Thread(target=_run, args=(use_ai, limit), name='model-linker-lm-backfill', daemon=True).start()
     return True
 
 
 def cancel() -> None:
     _cancel.set()
 ```
-
-`time.sleep(PAUSE_BETWEEN_MODELS)` makes `test_lm_backfill.py` slow; in its `BackfillTestCase.setUp` add `mock.patch.object(lm_backfill, 'PAUSE_BETWEEN_MODELS', 0)` (started and cleaned up like the `lm_api` patch).
 
 - [ ] **Step 6: Run the Python tests**
 
@@ -3819,16 +4245,52 @@ In `core/lm_sidecar.py`:
 ```python
     from . import lm_api
     try:
-        lm_api.scan(prefix)
+        # The download landed in a category root: scan only that root
+        lm_api.scan(prefix, root=os.path.dirname(model_path))
         if fetch:
             lm_api._call('POST', f'/{prefix}/fetch-civitai', json={'file_path': lm_api.lm_path(model_path)})
     except lm_api.LoraManagerUnavailable as e:
         logger.debug(f"Model Linker: Lora Manager not notified: {e}")
 ```
 
-2. In `on_download_complete`, after `outcome = write_sidecar(...)` (rewrite the function to keep the outcome), add: when the outcome is `'written'`, the sidecar has no `civitai.id`, and `hf_identify.repo_from_url(record.get('url'))` returns a repo, call `lm_api.link_huggingface(path, repo)` then `lm_api.hydrate_huggingface(path, downloader.category_directory(record['category']), repo)` inside `try/except lm_api.LoraManagerUnavailable`, and return `'written+huggingface'`. Add a test to `tests/test_lm_sidecar.py`:
+2. Replace `on_download_complete` with:
 
 ```python
+def on_download_complete(record: Dict[str, Any]) -> Optional[str]:
+    if not record.get('sha256') or not record.get('path'):
+        return None
+    from . import hf_identify, lm_api
+    from .downloader import category_directory
+
+    path = record['path']
+    repo = hf_identify.repo_from_url(record.get('url'))
+    # A HuggingFace file is hydrated from its model card below; asking Lora
+    # Manager to fetch it from CivitAI first would only cost a futile lookup
+    outcome = write_sidecar(path, record.get('category'), record['sha256'], fetch_if_unknown=not repo)
+    if outcome != 'written' or not repo:
+        return outcome
+    try:
+        with open(sidecar_path(path), 'r', encoding='utf-8') as handle:
+            written = json.load(handle)
+    except (OSError, ValueError):
+        written = {}
+    if (written.get('civitai') or {}).get('id'):
+        return outcome  # CivitAI knew the file; its record is the richer one
+    try:
+        lm_api.link_huggingface(path, repo)
+        lm_api.hydrate_huggingface(path, category_directory(record['category']), repo)
+    except lm_api.LoraManagerUnavailable as e:
+        logger.info(f"Model Linker: Lora Manager could not read {repo}'s model card: {e}")
+        return outcome
+    return 'written+huggingface'
+```
+
+(`category_directory` is imported at call time so the test's patch of `core.downloader.category_directory` applies.)
+
+Add to `WriteTests` in `tests/test_lm_sidecar.py` (the class already patches `notify_lora_manager` and `centralized_sidecars`):
+
+```python
+    @unittest.skipUnless(importlib.util.find_spec('requests'), 'requests is not installed')
     def test_huggingface_download_is_hydrated_by_lora_manager(self):
         calls = []
         with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=None), \
@@ -3840,9 +4302,10 @@ In `core/lm_sidecar.py`:
                 'url': 'https://huggingface.co/o/r/resolve/main/rebel.safetensors'})
         self.assertEqual(outcome, 'written+huggingface')
         self.assertEqual(calls, ['link', 'hydrate'])
+        self.assertEqual(self.notified, [('loras', False)])  # no CivitAI fetch for a HF file
 ```
 
-(It lives in `WriteTests`, which already patches `notify_lora_manager` and `centralized_sidecars`.)
+and add `import importlib.util` to that file's imports.
 
 - [ ] **Step 8: Add the routes**
 
@@ -3859,8 +4322,13 @@ In `core/routes_downloads.py` (import `lm_backfill`):
             data = await request.json()
         except Exception:
             data = {}
-        use_ai = bool(data.get('use_ai')) if isinstance(data, dict) else False
-        started = lm_backfill.start(use_ai=use_ai)
+        if not isinstance(data, dict):
+            data = {}
+        use_ai = bool(data.get('use_ai'))
+        limit = data.get('limit')
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            return _bad(web, 'limit must be a positive integer')
+        started = lm_backfill.start(use_ai=use_ai, limit=limit)
         return web.json_response({'started': started, 'state': lm_backfill.status()})
 
     @routes.post("/model_linker/lm-backfill/cancel")
@@ -3877,9 +4345,10 @@ Extend `tests/js/test_settings_dialog.mjs` before its `return`:
   check('offers filling empty Lora Manager info', /\/model_linker\/lm-backfill\/start/.test(src));
   check('AI enrichment is opt-in', /use_ai:\s*this\.useAi\.checked/.test(src));
   check('progress is shown as text, not markup', /backfillStatus\.textContent\s*=/.test(src));
+  check('an AI enrichment failure is shown', /ai_error/.test(src));
 ```
 
-Run `node tests/js/run.mjs` — expected: FAIL on the three checks. Then in `web/modules/settings-dialog.js` add a `backfillRow()` to the constructor's children (after `this.lookupRow()`):
+Run `node tests/js/run.mjs` — expected: FAIL on the four checks. Then in `web/modules/settings-dialog.js` add a `backfillRow()` to the constructor's children (after `this.lookupRow()`):
 
 ```js
     backfillRow() {
@@ -3908,7 +4377,9 @@ Run `node tests/js/run.mjs` — expected: FAIL on the three checks. Then in `web
 
     renderBackfill(state) {
         const c = state?.counts || {};
-        const summary = `hydrated ${c.hydrated || 0} · not found ${c.not_found || 0} · failed ${c.failed || 0}`;
+        const summary = `hydrated ${c.hydrated || 0} · not found ${c.not_found || 0} · failed ${c.failed || 0}`
+            + (state?.limit ? ` · sample of ${state.total || 0} from ${state.candidates_total || 0} empty models` : "")
+            + (state?.ai_error ? `\nAI enrichment did not run: ${state.ai_error}` : "");
         if (state?.status === "running") {
             this.backfillStatus.textContent = `Working… ${state.done || 0} / ${state.total || "?"}`
                 + `${state.current ? ` — ${state.current}` : ""}\n${summary}`;
@@ -3945,12 +4416,15 @@ Run: `python tests/run.py` — expected: all pass.
 
 - [ ] **Step 11: Verify against the real library**
 
-Restart ComfyUI (Lora Manager running). Before starting, copy one empty sidecar aside as a known case, e.g. `E:\models\loras\ltx\ltx23\ltx-2.3_Deforum_Evolution_v2.metadata.json` (linked, empty).
-1. ⚙ Settings → Fill empty model info from HuggingFace, without AI. Close the window; reopen after a minute: progress continues.
-2. When done, `ltx-2.3_Deforum_Evolution_v2` shows in Lora Manager with the README description and example images, `metadata_source: "source:huggingface"`, and still its `autov3`.
-3. Spot-check three "hydrated" results from `data/lm-backfill.json` in Lora Manager; spot-check three "not_found" ones are genuinely not on HuggingFace (e.g. your own `gt\` trainings).
-4. Run once more with AI enrichment on a small set (unlink most first, or cancel after a few) and confirm base model and tags appear.
-Restore the copied sidecar if anything about it is wrong, and report what you found before enabling it on the whole library.
+This writes into real Lora Manager sidecars, so it starts with a **sample** and stops for the user (hand-off: "Stop and ask the user before … the first fill run against the whole library").
+
+Restart ComfyUI (Lora Manager running).
+1. **Back up first.** Copy every `*.metadata.json` under the model folders (they are small) into a dated folder in the session scratchpad, keeping relative paths, so any sidecar can be restored. Note one linked-but-empty case to watch, e.g. `E:\models\loras\ltx\ltx23\ltx-2.3_Deforum_Evolution_v2.metadata.json`.
+2. **Sample, no AI:** `curl -s -X POST http://127.0.0.1:8188/model_linker/lm-backfill/start -H "Content-Type: application/json" -d '{"use_ai":false,"limit":5}'`, then poll `curl -s http://127.0.0.1:8188/model_linker/lm-backfill` until `status` is `done`. Expect `total: 5`, `candidates_total` around the counts measured above, and five `results`.
+3. For two `hydrated` results, diff the backup against the new sidecar and check in Lora Manager: README description and example images, `metadata_source: "source:huggingface"`, `autov3` and earlier trigger words still present, nothing else lost. For `not_found` results, confirm they are genuinely not on HuggingFace (e.g. your own `gt\` trainings).
+4. **Sample with AI** (only if Lora Manager has an LLM configured): `-d '{"use_ai":true,"limit":10}'`. The sample's `not_found` models come first again, so the larger limit reaches fresh ones; confirm base model and tags appear on what this run hydrated. Without an LLM, the report shows `ai_error` and the run still ends `done`.
+5. **Stop.** Report steps 2–4 to the user (counts, the two before/after diffs, any failures) and wait for a go-ahead. Restore from the backup anything that is wrong.
+6. Only after the go-ahead: ⚙ Settings → Fill empty model info from HuggingFace (no limit), without AI. Close the window; reopen after a minute: progress continues. When done, the watched case shows its README in Lora Manager; spot-check three `hydrated` and three `not_found` entries from `data/lm-backfill.json`.
 
 - [ ] **Step 12: Commit**
 

@@ -6,7 +6,7 @@ imports - see __init__.setup_routes.
 import asyncio
 import logging
 
-from . import downloader, lookups
+from . import downloader, lookups, online_search
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,19 @@ def register(routes, web) -> None:
         clean = {k: missing[k] for k in fields if isinstance(missing.get(k), str)}
         key = await asyncio.to_thread(lookups.refresh, clean)
         return web.json_response({'key': key, 'state': 'pending'})
+
+    @routes.post("/model_linker/search")
+    async def search_similar(request):
+        try:
+            data = await request.json()
+        except Exception:
+            return _bad(web, 'Body must be JSON')
+        missing = data.get('missing') if isinstance(data, dict) else None
+        if not isinstance(missing, dict) or not isinstance(missing.get('original_path'), str):
+            return _bad(web, 'missing.original_path is required')
+        category = missing.get('category') if isinstance(missing.get('category'), str) else ''
+        result = await asyncio.to_thread(online_search.search_candidates, missing['original_path'], category)
+        return web.json_response(result)
 
     @routes.post("/model_linker/download")
     async def start(request):

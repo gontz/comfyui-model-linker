@@ -319,5 +319,82 @@ export default async function run() {
     c.stop();
   }
 
+  // 10. "Search similar": results render as scored rows, a chosen candidate
+  // downloads under its own filename (never the workflow's), its progress
+  // shows on the card that started it without replacing that card's own
+  // "not found" message, and "download all found" never touches it.
+  {
+    const candidates = [
+      { source: 'huggingface', filename: 'qwen3vl_8b_bf16.safetensors',
+        url: 'https://huggingface.co/a/b/resolve/main/qwen3vl_8b_bf16.safetensors', confidence: 95, different_model: false },
+      { source: 'huggingface', filename: 'qwen3vl_4b_int8.safetensors',
+        url: 'https://huggingface.co/a/b/resolve/main/qwen3vl_4b_int8.safetensors', confidence: 69, different_model: true },
+    ];
+    let searchBody;
+    const progress = {};
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/search') { searchBody = body; return reply({ candidates, errors: [] }); }
+      if (path === '/model_linker/download') {
+        progress.sim1 = { status: 'downloading', progress: 20, filename: body.filename, category: body.category };
+        return reply({ download_id: 'sim1' });
+      }
+      if (path === '/model_linker/progress') return reply(progress);
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'qwen3vl_8b_int8.safetensors', 'checkpoints', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(cont, { missing_models: [m] });
+
+    await c.searchSimilar(m);
+    check("search similar posts the missing model's own path and category",
+          searchBody?.missing?.original_path === 'qwen3vl_8b_int8.safetensors' && searchBody?.missing?.category === 'checkpoints');
+    let html = cont.els.get(c.blockId(m))?.innerHTML || '';
+    check('a different-size candidate is labelled in its own row',
+          /qwen3vl_4b_int8\.safetensors[\s\S]*different model/.test(html));
+    check('the card still shows its own "not found" message alongside the list',
+          /No download found online/.test(html));
+
+    await c.startSimilar(m, 0);
+    html = cont.els.get(c.blockId(m))?.innerHTML || '';
+    check("a started similar download saves under the candidate's own filename, never the workflow's",
+          progress.sim1?.filename === 'qwen3vl_8b_bf16.safetensors', JSON.stringify(progress));
+    check('its progress shows on the card that started it',
+          /qwen3vl_8b_bf16\.safetensors[\s\S]*progress/.test(html), html);
+    check("the card's own block is unaffected - still \"not found\", not the candidate's status",
+          /No download found online/.test(html));
+
+    await c.downloadAll();
+    check('"download all found" never starts a similar candidate',
+          Object.keys(progress).length === 1, JSON.stringify(progress));
+    c.stop();
+  }
+
+  // 11. A failed search renders its error instead of throwing, and offers
+  // nothing to download.
+  {
+    api.fetchApi = async (path) => (path === '/model_linker/search' ? reply({ error: 'HTTP 500' }, false, 500) : reply({}));
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'x.safetensors', 'loras', { lookup_state: 'idle', download_source: null });
+    c.afterRender(cont, { missing_models: [m] });
+    await c.searchSimilar(m);
+    const html = cont.els.get(c.blockId(m))?.innerHTML || '';
+    check('a failed search shows its error, not a crash', /HTTP 500/.test(html));
+    check('a failed search leaves no downloadable candidate', !/download-similar/.test(html));
+    c.stop();
+  }
+
+  const similar = src.slice(src.indexOf('similarHtml(missing) {'), src.indexOf('async downloadAll'));
+  check('similar results are escaped', /escapeHtml\(candidate\.filename\)/.test(similar));
+  check('different models are labelled', /different model/.test(similar));
+  check('a similar file keeps its own name',
+        /filename:\s*candidate\.filename/.test(src.slice(src.indexOf('async startSimilar'))));
+  check('download all never takes a similar result',
+        !/similar/i.test(src.slice(src.indexOf('async downloadAll'), src.indexOf('stop() {'))));
+  check('searching similar is offered when no exact download exists',
+        /"similar"/.test(src.slice(src.indexOf('blockHtml(missing) {'), src.indexOf('refresh(missing) {'))));
+
   return check.failures;
 }

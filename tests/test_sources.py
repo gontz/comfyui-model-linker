@@ -12,6 +12,7 @@ except ImportError:
 
 from core.matcher import is_variant_token
 from core.sources import civarchive, hf_index
+from core.sources.civitai import parse_civitai_url
 from core.sources.huggingface import build_search_queries, parse_huggingface_url
 
 SHA = 'df7c757437ef3696e76ee5cc18c063681478639132547b6292b0b4d773814ba5'
@@ -47,6 +48,16 @@ class HuggingFaceTests(unittest.TestCase):
                     'https://evil.example/huggingface.co/a/b/resolve/main/c.safetensors',
                     'http://huggingface.co/a/b/resolve/main/c.safetensors'):
             self.assertIsNone(parse_huggingface_url(url), url)
+
+
+class CivitaiTests(unittest.TestCase):
+    def test_parses_real_hosts_only(self):
+        parsed = parse_civitai_url('https://civitai.com/models/123?modelVersionId=456')
+        self.assertEqual(parsed, {'model_id': 123, 'version_id': 456})
+        for url in ('https://civitai.com.evil.example/models/1',
+                    'https://evil.example/civitai.com/models/1',
+                    'http://civitai.com/models/1'):
+            self.assertIsNone(parse_civitai_url(url), url)
 
 
 class IndexTests(unittest.TestCase):

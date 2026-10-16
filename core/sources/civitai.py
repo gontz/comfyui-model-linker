@@ -23,9 +23,12 @@ def parse_civitai_url(url: str) -> Optional[Dict[str, Any]]:
     """
     Parse a CivitAI URL to extract model/version info.
     """
-    parsed = urlparse(url)
-    if 'civitai.com' not in parsed.netloc:
+    # Decided by the actual host: a workflow-supplied URL on a lookalike host
+    # must not be treated (and authenticated) as CivitAI.
+    from ..settings import provider_for_url
+    if provider_for_url(url) != 'civitai':
         return None
+    parsed = urlparse(url)
     
     if '/api/download/models/' in parsed.path:
         match = re.search(r'/api/download/models/(\d+)', parsed.path)

@@ -13,11 +13,30 @@ import json
 # Web directory for JavaScript interface
 WEB_DIRECTORY = "./web"
 
-# Empty NODE_CLASS_MAPPINGS - we don't provide custom nodes, only web extension
-# This prevents ComfyUI from showing "IMPORT FAILED" message
-NODE_CLASS_MAPPINGS = {}
+class ModelLinkerNode:
+    """
+    Marks a shared workflow as prepared with Model Linker and carries its
+    buttons (added by web/linker.js). No inputs and no outputs, so ComfyUI
+    never executes it. Export adds it muted, so a workflow carrying it still
+    runs where this extension is not installed.
+    """
 
-__all__ = ["WEB_DIRECTORY"]
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ()
+    FUNCTION = "noop"
+    CATEGORY = "utils"
+
+    def noop(self):
+        return ()
+
+
+NODE_CLASS_MAPPINGS = {"ModelLinker": ModelLinkerNode}
+NODE_DISPLAY_NAME_MAPPINGS = {"ModelLinker": "Model Linker"}
+
+__all__ = ["WEB_DIRECTORY", "NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]
 
 
 class ModelLinkerExtension:
@@ -79,6 +98,8 @@ class ModelLinkerExtension:
                 import requests  # noqa: F401
                 from .core import lookups, routes_downloads
                 routes_downloads.register(routes, web)
+                from .core import routes_export
+                routes_export.register(routes, web)
                 lookups_available = True
             except Exception as e:
                 lookups = None

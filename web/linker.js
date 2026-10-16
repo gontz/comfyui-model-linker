@@ -45,6 +45,14 @@ export class ModelLinker {
         }
     }
 
+    openExport() {
+        if (!this.dialog) this.dialog = new LinkerManagerDialog();
+        // show() starts an analysis; openExport() starts a newer one, which
+        // supersedes it and is the one the Export dialog is built from
+        this.dialog.show();
+        this.dialog.openExport();
+    }
+
     // ComfyUI fires afterConfigureGraph for every graph it loads, including
     // tab switches, so the check is debounced and each workflow's missing set
     // is announced once per session.
@@ -129,6 +137,19 @@ app.registerExtension({
     name: "Model Linker",
     setup: modelLinker.setup,
     afterConfigureGraph: () => modelLinker.onGraphLoaded(),
+    nodeCreated(node) {
+        if (node.comfyClass !== "ModelLinker") return;
+        for (const [label, action] of [["Open Model Linker", () => modelLinker.openLinkerManager()],
+                                       ["Export…", () => modelLinker.openExport()]]) {
+            // options.serialize is what graphToPrompt checks; the widget's own
+            // flag keeps the buttons out of widgets_values. Setting the latter
+            // after addWidget is fine: the saved-value restore addWidget runs
+            // first means nothing for a button.
+            const widget = node.addWidget("button", label, null, action, { serialize: false });
+            widget.serialize = false;
+        }
+        node.size = [220, node.computeSize()[1]];
+    },
     settings: [
         {
             id: "ModelLinker.OpenOnMissing",

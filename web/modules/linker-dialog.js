@@ -5,6 +5,7 @@ import { api } from "../../../scripts/api.js";
 
 import { $el } from "./dom.js";
 import { DownloadController } from "./downloads.js";
+import { ExportDialog } from "./export-dialog.js";
 import { ManageOverridesDialog } from "./overrides-dialog.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import {
@@ -320,6 +321,25 @@ export class LinkerManagerDialog {
                     }
                 }),
                 $el("button", {
+                    id: "model-linker-export-btn",
+                    title: "Add download links for sharing this workflow",
+                    textContent: "Export…",
+                    onclick: () => this.openExport(),
+                    style: {
+                        background: "none",
+                        border: "1px solid var(--border-color)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "2px 8px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                }),
+                $el("button", {
                     id: "model-linker-fullscreen-toggle",
                     title: "Toggle full screen",
                     textContent: "⛶",
@@ -497,6 +517,15 @@ export class LinkerManagerDialog {
     openSettings() {
         if (!this.settingsDialog) this.settingsDialog = new SettingsDialog();
         this.settingsDialog.show();
+    }
+
+    async openExport() {
+        // Always analyse the workflow on screen: apply() writes by node id, so an
+        // earlier analysis - perhaps of another tab - must never be used
+        const data = await this.loadWorkflowData();
+        if (!data) return;   // superseded, no workflow, or failed; the dialog says which
+        if (!this.exportDialog) this.exportDialog = new ExportDialog(this);
+        this.exportDialog.show(data);
     }
 
     createQueuePanel() {
@@ -1070,7 +1099,7 @@ export class LinkerManagerDialog {
      * Load workflow data and display missing models
      */
     async loadWorkflowData(workflow = null) {
-        if (!this.contentElement) return;
+        if (!this.contentElement) return null;
 
         // Drop download/lookup state derived from the last render, before
         // deciding anything about this one: the zero-missing, no-workflow
@@ -1097,7 +1126,7 @@ export class LinkerManagerDialog {
 
             if (!workflow) {
                 this.contentElement.innerHTML = '<p>No workflow loaded. Please load a workflow first.</p>';
-                return;
+                return null;
             }
 
             // Call analyze endpoint
@@ -1116,13 +1145,14 @@ export class LinkerManagerDialog {
 
             // A newer analysis started while this one was in flight, or the
             // dialog was closed; either way this answer is stale.
-            if (this.analyzeAbort !== abort || !this.contentElement) return;
+            if (this.analyzeAbort !== abort || !this.contentElement) return null;
 
             this.displayMissingModels(this.contentElement, data);
+            return data;
 
         } catch (error) {
             // Superseding a request is normal, not a failure to report
-            if (error.name === 'AbortError' || this.analyzeAbort !== abort) return;
+            if (error.name === 'AbortError' || this.analyzeAbort !== abort) return null;
             console.error('Model Linker: Error loading workflow data:', error);
             if (this.contentElement) {
                 this.contentElement.innerHTML =
@@ -1131,6 +1161,7 @@ export class LinkerManagerDialog {
         } finally {
             if (this.analyzeAbort === abort) this.analyzeAbort = null;
         }
+        return null;
     }
 
     /**

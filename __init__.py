@@ -6,6 +6,7 @@
 @description: Extension for relinking missing models in ComfyUI workflows using fuzzy matching
 """
 
+import asyncio
 import logging
 import json
 
@@ -83,7 +84,7 @@ class ModelLinkerExtension:
                         )
                     
                     # Analyze and find matches
-                    result = analyze_and_find_matches(workflow_json)
+                    result = await asyncio.to_thread(analyze_and_find_matches, workflow_json)
                     
                     return web.json_response(result)
                 except Exception as e:
@@ -120,7 +121,7 @@ class ModelLinkerExtension:
                         workflow_before = None
 
                     # Apply resolutions
-                    updated_workflow = apply_resolution(workflow_json, resolutions)
+                    updated_workflow = await asyncio.to_thread(apply_resolution, workflow_json, resolutions)
 
                     # Persist user choices as overrides (so next time we know the correct match)
                     try:
@@ -207,7 +208,7 @@ class ModelLinkerExtension:
             async def get_models(request):
                 """Get list of all available models (for debugging/UI display)."""
                 try:
-                    models = list_available_models()
+                    models = await asyncio.to_thread(list_available_models)
                     return web.json_response(models)
                 except Exception as e:
                     self.logger.error(f"Model Linker get_models error: {e}", exc_info=True)

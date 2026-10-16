@@ -6,6 +6,7 @@ Scans configured model directories and finds available model files.
 
 import os
 import logging
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 # Import folder_paths lazily - it may not be available until ComfyUI is initialized
@@ -240,6 +241,10 @@ def scan_all_directories(visited_dirs: Optional[List[str]] = None) -> List[Dict[
 # removed.
 _scan_cache: Optional[Dict[str, Any]] = None
 
+# Routes run analyses in worker threads, so two can arrive on a cold cache at
+# once. One walks the library; the other waits for its answer.
+_scan_lock = threading.Lock()
+
 
 def _layout_signature() -> Any:
     """
@@ -298,7 +303,8 @@ def _cache_is_valid(cache: Dict[str, Any]) -> bool:
 def invalidate_cache() -> None:
     """Drop the cached scan so the next call re-reads from disk."""
     global _scan_cache
-    _scan_cache = None
+    with _scan_lock:
+        _scan_cache = None
 
 
 def get_model_files(force_rescan: bool = False) -> List[Dict[str, str]]:
@@ -317,21 +323,22 @@ def get_model_files(force_rescan: bool = False) -> List[Dict[str, str]]:
     """
     global _scan_cache
 
-    if not force_rescan and _scan_cache is not None:
-        try:
-            if _cache_is_valid(_scan_cache):
-                return _scan_cache['models']
-        except Exception as e:
-            logging.debug(f"Model Linker: cache validation failed, rescanning: {e}")
+    with _scan_lock:
+        if not force_rescan and _scan_cache is not None:
+            try:
+                if _cache_is_valid(_scan_cache):
+                    return _scan_cache['models']
+            except Exception as e:
+                logging.debug(f"Model Linker: cache validation failed, rescanning: {e}")
 
-    visited_dirs: List[str] = []
-    models = scan_all_directories(visited_dirs)
+        visited_dirs: List[str] = []
+        models = scan_all_directories(visited_dirs)
 
-    _scan_cache = {
-        'models': models,
-        'dirs': _directory_signature(visited_dirs),
-        'layout': _layout_signature(),
-    }
-    logging.debug(f"Model Linker: scanned {len(models)} models across {len(visited_dirs)} directories")
-    return models
+        _scan_cache = {
+            'models': models,
+            'dirs': _directory_signature(visited_dirs),
+            'layout': _layout_signature(),
+        }
+        logging.debug(f"Model Linker: scanned {len(models)} models across {len(visited_dirs)} directories")
+        return models
 

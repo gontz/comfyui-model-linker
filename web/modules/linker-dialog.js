@@ -1295,11 +1295,11 @@ export class LinkerManagerDialog {
             // Refresh selected UI for this item based on queued selections
             this.updateSelectedBarForMissing(missing);
 
-            // Wire Locate button (only available for top-level items)
+            // Wire Locate button
             const locateId = `locate-${refSlot(missing)}`;
             const locateBtn = container.querySelector(`#${locateId}`);
-            if (locateBtn && missing.is_top_level !== false) {
-                locateBtn.addEventListener('click', () => this.locateNodeInGraph(missing.node_id));
+            if (locateBtn) {
+                locateBtn.addEventListener('click', () => this.locateRef(missing));
             }
 
             // Model combo is already attached above
@@ -1336,31 +1336,19 @@ export class LinkerManagerDialog {
             // Show subgraph name as primary identifier
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
             html += `<span><strong>Subgraph:</strong> ${subgraphName} (ID: ${nodeId})</span>`;
-            if (missing.is_top_level === false) {
-                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
-            } else {
-                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
-            }
+            html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
             html += `</div>`;
         } else if (isSubgraphNode) {
             // Node type is a UUID (subgraph) but we don't have the name (shouldn't happen, but handle gracefully)
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
             html += `<span><strong>Node:</strong> <em>Subgraph</em> (ID: ${nodeId})</span>`;
-            if (missing.is_top_level === false) {
-                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
-            } else {
-                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
-            }
+            html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
             html += `</div>`;
         } else {
             // Regular node
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
             html += `<span><strong>Node:</strong> ${nodeType} (ID: ${nodeId})</span>`;
-            if (missing.is_top_level === false) {
-                html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
-            } else {
-                html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
-            }
+            html += `<button id="${locateId}" class="model-linker-resolve-btn" style="padding:2px 8px;">Locate</button>`;
             html += `</div>`;
         }
         html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${originalPath}</code></div>`;
@@ -2169,45 +2157,59 @@ export class LinkerManagerDialog {
         }
     }
 
-    // Center and select a node in the current graph by ID
-    locateNodeInGraph(nodeId) {
+    /** The live canvas node(s) a reference points at. Subgraph instances share one definition. */
+    liveNodesFor(ref) {
+        if (!app?.graph) return [];
+        const node = ref.is_top_level === false
+            ? this.findLiveNodeInSubgraphs(app.graph, ref.subgraph_id, ref.node_id)
+            : (app.graph.getNodeById?.(ref.node_id) || app.graph._nodes_by_id?.[ref.node_id]);
+        return node ? [node] : [];
+    }
+
+    /**
+     * Move the viewport onto a live node, entering its subgraph first when the
+     * canvas shows another graph. Ported from upstream, which mirrors the
+     * frontend's useFocusNode (the locate button in ComfyUI's workflow
+     * overview). Older frontends lack setGraph/animateToBounds; both degrade.
+     */
+    async focusNode(node) {
+        const canvas = app.canvas;
+        const graph = node.graph;
+        if (graph && canvas.graph !== graph && typeof canvas.setGraph === 'function') {
+            const isRoot = graph.isRootGraph ?? (graph === (app.rootGraph || app.graph));
+            canvas.subgraph = isRoot ? undefined : graph;
+            canvas.setGraph(graph);
+            // LiteGraph needs a full frame in the new graph before measuring
+            await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+        }
+        if (typeof canvas.animateToBounds === 'function' && node.boundingRect) {
+            canvas.animateToBounds(node.boundingRect);
+        } else {
+            canvas.centerOnNode?.(node);
+        }
+        if (typeof canvas.selectNode === 'function') canvas.selectNode(node);
+        else canvas.selectNodes?.([node]);
+        canvas.setDirty?.(true, true);
+    }
+
+    async locateRef(ref) {
+        if (!app?.graph || !app?.canvas) {
+            this.showNotification('Canvas not available', 'error');
+            return;
+        }
+        const [node] = this.liveNodesFor(ref);
+        if (!node) {
+            const where = ref.subgraph_name || ref.subgraph_id;
+            this.showNotification(where
+                ? `Node #${ref.node_id} not found - subgraph "${where}" has no live instance on the canvas`
+                : `Node #${ref.node_id} not found on the canvas`, 'error');
+            return;
+        }
+        this.close();  // the canvas has to be visible to be of any use
         try {
-            if (!app || !app.graph) {
-                this.showNotification('Graph not available', 'error');
-                return;
-            }
-            let node = null;
-            if (typeof app.graph.getNodeById === 'function') {
-                try { node = app.graph.getNodeById(nodeId); } catch (e) { /* ignore */ }
-            }
-            if (!node && app.graph._nodes_by_id) {
-                node = app.graph._nodes_by_id[nodeId];
-            }
-            if (!node) {
-                this.showNotification('Node not found in current view', 'error');
-                return;
-            }
-            const canvas = app.canvas;
-            if (canvas) {
-                // Deselect other nodes
-                if (typeof canvas.deselectAllNodes === 'function') {
-                    try { canvas.deselectAllNodes(); } catch (e) { }
-                }
-                // Select this node
-                if (typeof canvas.selectNode === 'function') {
-                    try { canvas.selectNode(node, true); } catch (e) { }
-                } else if (typeof canvas.selectNodes === 'function') {
-                    try { canvas.selectNodes([node], true); } catch (e) { }
-                }
-                // Center on node
-                if (typeof canvas.centerOnNode === 'function') {
-                    try { canvas.centerOnNode(node); } catch (e) { }
-                } else if (typeof canvas.scrollToCenter === 'function') {
-                    try { canvas.scrollToCenter(); } catch (e) { }
-                }
-            }
+            await this.focusNode(node);
         } catch (error) {
-            console.error('Model Linker: locateNodeInGraph error', error);
+            console.error('Model Linker: locate failed', error);
         }
     }
 

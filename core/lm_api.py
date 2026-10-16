@@ -17,11 +17,24 @@ class LoraManagerUnavailable(Exception):
     timeout, a connection error). `scan()` uses this to tell "this root
     is spelled differently" (400) apart from "Lora Manager isn't reachable
     right now", which must never be treated the same way.
+
+    `unreachable` is True only for the two `_call` failures that never got
+    an HTTP response at all - no server to ask, or the request itself
+    raised (a timeout, a connection error). It is deliberately *not* just
+    "`status_code is None`": `hydrate_huggingface`'s own local validation
+    (a model outside its root, a zero-byte file) also raises with no
+    `status_code`, and that is not Lora Manager being unreachable - it is
+    this call refusing to even try, for a reason that has nothing to do
+    with connectivity. `lm_backfill._run` uses this flag to decide whether
+    a per-model failure means "stop the whole run" (Lora Manager itself has
+    stopped answering) or "record it and move on" (an ordinary failure,
+    still a real response from a server that is still up).
     """
 
-    def __init__(self, message: str, status_code: Optional[int] = None):
+    def __init__(self, message: str, status_code: Optional[int] = None, unreachable: bool = False):
         super().__init__(message)
         self.status_code = status_code
+        self.unreachable = unreachable
 
 
 def lm_path(path: str) -> str:
@@ -35,11 +48,14 @@ def _call(method: str, route: str, **kwargs) -> Dict[str, Any]:
         from server import PromptServer
         url = f'http://127.0.0.1:{PromptServer.instance.port}/api/lm{route}'
     except Exception as e:
-        raise LoraManagerUnavailable(f'ComfyUI server not available: {e}')
+        raise LoraManagerUnavailable(f'ComfyUI server not available: {e}', unreachable=True)
     try:
         response = requests.request(method, url, timeout=TIMEOUT, **kwargs)
     except requests.RequestException as e:
-        raise LoraManagerUnavailable(str(e))
+        # Timed out, connection refused, connection reset, DNS failure, ... -
+        # no response was ever received, as opposed to a response that
+        # happens to carry an error status (handled below, not unreachable).
+        raise LoraManagerUnavailable(str(e), unreachable=True)
     try:
         data = response.json()
     except ValueError:

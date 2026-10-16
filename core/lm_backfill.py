@@ -295,6 +295,7 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
         except OSError as e:
             logger.warning(f"Model Linker: could not save the backfill report: {e}")
         hydrated = []
+        stop_error = None
         for item in items:
             if _cancel.is_set():
                 _update(status='cancelled')
@@ -322,6 +323,21 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
                     # nothing left to recover the words from.
                     extra['trainedWords_before'] = item['trainedWords_before']
                 _record(item, 'failed', **extra)
+                # A LoraManagerUnavailable that never got a response at all -
+                # a timeout, connection refused, or no server to ask - means
+                # Lora Manager itself has stopped answering, not that this
+                # one model failed. Its own README processing can block the
+                # whole aiohttp event loop (observed on the real library:
+                # model ~320 froze Lora Manager, and this run then spent
+                # three hours recording the identical timeout-then-refused
+                # failure for every remaining model while nothing was
+                # written for any of them). Stop here instead - the
+                # untouched models stay empty, and the next run (after a
+                # restart) picks them up, same as any other candidate.
+                if isinstance(e, lm_api.LoraManagerUnavailable) and e.unreachable:
+                    filename = os.path.basename(item['path'])
+                    stop_error = (f"Lora Manager stopped responding while processing {filename}; "
+                                  "the run was stopped. Restart ComfyUI and run again to continue.")
             # Persisted after every model, not only at the end, so an
             # interrupted run (a server restart, a crash) still leaves a
             # report listing every sidecar actually touched so far. A
@@ -333,7 +349,11 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
                 _save_report()
             except OSError as e:
                 logger.warning(f"Model Linker: could not save the backfill report: {e}")
+            if stop_error:
+                break
             time.sleep(PAUSE_BETWEEN_MODELS)
+        if stop_error:
+            raise lm_api.LoraManagerUnavailable(stop_error)
         if use_ai and hydrated and not _cancel.is_set():
             # One batch: Lora Manager runs each call as its own background task,
             # so a call per model would start them all at once. Its failure

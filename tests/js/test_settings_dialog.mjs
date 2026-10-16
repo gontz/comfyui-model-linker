@@ -26,5 +26,7 @@ export default async function run() {
   check('an interrupted run says to run again, and leaves the button usable',
     /run again to continue/.test(src));
   check('the outcome summary includes skipped', /\["skipped", "skipped"\]/.test(src));
+  check('the most recent per-model results are shown, not just aggregate counts',
+    /state\?\.results \|\| \[\]/.test(src));
   return check.failures;
 }

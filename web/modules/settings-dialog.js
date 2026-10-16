@@ -109,6 +109,17 @@ export class SettingsDialog {
             + (c.ai_skipped ? ` · AI skipped ${c.ai_skipped}` : "")
             + (state?.limit ? ` · sample of ${state.total || 0} from ${state.candidates_total || 0} empty models` : "")
             + (state?.ai_error ? `\nAI enrichment did not run: ${state.ai_error}` : "");
+        // The counts above are an aggregate; when something stopped the run
+        // (e.g. Lora Manager itself stopping responding - the top-level
+        // `error` names which file was in progress, but not what happened
+        // to the handful of models right before it), the last few actual
+        // results make that visible without building a full results table.
+        // Plain text via textContent, same as everything else here - safe
+        // regardless of what `file`/`error` (workflow- and disk-derived)
+        // actually contain.
+        const recent = (state?.results || []).slice(-5)
+            .map((r) => `  ${r.file}: ${r.outcome}${r.error ? ` (${r.error})` : ""}`).join("\n");
+        const details = recent ? `\n\nMost recent results:\n${recent}` : "";
         if (state?.status === "running") {
             this.backfillStatus.textContent = `Working… ${state.done || 0} / ${state.total || "?"}`
                 + `${state.current ? ` — ${state.current}` : ""}\n${summary}`;
@@ -117,12 +128,12 @@ export class SettingsDialog {
             // more, so the button must not stay disabled and polling must
             // not continue - starting again is the only way forward.
             this.backfillStatus.textContent = `Interrupted at ${state.done || 0} / ${state.total || "?"}`
-                + ` — run again to continue\n${summary}`;
+                + ` — run again to continue\n${summary}${details}`;
         } else if (state?.finished_at) {
             const when = new Date(state.finished_at * 1000).toLocaleString();
             const label = state.status === "error" ? `failed: ${state.error}` : state.status;
             const restored = state.from_report ? " (restored after a restart)" : "";
-            this.backfillStatus.textContent = `Last run ${label} (${when})${restored}\n${summary}`;
+            this.backfillStatus.textContent = `Last run ${label} (${when})${restored}\n${summary}${details}`;
         } else {
             this.backfillStatus.textContent = "";
         }

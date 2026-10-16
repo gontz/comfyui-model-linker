@@ -3,9 +3,11 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -528,6 +530,71 @@ class RunTests(BackfillTestCase):
         self.assertEqual(lm_backfill.status()['counts']['no_card'], 1)
 
 
+class CircuitBreakerTests(BackfillTestCase):
+    """
+    When Lora Manager itself stops answering - its own README processing
+    can block the whole aiohttp event loop - the run must stop rather than
+    spend hours recording the same timeout-then-connection-refused failure
+    for every remaining model while nothing is written for any of them
+    (observed on the real whole-library run: model ~320 of 864 froze Lora
+    Manager, and the run then recorded 543 'failed' entries over ~3 hours
+    with nothing written for any of them). An ordinary per-model failure
+    that still got a real response from Lora Manager (a 4xx/5xx JSON
+    error, a bad payload) must keep going as before.
+    """
+
+    def _write_five(self):
+        names = [f'm{i}' for i in range(1, 6)]
+        for name in names:
+            self.add_models('loras', [f'{name}.safetensors'], ['.safetensors'])
+            self.write_sidecar(name, source_url='https://huggingface.co/o/r')
+        return names
+
+    def test_a_timeout_stops_the_run_and_leaves_the_rest_untouched(self):
+        self._write_five()
+        seen_paths = []
+
+        def hydrate(path, model_root, repo):
+            seen_paths.append(path)
+            if len(seen_paths) == 2:
+                raise lm_api.LoraManagerUnavailable('timed out', unreachable=True)
+            self._default_hydrate(path, model_root, repo)
+
+        lm_backfill.lm_api.hydrate_huggingface.side_effect = hydrate
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=False)
+
+        self.assertEqual(len(seen_paths), 2)  # models 3-5 never reached hydrate_huggingface at all
+        failing_file = os.path.basename(seen_paths[1])
+        state = lm_backfill.status()
+        self.assertEqual(state['status'], 'error')
+        self.assertIn(failing_file, state['error'])
+        self.assertIn('Restart ComfyUI', state['error'])
+        outcomes = {r['file']: r['outcome'] for r in state['results']}
+        self.assertEqual(len(outcomes), 2)  # only the two touched models were ever recorded
+        self.assertEqual(outcomes[failing_file], 'failed')
+
+    def test_a_server_error_does_not_stop_the_run(self):
+        self._write_five()
+        seen_paths = []
+
+        def hydrate(path, model_root, repo):
+            seen_paths.append(path)
+            if len(seen_paths) == 2:
+                raise lm_api.LoraManagerUnavailable('Internal Server Error', status_code=500)
+            self._default_hydrate(path, model_root, repo)
+
+        lm_backfill.lm_api.hydrate_huggingface.side_effect = hydrate
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=False)
+
+        self.assertEqual(len(seen_paths), 5)  # every model was still attempted - the run kept going
+        state = lm_backfill.status()
+        self.assertEqual(state['status'], 'done')
+        self.assertEqual(state['counts'].get('failed'), 1)
+        self.assertEqual(state['counts'].get('hydrated'), 4)
+
+
 class StartStopTests(BackfillTestCase):
     def test_start_refuses_a_second_concurrent_run(self):
         """
@@ -605,13 +672,18 @@ class LmApiTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         outside = os.path.join(os.path.dirname(root), 'elsewhere', 'm.safetensors')
         with mock.patch.object(lm_api, '_call', side_effect=AssertionError('must not be called')):
-            with self.assertRaises(lm_api.LoraManagerUnavailable):
+            with self.assertRaises(lm_api.LoraManagerUnavailable) as ctx:
                 lm_api.hydrate_huggingface(outside, root, 'o/r')
+        # A local validation refusal is not Lora Manager being unreachable -
+        # it never even tried to ask - so it must not trip the run's
+        # circuit breaker, which only looks at `.unreachable`.
+        self.assertFalse(ctx.exception.unreachable)
         # Another drive makes os.path.relpath raise ValueError on Windows
         with mock.patch.object(lm_api.os.path, 'relpath', side_effect=ValueError('different drives')), \
              mock.patch.object(lm_api, '_call', side_effect=AssertionError('must not be called')):
-            with self.assertRaises(lm_api.LoraManagerUnavailable):
+            with self.assertRaises(lm_api.LoraManagerUnavailable) as ctx:
                 lm_api.hydrate_huggingface('D:/m.safetensors', root, 'o/r')
+        self.assertFalse(ctx.exception.unreachable)
 
     def test_hydrating_a_zero_byte_file_is_refused(self):
         """
@@ -624,8 +696,38 @@ class LmApiTests(unittest.TestCase):
         empty = os.path.join(root, 'm.safetensors')
         open(empty, 'wb').close()
         with mock.patch.object(lm_api, '_call', side_effect=AssertionError('must not be called')):
-            with self.assertRaises(lm_api.LoraManagerUnavailable):
+            with self.assertRaises(lm_api.LoraManagerUnavailable) as ctx:
                 lm_api.hydrate_huggingface(empty, root, 'o/r')
+        self.assertFalse(ctx.exception.unreachable)  # a local refusal, not Lora Manager going quiet
+
+    def test_unreachable_is_set_only_when_no_response_was_ever_received(self):
+        """
+        `_call`'s two no-response raises (no ComfyUI server to ask; the
+        request itself raising - a timeout, connection refused, DNS
+        failure, ...) must set `unreachable=True`. A raise built from an
+        actual HTTP response (an error status, `success: false`) must not,
+        even though it is also a failure - Lora Manager answered, it just
+        answered with an error. `lm_backfill._run`'s circuit breaker relies
+        on exactly this distinction to tell "Lora Manager has gone quiet,
+        stop" apart from "one model failed, keep going".
+        """
+        fake_server = types.ModuleType('server')
+        fake_server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(port=8765))
+        with mock.patch.dict(sys.modules, {'server': fake_server}), \
+             mock.patch('requests.request', side_effect=requests.exceptions.ConnectionError('refused')):
+            with self.assertRaises(lm_api.LoraManagerUnavailable) as ctx:
+                lm_api._call('GET', '/model-sources')
+        self.assertTrue(ctx.exception.unreachable)
+        self.assertIsNone(ctx.exception.status_code)
+
+        response = mock.MagicMock(status_code=500)
+        response.json.return_value = {'error': 'boom'}
+        with mock.patch.dict(sys.modules, {'server': fake_server}), \
+             mock.patch('requests.request', return_value=response):
+            with self.assertRaises(lm_api.LoraManagerUnavailable) as ctx:
+                lm_api._call('GET', '/model-sources')
+        self.assertFalse(ctx.exception.unreachable)
+        self.assertEqual(ctx.exception.status_code, 500)
 
     def test_scan_falls_back_to_a_full_scan_on_an_unknown_root(self):
         calls = []

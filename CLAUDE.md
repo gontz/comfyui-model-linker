@@ -79,7 +79,17 @@ requires no network call during analysis, and stays.
   filename — never the missing model's name.
 - **Filling empty Lora Manager info from HuggingFace** is a server job started from
   ⚙ Settings (not automatic), implemented in `core/lm_backfill.py`; its last report
-  persists in `data/lm-backfill.json` (gitignored). See "Lora Manager sidecars" below.
+  persists in `data/lm-backfill.json` (gitignored). `GET /lm-backfill` (polled by the
+  dialog) returns only the last 20 results plus `results_total`; the full list stays in
+  the live state and on disk. See "Lora Manager sidecars" below.
+- **Never interpolate a request exception's text** (`{e}`, `str(e)`) anywhere headers
+  carried a token: a token with a CR/LF makes requests raise `InvalidHeader` with the whole
+  `Authorization` value in its message. Report `type(e).__name__` (re-raise `from None`),
+  as `settings.check_token`, `civitai_meta._get_json`, `hf_identify._get`,
+  `online_search._get` and `downloader._stream` do. `hf_downloader._redact` also redacts
+  the token's repr-escaped form, which is how HTTP clients echo a bad header value.
+- **A search cache stores "not found" only from a complete search**: a 429 or any other
+  non-200 is no answer (`sources/huggingface.py`, `sources/civitai.py`).
 - **Modules:** `core/settings.py`, `core/routes_settings.py`, `core/sources/*`
   (`civitai`, `civarchive`, `huggingface`, `hf_index`, `popular`, `model_list`) with
   `metadata/*.json` and `tools/build_hf_index.py`, `core/source_chain.py`,
@@ -91,7 +101,10 @@ requires no network call during analysis, and stays.
   `core/routes_settings.py`) registers only when `requests` imports** (`__init__.py`'s
   guarded registration block) — without it, relinking from disk (`/analyze`,
   `/resolve`) still works; `/settings` and `/settings/check/{provider}` register
-  unconditionally.
+  unconditionally. `routes_export.register` has its own try/except after that block, so
+  a failure in Export is logged and leaves lookups and downloads working. `/analyze`
+  answers `lookups_available`; when it is `false` the dialog hides "☁ Download all
+  found" and Export says it needs `requests` instead of opening.
 
 ### Lora Manager sidecars
 
@@ -112,6 +125,9 @@ requires no network call during analysis, and stays.
 - **`file_path` uses the registered directory, not `realpath`** — the one deliberate
   exception to "Physical File Identity" below. Lora Manager indexes by its own configured
   path, so writing the resolved (junction-following) path would mismatch its catalogue.
+- **Only when Lora Manager is installed**: `write_sidecar` returns `'skipped'` before
+  anything else when `_LORA_MANAGER_DIR` is not a directory — no CivitAI call, no preview,
+  no file. Tests that exercise writing patch `_LORA_MANAGER_DIR` to a folder they create.
 - **Never overwrites an existing sidecar or preview.** Both land via a unique temp file
   and `downloader._rename_no_clobber()`; a collision (Lora Manager's own file already
   there) is reported, not replaced — `core/lm_sidecar.py`.
@@ -333,7 +349,7 @@ imports work with no build step. Import paths climb one level further from `web/
   notice; it is deduped per workflow via
   `app.extensionManager.workflow.activeWorkflow.path` (the `ModelLinker.OpenOnMissing`
   setting gates whether it opens the dialog at all)
-- A graph mutation the user triggers through this extension (Swap, Locate, Export) is one
+- A graph mutation the user triggers through this extension (Swap, Export) is one
   undo step via `app.canvas?.emitBeforeChange?.()` / `app.canvas?.emitAfterChange?.()` (the
   second in a `finally`) — not `graph.beforeChange()/afterChange()`, which in frontend 1.55
   only call `canvas.onBeforeChange` (nothing assigns it), and the root graph has no canvas
@@ -344,6 +360,10 @@ imports work with no build step. Import paths climb one level further from `web/
   for saved overrides too — an override *records* a workflow-supplied name, so the overrides
   manager renders untrusted text however local the file looks. Use `escapeHtml()`, and pass
   URLs through `safeHttpUrl()`
+- Queued selections belong to the workflow they were picked on: `ModelLinker.onGraphLoaded`
+  clears them (and their selected bars) whenever `workflowKey()` changes, and re-analyses
+  an open dialog. Reloading the same workflow (an undo does) keeps them; with no workflow
+  identity, every load clears them
 - Only one analysis may render: a new one aborts the request in flight, and a superseded
   answer is discarded. Without that, two overlapping analyses both complete and whichever
   *arrives* last wins

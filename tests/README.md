@@ -46,6 +46,7 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `test_online_search.py` | scores and returns similar-model candidates (CivitAI + HuggingFace); one failing source doesn't hide the others, tokens go only to their own host, a total outage is reported rather than returning empty — the same-basename refusal itself is frontend-only, see `js/test_downloads.mjs` |
 | `test_hf_identify.py` | identifying a HuggingFace repo by SHA-256 |
 | `test_lm_backfill.py` | the Lora Manager HuggingFace backfill: no forced scans, `linked_elsewhere` for non-HF links, `hydrated` verified against pre-hydration values (else `no_card`), AI gated to models with no trigger words/notes/usage tips/base model, `trainedWords_before` restore trail, `interrupted` after a restart, `limit` |
+| `test_registration.py` | route registration in `__init__.py`: a failing Export leaves lookups working; `/analyze` answers `lookups_available` |
 | `test_exporter.py` | `strip_secrets` (userinfo, fragment, `;params`, secret query keys incl. AWS/GCS, losslessly); the exported note and node links |
 | `js/test_extension.mjs` | registration (`commands`, `settings`, `afterConfigureGraph`, `nodeCreated`, `getCanvasMenuItems`); only `scripts/app.js`/`scripts/api.js` imported |
 | `js/test_escaping.mjs` | escaping workflow-supplied strings into HTML; URLs through `safeHttpUrl()` |
@@ -57,11 +58,12 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | `js/test_downloads.mjs` | `DownloadController`: keyed by canonical file key, reconnect after reload, 🔎 Search similar (refuses a candidate whose basename matches any on-screen card's, by basename alone, never scoped to category), cancel |
 | `js/test_locate.mjs` | Locate, including into a nested subgraph; the empty-result notification when a subgraph has no live instance |
 | `js/test_swap.mjs` | Swap: one queued resolution per node sharing a model, `record_override: false`, queue-panel removal by `swap_group` key |
+| `js/test_workflow_switch.mjs` | queued selections are cleared when another workflow loads (kept on a reload of the same one); "Download all found" hidden and Export refused when `lookups_available` is false |
 | `js/test_export.mjs` | Export: `strip_secrets` round-trip, the "Model links" note, the muted Model Linker node, re-applying without duplicating |
 
 Suites that need `requests` (`test_sources.py`, `test_source_chain.py`, `test_downloader.py`,
 `test_hf_routing.py`, `test_online_search.py`, `test_hf_identify.py`, `test_lm_backfill.py`,
-`test_lm_sidecar.py`) are reported as skipped, not failing, when it is not installed.
+`test_lm_sidecar.py`, `test_registration.py`) are reported as skipped, not failing, when it is not installed.
 
 `support.py` holds the fixtures. `LibraryTestCase` gives each test a temporary
 `models/` tree wired into the fake `folder_paths`; `add_models` creates files

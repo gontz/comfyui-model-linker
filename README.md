@@ -50,15 +50,17 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
 - **Download Links**: When a workflow records where a model came from, the original download
   is offered — useful when nothing on disk resembles it
 - **Background Lookups**: For a missing model with no link of its own, Model Linker checks
-  HuggingFace and CivitAI for a matching download in the background after the analysis
-  already answered, so missing-model results never wait on the network. Results are shown
-  as they arrive and persist for next time. Turn this off any time in ⚙ Settings
-  (`auto_lookup`)
+  HuggingFace and CivitAI (and CivArchive, when the workflow records the model's SHA-256)
+  for a matching download in the background after the analysis already answered, so
+  missing-model results never wait on the network. They start as soon as a workflow is
+  loaded, not only when the dialog opens. Results are shown as they arrive and persist for
+  next time. On by default; turn this off any time in ⚙ Settings (`auto_lookup`)
 - **Downloads**: Start a found or looked-up download straight from the dialog — two at a
   time, continuing on the server even if you close the dialog or the tab
-- **Lora Manager Info**: A downloaded model gets a Lora Manager-format sidecar (trigger
-  words, base model, preview image) when CivitAI has that data, without overwriting
-  anything Lora Manager already wrote
+- **Lora Manager Info**: When Lora Manager is installed, a downloaded model gets a Lora
+  Manager-format sidecar — trigger words, base model and preview image when CivitAI knows
+  the file, a minimal one otherwise — without overwriting anything Lora Manager already
+  wrote. Without Lora Manager no sidecar is written and nothing is sent to CivitAI
 - **🔎 Search Similar**: User-initiated — nothing is searched automatically. A chosen file
   downloads and keeps its own filename, never the missing model's name, and a candidate
   whose name already matches a model shown on screen is refused (shared/junctioned model
@@ -72,8 +74,10 @@ https://github.com/user-attachments/assets/fedf3645-aa66-49f7-b01d-8c3b5127faf4
   action, without saving an override (so it won't silently apply to other workflows)
 - **Locate in Subgraphs**: Jump straight to a reference that lives inside a nested subgraph
 - **Export**: Share a workflow with its model links intact. Download URLs are stripped of
-  tokens and credentials before they're written; a muted **Model Linker** node is added so
-  the shared workflow still runs with this extension not installed
+  tokens and credentials before they're written, and a **Model Linker** node is added. It
+  is added muted, and the muting is what lets the shared workflow run where this extension
+  is not installed; recipients without it will still see ComfyUI's missing-node notice for
+  `ModelLinker`. Export needs the Python package `requests`
 - **Load-Time Notice**: Opening a workflow with missing models can open Model Linker
   automatically — turn on "Open Model Linker when a loaded workflow has missing models"
   in **ComfyUI's own Settings** (gear icon, under "Model Linker" → "Workflow loading";
@@ -91,10 +95,12 @@ no token is saved in Settings. Tokens are never echoed back in error messages.
 
 ## Privacy
 
-- **Background lookups** send a missing model's filename (never a path) to HuggingFace and
-  CivitAI to look for a matching download. Turn this off in ⚙ Settings (`auto_lookup`); it
-  never goes online for a model that already carries its own download link — that link is
-  returned as-is, before any search.
+- **Background lookups** start as soon as a workflow is loaded (the dialog need not be
+  open) and are **on by default**. For each missing model they send its filename (never a
+  path) to HuggingFace and CivitAI, and — when the workflow records the model's SHA-256 —
+  that hash to CivitAI and CivArchive, to look for a matching download. Turn this off in
+  ⚙ Settings (`auto_lookup`); it never goes online for a model that already carries its own
+  download link — that link is returned as-is, before any search.
 - **🔎 Search similar** sends a filename online only when you press it for that specific
   model.
 - **Export** looks up links the same way background lookups do, for every model in the
@@ -103,6 +109,10 @@ no token is saved in Settings. Tokens are never echoed back in error messages.
   press "Find links", which asks once regardless of the setting.
 - **The Lora Manager HuggingFace fill** (⚙ Settings) sends the SHA-256 and filename of
   models Lora Manager already catalogues, to identify the matching HuggingFace repo.
+- **After a download**, and only when Lora Manager is installed, the file's SHA-256 is sent
+  to CivitAI to fill in its Lora Manager info, and a preview image is fetched from CivitAI's
+  image CDN. For a file downloaded from HuggingFace, Lora Manager is also asked to read that
+  repo's model card.
 - Nothing contacts a workflow's own recorded URL during any of the above — that link is
   only ever shown to you, never fetched.
 
@@ -110,7 +120,8 @@ no token is saved in Settings. Tokens are never echoed back in error messages.
 
 Model Linker makes network calls only for the features above, and only when they run:
 background lookups (unless turned off), Export's own lookups (same switch, plus "Find
-links"), downloads you start, 🔎 Search similar, and the Lora Manager HuggingFace fill.
+links"), downloads you start (and, with Lora Manager installed, their Lora Manager info),
+🔎 Search similar, and the Lora Manager HuggingFace fill.
 See **Privacy** above for exactly what each one sends.
 
 ## License

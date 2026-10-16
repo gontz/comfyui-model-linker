@@ -279,14 +279,14 @@ export class ExportDialog {
      * A non-http(s) URL (`s3://...`, etc.) that `strip_secrets` never
      * touches server-side (it is a no-op there for any scheme but http(s)):
      * kept only if it carries no credential-shaped part of its own - no
-     * userinfo, query, fragment or `;` path parameter.
+     * userinfo, query, fragment, or `;` anywhere (a non-special scheme's
+     * host is opaque, so `s3://bucket;token=X/a` hides one outside the path).
      */
     static cleanNonHttpUrl(value) {
-        if (typeof value !== "string") return false;
+        if (typeof value !== "string" || value.includes(";")) return false;
         try {
             const parsed = new URL(value);
-            return !parsed.username && !parsed.password && !parsed.search && !parsed.hash
-                && !parsed.pathname.includes(";");
+            return !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
         } catch (e) {
             return false;
         }
@@ -466,13 +466,21 @@ export class ExportDialog {
             };
             const linked = rows.filter((row) => finalUrl(row)).map((row) => ({ ...row, url: finalUrl(row) }));
 
+            // The note is optional: when it cannot be built (the server
+            // refuses more than 500 models, say), the node links - scrubs
+            // included - are still written, and the note is left as it was
             let markdown = "";
+            let noteFailed = false;
             if (this.option("note") && linked.length) {
                 try {
                     ({ markdown } = await this.request("/model_linker/export/markdown", {
                         models: linked.map((row) => ({ name: row.name, url: row.url, directory: row.category })),
                     }));
-                } catch (error) { notifyError("Could not build the links note", error); return; }
+                } catch (error) {
+                    noteFailed = true;
+                    markdown = "";
+                    notifyError("Could not build the links note; the node links are written without it", error);
+                }
                 if (rows !== this.rows) return;
             }
 
@@ -500,7 +508,7 @@ export class ExportDialog {
                         }
                         if (note.widgets?.[0]) note.widgets[0].value = markdown;
                         note.widgets_values = [markdown];
-                    } else if (existingNote) {
+                    } else if (existingNote && !noteFailed) {
                         // The option is on but nothing is linked any more:
                         // leave no stale note (or stale credential inside one)
                         if (existingNote.widgets?.[0]) existingNote.widgets[0].value = "";

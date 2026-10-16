@@ -647,6 +647,51 @@ export default async function run() {
           opened.rows[0].url === 'https://found/m0.safetensors' && opened.rows[500].url === 'https://found/m500.safetensors');
   });
 
+  // --- Fix round 5 ---------------------------------------------------------
+  //
+  // The note cannot be built (/export/markdown refuses more than 500 models
+  // with a 400): the node links - added and scrubbed - are still written in
+  // the one undo step, the existing note is left as it was, and the failure
+  // is reported as a toast.
+  await withFakeCanvas(async ({ graph, canvasCalls }) => {
+    const oldNote = { type: 'MarkdownNote', pos: [0, 0], size: [1, 1], properties: { model_linker_note: true },
+      widgets: [{ value: 'old note' }], widgets_values: ['old note'], mode: 0, graph: null };
+    const loose = { properties: { models: [{ name: 'l.safetensors', url: 'https://h/l?token=T' }] } };
+    graph.add(oldNote); graph.add(loose);
+    const refN = { node_id: 5, widget_index: 0, original_path: 'n.safetensors', category: 'loras' };
+    const nodeN = { properties: {} };
+    const rowN = { key: 'loras|n.safetensors', name: 'n.safetensors', category: 'loras', original_path: 'n.safetensors',
+      url: 'https://h/n?token=T', sha256: '', present: true, refs: [refN] };
+    const strip = stripRequest();
+    const dialog = makeDialog({ rows: [rowN], linker: { liveNodesFor: (r) => (r === refN ? [nodeN] : []) },
+      option: () => true,
+      request: async (path, body) => {
+        if (path === '/model_linker/export/markdown') throw new Error('models must be a list');
+        return strip(path, body);
+      } });
+    globalThis.__toasts = [];
+    await dialog.apply();
+    check('note failure: the node link is still added', nodeN.properties.models?.[0]?.url === 'https://h/n');
+    check('note failure: an orphan is still scrubbed', loose.properties.models[0].url === 'https://h/l');
+    check('note failure: the existing note is left as it was, and no second one added',
+          oldNote.widgets_values[0] === 'old note' && graph._nodes.filter((n) => n.properties?.model_linker_note).length === 1);
+    check('note failure: still one undo step', canvasCalls.join(',') === 'before,after');
+    check('note failure: reported as an error toast',
+          globalThis.__toasts.some((t) => t.severity === 'error' && /links note/.test(t.summary)));
+  });
+
+  // A ';' anywhere in a non-http link is unclean - a non-special scheme's
+  // host is opaque, so s3://bucket;token=X/a carries it outside the path.
+  await withFakeCanvas(async ({ graph }) => {
+    check('cleanNonHttpUrl rejects ; in an opaque host', ExportDialog.cleanNonHttpUrl('s3://bucket;token=X/a') === false);
+    check('cleanNonHttpUrl still keeps a clean s3 link', ExportDialog.cleanNonHttpUrl('s3://bucket/a') === true);
+    const node = { properties: { models: [{ name: 'h.safetensors', url: 's3://bucket;token=X/a' }] } };
+    graph.add(node);
+    const dialog = makeDialog({ request: async (path) => { throw new Error('nothing to send: ' + path); } });
+    await dialog.apply();
+    check('a non-http orphan with ; in its host is deleted', !('url' in node.properties.models[0]));
+  });
+
   // Scenario 7 (item 2b, faithful transcription - LinkerManagerDialog needs a
   // live DOM this harness does not have, same reason test_analyze_race.mjs
   // uses a stub rather than the real class): a tab switch while openExport()

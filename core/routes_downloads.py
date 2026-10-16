@@ -6,7 +6,7 @@ imports - see __init__.setup_routes.
 import asyncio
 import logging
 
-from . import downloader, lookups, online_search
+from . import downloader, lm_backfill, lookups, online_search
 
 logger = logging.getLogger(__name__)
 
@@ -96,3 +96,27 @@ def register(routes, web) -> None:
     @routes.post("/model_linker/cancel/{download_id}")
     async def cancel(request):
         return web.json_response({'success': downloader.cancel_download(request.match_info['download_id'])})
+
+    @routes.get("/model_linker/lm-backfill")
+    async def backfill_status(request):
+        return web.json_response(lm_backfill.status())
+
+    @routes.post("/model_linker/lm-backfill/start")
+    async def backfill_start(request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        use_ai = bool(data.get('use_ai'))
+        limit = data.get('limit')
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+            return _bad(web, 'limit must be a positive integer')
+        started = lm_backfill.start(use_ai=use_ai, limit=limit)
+        return web.json_response({'started': started, 'state': lm_backfill.status()})
+
+    @routes.post("/model_linker/lm-backfill/cancel")
+    async def backfill_cancel(request):
+        lm_backfill.cancel()
+        return web.json_response({'state': lm_backfill.status()})

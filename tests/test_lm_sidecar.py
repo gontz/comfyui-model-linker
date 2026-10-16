@@ -4,10 +4,10 @@ Lora Manager skip the model entirely, so the required set is checked against
 Lora Manager's published schema whenever it is installed alongside.
 """
 
+import importlib.util
 import json
 import os
 import shutil
-import sys
 import tempfile
 import types
 import unittest
@@ -295,6 +295,20 @@ class WriteTests(SidecarTestCase):
         data = self.read()
         self.assertTrue(data['preview_url'].endswith('/rebel.jpeg'))
 
+    @unittest.skipUnless(importlib.util.find_spec('requests'), 'requests is not installed')
+    def test_huggingface_download_is_hydrated_by_lora_manager(self):
+        calls = []
+        with mock.patch.object(civitai_meta, 'version_for_sha256', return_value=None), \
+             mock.patch('core.lm_api.link_huggingface', lambda *a: calls.append('link')), \
+             mock.patch('core.lm_api.hydrate_huggingface', lambda *a: calls.append('hydrate')), \
+             mock.patch('core.downloader.category_directory', return_value=self.root):
+            outcome = lm_sidecar.on_download_complete({
+                'path': self.model, 'category': 'loras', 'sha256': SHA,
+                'url': 'https://huggingface.co/o/r/resolve/main/rebel.safetensors'})
+        self.assertEqual(outcome, 'written+huggingface')
+        self.assertEqual(calls, ['link', 'hydrate'])
+        self.assertEqual(self.notified, [('loras', False)])  # no CivitAI fetch for a HF file
+
 
 class LoraManagerSettingsTests(unittest.TestCase):
     """settings.json is found where Lora Manager itself looks for it."""
@@ -500,27 +514,35 @@ class ApplyUmaskTests(unittest.TestCase):
 
 
 class NotifyLoraManagerTests(unittest.TestCase):
-    """`notify_lora_manager` is best-effort HTTP to a locally running Lora Manager."""
+    """
+    `notify_lora_manager` is best effort and now delegates the actual HTTP to
+    `lm_api` (Task 9). The scoped-scan-falls-back-to-a-full-scan behaviour
+    this used to assert directly now lives in, and is covered by,
+    `lm_api.scan` itself (see `tests/test_lm_backfill.py`'s
+    `LmApiTests.test_scan_falls_back_to_a_full_scan`); what is left to check
+    here is that `notify_lora_manager` calls `lm_api` with the right
+    arguments and swallows `LoraManagerUnavailable`.
+    """
 
     def setUp(self):
         self.model = os.path.join(tempfile.mkdtemp(prefix='model-linker-lm-notify-'), 'rebel.safetensors')
         self.addCleanup(shutil.rmtree, os.path.dirname(self.model), True)
-        fake_server = types.ModuleType('server')
-        fake_server.PromptServer = types.SimpleNamespace(instance=types.SimpleNamespace(port=8765))
-        patcher = mock.patch.dict(sys.modules, {'server': fake_server})
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
-    def test_a_400_on_the_scoped_scan_falls_back_to_a_full_scan(self):
-        calls = []
-
-        def fake_get(url, params=None, timeout=None):
-            calls.append((url, params))
-            return types.SimpleNamespace(status_code=400 if params else 200)
-
-        with mock.patch('requests.get', side_effect=fake_get), mock.patch('requests.post') as post:
+    def test_scans_only_the_models_own_root(self):
+        from core import lm_api
+        with mock.patch.object(lm_api, 'scan') as scan, mock.patch.object(lm_api, '_call') as call:
             lm_sidecar.notify_lora_manager('loras', self.model, fetch=False)
-        self.assertEqual(len(calls), 2)
-        self.assertIn('roots', calls[0][1])
-        self.assertIsNone(calls[1][1])
-        post.assert_not_called()
+        scan.assert_called_once_with('loras', root=os.path.dirname(self.model))
+        call.assert_not_called()
+
+    def test_fetch_asks_lora_manager_to_pull_civitai_metadata_itself(self):
+        from core import lm_api
+        with mock.patch.object(lm_api, 'scan'), mock.patch.object(lm_api, '_call') as call:
+            lm_sidecar.notify_lora_manager('loras', self.model, fetch=True)
+        call.assert_called_once_with('POST', '/loras/fetch-civitai',
+                                     json={'file_path': lm_api.lm_path(self.model)})
+
+    def test_lora_manager_unavailable_is_swallowed(self):
+        from core import lm_api
+        with mock.patch.object(lm_api, 'scan', side_effect=lm_api.LoraManagerUnavailable('down')):
+            lm_sidecar.notify_lora_manager('loras', self.model, fetch=True)  # must not raise

@@ -33,6 +33,7 @@ export class SettingsDialog {
             ]),
             ...PROVIDERS.map((p) => this.providerRow(p)),
             this.lookupRow(),
+            this.backfillRow(),
         ]);
     }
 
@@ -69,6 +70,62 @@ export class SettingsDialog {
         ]);
     }
 
+    backfillRow() {
+        this.useAi = $el("input", { type: "checkbox" });
+        this.backfillStatus = $el("div", { style: { fontSize: "12px", opacity: "0.8", whiteSpace: "pre-line" } });
+        this.backfillButton = $el("button.model-linker-resolve-btn", {
+            textContent: "Fill empty model info from HuggingFace",
+            style: { padding: "2px 10px", alignSelf: "flex-start" },
+            onclick: () => this.startBackfill(),
+        });
+        return $el("div", { style: { display: "flex", flexDirection: "column", gap: "6px",
+                borderTop: "1px solid var(--border-color)", paddingTop: "12px" } }, [
+            $el("strong", { textContent: "Lora Manager" }),
+            $el("div", { style: { fontSize: "12px", opacity: "0.6" },
+                textContent: "For models whose Lora Manager info is empty: finds the HuggingFace repo each file "
+                    + "came from (by its SHA-256, never by name alone), links it, and has Lora Manager read the "
+                    + "model card. Runs on the server; you can close this window. Models it cannot identify can "
+                    + "be linked by hand in Lora Manager and are filled on the next run." }),
+            $el("label", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
+                this.useAi, document.createTextNode("Also use Lora Manager's AI enrichment (base model, tags, usage tips)"),
+            ]),
+            this.backfillButton,
+            this.backfillStatus,
+        ]);
+    }
+
+    renderBackfill(state) {
+        const c = state?.counts || {};
+        const summary = `hydrated ${c.hydrated || 0} · not found ${c.not_found || 0} · failed ${c.failed || 0}`
+            + (state?.limit ? ` · sample of ${state.total || 0} from ${state.candidates_total || 0} empty models` : "")
+            + (state?.ai_error ? `\nAI enrichment did not run: ${state.ai_error}` : "");
+        if (state?.status === "running") {
+            this.backfillStatus.textContent = `Working… ${state.done || 0} / ${state.total || "?"}`
+                + `${state.current ? ` — ${state.current}` : ""}\n${summary}`;
+        } else if (state?.finished_at) {
+            const when = new Date(state.finished_at * 1000).toLocaleString();
+            this.backfillStatus.textContent = `Last run ${state.status === "error" ? `failed: ${state.error}` : state.status} (${when})\n${summary}`;
+        } else {
+            this.backfillStatus.textContent = "";
+        }
+        this.backfillButton.disabled = state?.status === "running";
+        clearTimeout(this.backfillTimer);
+        if (state?.status === "running" && this.element.style.display !== "none") {
+            this.backfillTimer = setTimeout(async () => {
+                try { this.renderBackfill(await this.request("/model_linker/lm-backfill")); } catch (e) { }
+            }, 2000);
+        }
+    }
+
+    async startBackfill() {
+        try {
+            const result = await this.request("/model_linker/lm-backfill/start", { use_ai: this.useAi.checked });
+            this.renderBackfill(result.state);
+        } catch (error) {
+            notifyError("Could not start filling model info", error);
+        }
+    }
+
     render(view) {
         for (const p of PROVIDERS) {
             const row = this.rows[p.id];
@@ -96,6 +153,7 @@ export class SettingsDialog {
         this.element.style.display = "flex";
         try {
             this.render(await this.request("/model_linker/settings"));
+            this.renderBackfill(await this.request("/model_linker/lm-backfill"));
         } catch (error) {
             notifyError("Could not load settings", error);
         }

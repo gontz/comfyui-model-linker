@@ -399,23 +399,13 @@ def notify_lora_manager(prefix: str, model_path: str, fetch: bool = False) -> No
     its info itself when CivitAI could not be asked (its own chain also tries
     CivArchive). Silently does nothing when Lora Manager is not installed.
     """
+    from . import lm_api
     try:
-        import requests
-        from server import PromptServer
-        port = PromptServer.instance.port
-    except Exception:
-        return
-    base = f'http://127.0.0.1:{port}/api/lm/{prefix}'
-    try:
-        # Only the folder the download landed in (a category root). Lora
-        # Manager answers 400 for a root it spells differently; scan all then.
-        response = requests.get(f'{base}/scan', params={'roots': lm_path(os.path.dirname(model_path))},
-                                timeout=300)
-        if response.status_code == 400:
-            requests.get(f'{base}/scan', timeout=300)
+        # The download landed in a category root: scan only that root
+        lm_api.scan(prefix, root=os.path.dirname(model_path))
         if fetch:
-            requests.post(f'{base}/fetch-civitai', json={'file_path': lm_path(model_path)}, timeout=300)
-    except Exception as e:
+            lm_api._call('POST', f'/{prefix}/fetch-civitai', json={'file_path': lm_api.lm_path(model_path)})
+    except lm_api.LoraManagerUnavailable as e:
         logger.debug(f"Model Linker: Lora Manager not notified: {e}")
 
 
@@ -464,4 +454,27 @@ def write_sidecar(model_path: str, category: str, sha256: str, fetch_if_unknown:
 def on_download_complete(record: Dict[str, Any]) -> Optional[str]:
     if not record.get('sha256') or not record.get('path'):
         return None
-    return write_sidecar(record['path'], record.get('category'), record['sha256'])
+    from . import hf_identify, lm_api
+    from .downloader import category_directory
+
+    path = record['path']
+    repo = hf_identify.repo_from_url(record.get('url'))
+    # A HuggingFace file is hydrated from its model card below; asking Lora
+    # Manager to fetch it from CivitAI first would only cost a futile lookup
+    outcome = write_sidecar(path, record.get('category'), record['sha256'], fetch_if_unknown=not repo)
+    if outcome != 'written' or not repo:
+        return outcome
+    try:
+        with open(sidecar_path(path), 'r', encoding='utf-8') as handle:
+            written = json.load(handle)
+    except (OSError, ValueError):
+        written = {}
+    if (written.get('civitai') or {}).get('id'):
+        return outcome  # CivitAI knew the file; its record is the richer one
+    try:
+        lm_api.link_huggingface(path, repo)
+        lm_api.hydrate_huggingface(path, category_directory(record['category']), repo)
+    except lm_api.LoraManagerUnavailable as e:
+        logger.info(f"Model Linker: Lora Manager could not read {repo}'s model card: {e}")
+        return outcome
+    return 'written+huggingface'

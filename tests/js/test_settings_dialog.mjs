@@ -13,5 +13,9 @@ export default async function run() {
   check('offers the background lookup switch', /auto_lookup/.test(src));
   check('explains what background lookup sends', /HuggingFace and CivitAI/.test(src));
   check('the header opens it', /new SettingsDialog\(/.test(readSource('modules/linker-dialog.js')));
+  check('offers filling empty Lora Manager info', /\/model_linker\/lm-backfill\/start/.test(src));
+  check('AI enrichment is opt-in', /use_ai:\s*this\.useAi\.checked/.test(src));
+  check('progress is shown as text, not markup', /backfillStatus\.textContent\s*=/.test(src));
+  check('an AI enrichment failure is shown', /ai_error/.test(src));
   return check.failures;
 }

@@ -126,8 +126,10 @@ export class LinkerManagerDialog {
                         #model-linker-modal #model-linker-missing-list > div {
                             display: block !important;
                         }
-                        /* Make direct children inside each missing item stack vertically */
-                        #model-linker-modal #model-linker-missing-list > div > div,
+                        /* Make direct children inside each missing item stack vertically.
+                           The "Selected" bar is excluded: it shows and hides itself through
+                           its inline display, which !important here would override. */
+                        #model-linker-modal #model-linker-missing-list > div > div:not(.model-linker-selected),
                         #model-linker-modal #model-linker-missing-list > div > p,
                         #model-linker-modal #model-linker-missing-list > div > ul,
                         #model-linker-modal #model-linker-missing-list > div > li {

@@ -594,12 +594,26 @@ export class LinkerManagerDialog {
         const list = Array.isArray(this.pendingResolutions) ? this.pendingResolutions : [];
         if (i < 0 || i >= list.length) return;
         const r = list[i];
-        // Remove
-        this.pendingResolutions.splice(i, 1);
+        // A swap queues one resolution per node that loads this model. Removing
+        // only the clicked row would strand the rest of the group half-queued,
+        // with no bar showing them and no way back to "not queued" - so
+        // removing any swap entry removes every entry in its group.
+        const sameSwapGroup = (res) => res.record_override === false
+            && res.original_path === r.original_path
+            && res.category === r.category;
+        const removed = (r.record_override === false) ? list.filter(sameSwapGroup) : [r];
+        this.pendingResolutions = list.filter((res) => !removed.includes(res));
         this.rebuildPendingIndex();
-        // Update per-item selected bar
-        const m = { node_id: r.node_id, widget_index: r.widget_index, subgraph_id: r.subgraph_id, is_top_level: r.is_top_level };
-        this.updateSelectedBarForMissing(m);
+        // Refresh the bar for every reference that just lost its resolution
+        removed.forEach((res) => {
+            this.updateSelectedBarForMissing({
+                node_id: res.node_id,
+                widget_index: res.widget_index,
+                list_index: res.list_index,
+                subgraph_id: res.subgraph_id,
+                is_top_level: res.is_top_level,
+            });
+        });
         this.updateApplyPendingButton();
         this.updateQueuePanel();
     }
@@ -1179,6 +1193,12 @@ export class LinkerManagerDialog {
             const swap = container.querySelector(`#present-swap-${index}`);
             const panel = container.querySelector(`#present-swap-panel-${index}`);
             if (!swap || !panel) return;
+            // The bar shows the first reference only; its Remove must drop the
+            // swap from every node, not just that one
+            const bindGroupRemove = () => {
+                const remove = panel.querySelector(`#selected-remove-${refSlot(first)}`);
+                if (remove) remove.onclick = () => this.removeSwapGroup(group);
+            };
             swap.onclick = async () => {
                 const opening = panel.style.display === 'none';
                 panel.style.display = opening ? '' : 'none';
@@ -1187,14 +1207,29 @@ export class LinkerManagerDialog {
                 await this.ensureAllModelsLoaded();
                 // A present model has no fuzzy matches; the picker lists the folder
                 this.attachModelCombo(panel, { ...first, matches: [] }, (model) => {
-                    group.refs.forEach((ref) => this.queueResolution({ ...ref, record_override: false }, model));
-                    // The bar shows the first reference only; its Remove must
-                    // drop the swap from every node, not just that one
-                    const remove = panel.querySelector(`#selected-remove-${refSlot(first)}`);
-                    if (remove) remove.onclick = () => group.refs.forEach((ref) => this.removeQueuedResolution(ref));
+                    this.queueSwap(group, model);
+                    bindGroupRemove();
                 });
             };
+            // A re-render (new analysis, tab switch) rebuilds this row from
+            // scratch, so a swap queued before it has no bar and no Remove
+            // wiring yet - restore both rather than leaving it invisible.
+            if (group.refs.some((ref) => this.pendingIndex && this.pendingIndex.has(refKey(ref)))) {
+                this.updateSelectedBarForMissing(first);
+                bindGroupRemove();
+                panel.style.display = '';
+            }
         });
+    }
+
+    /** Queue a swap: the same replacement for every node that loads this model. */
+    queueSwap(group, model) {
+        group.refs.forEach((ref) => this.queueResolution({ ...ref, record_override: false }, model));
+    }
+
+    /** Drop every queued entry a swap created, not just the one the UI shows. */
+    removeSwapGroup(group) {
+        group.refs.forEach((ref) => this.removeQueuedResolution(ref));
     }
 
     displayMissingModels(container, data) {
@@ -2321,18 +2356,25 @@ export class LinkerManagerDialog {
                     const nodeId = res.node_id;
                     const widgetIndex = res.widget_index;
 
-                    // Get the new value from the updated workflow returned by backend
+                    // Get the new value from the updated workflow returned by backend.
+                    // A node inside a subgraph can share an id with a top-level node -
+                    // ids are only unique within their own graph - so a resolution that
+                    // says is_top_level === false must never be answered from the
+                    // top-level nodes, or it silently picks up the wrong node's value.
                     let newValue = undefined;
                     const workflowNodes = workflow?.nodes || [];
-                    for (const wn of workflowNodes) {
-                        if (wn.id === nodeId) {
-                            const wv = wn.widgets_values;
-                            if (Array.isArray(wv) && widgetIndex >= 0 && widgetIndex < wv.length) {
-                                newValue = wv[widgetIndex];
-                            } else if (wv && typeof wv === 'object' && widgetIndex in wv) {
-                                newValue = wv[widgetIndex];
+                    const insideSubgraph = res.is_top_level === false && !!res.subgraph_id;
+                    if (!insideSubgraph) {
+                        for (const wn of workflowNodes) {
+                            if (wn.id === nodeId) {
+                                const wv = wn.widgets_values;
+                                if (Array.isArray(wv) && widgetIndex >= 0 && widgetIndex < wv.length) {
+                                    newValue = wv[widgetIndex];
+                                } else if (wv && typeof wv === 'object' && widgetIndex in wv) {
+                                    newValue = wv[widgetIndex];
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
 

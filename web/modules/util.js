@@ -118,7 +118,10 @@ export function groupPresentModels(present) {
     const groups = new Map();
     for (const ref of present || []) {
         const category = ref.canonical_category || ref.category || "unknown";
-        const key = `${category}|${ref.original_path}`;
+        // Only the key is normalised - "sub\a" and "sub/a" are the same file
+        // under two separator conventions and must group as one row, but the
+        // row itself keeps the reference's own original_path for display/use.
+        const key = `${category}|${(ref.original_path || "").replace(/[\\/]+/g, "/")}`;
         if (!groups.has(key)) {
             groups.set(key, {
                 key,

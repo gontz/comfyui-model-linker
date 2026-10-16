@@ -126,6 +126,13 @@ _VARIANT_TOKEN_RE = re.compile(r'(?:q\d+(?:_?[a-z0-9]+)*|fp\d+|int\d+|nf\d+|e\d+
 _VARIANT_TAIL_TOKENS = {'0', '1', 's', 'm', 'l', 'k', 'ks', 'km', 'kl'}
 _VARIANT_HEAD_RE = re.compile(r'q\d+$')
 
+
+def is_variant_token(token: str) -> bool:
+    """True for a precision/quantisation token (fp8, bf16, q4, e4m3fn, int8, ...)."""
+    token = (token or '').lower()
+    return token in _VARIANT_TOKENS or bool(_VARIANT_TOKEN_RE.match(token))
+
+
 # Parameter counts: 8b, 4b, 1.5b, 700m. These identify *which* model it is and
 # must never be stripped.
 _CAPACITY_TOKEN_RE = re.compile(r'\d+(?:\.\d+)?[bm]$')

@@ -410,6 +410,10 @@ def notify_lora_manager(prefix: str, model_path: str, fetch: bool = False) -> No
 
 
 def write_sidecar(model_path: str, category: str, sha256: str, fetch_if_unknown: bool = True) -> str:
+    # Without Lora Manager nothing reads a sidecar, so nothing is sent to
+    # CivitAI, fetched or written
+    if not os.path.isdir(_LORA_MANAGER_DIR):
+        return 'skipped'
     target = lm_target(category)
     if not target:
         return 'skipped'

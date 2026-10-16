@@ -756,3 +756,43 @@ class LmApiTests(unittest.TestCase):
             with self.assertRaises(lm_api.LoraManagerUnavailable):
                 lm_api.scan('loras', root='/models/loras')
         self.assertEqual(calls, [{'roots': lm_api.lm_path('/models/loras')}])
+
+
+class StatusPayloadTests(BackfillTestCase):
+    """The Settings dialog polls status(); it gets the counts and the most
+    recent results, never the whole run - that stays in the report on disk."""
+
+    def setUp(self):
+        super().setUp()
+        saved = dict(lm_backfill._state)
+        self.addCleanup(lambda: (lm_backfill._state.clear(), lm_backfill._state.update(saved)))
+
+    def fill_state(self, n):
+        lm_backfill._state.clear()
+        lm_backfill._state.update(status='running', total=n, done=0, counts={}, results=[])
+        for i in range(n):
+            lm_backfill._record({'path': os.path.join(self.loras, f'm{i}.safetensors'), 'category': 'loras'},
+                                'hydrated')
+
+    def test_a_live_run_reports_only_the_last_20_results(self):
+        self.fill_state(25)
+        lm_backfill._save_report()
+        state = lm_backfill.status()
+        self.assertEqual([r['file'] for r in state['results']], [f'm{i}.safetensors' for i in range(5, 25)])
+        self.assertEqual(state['results_total'], 25)
+        self.assertEqual(state['counts'], {'hydrated': 25})
+        self.assertEqual(state['done'], 25)
+        with open(lm_backfill._report_path(), encoding='utf-8') as handle:
+            self.assertEqual(len(json.load(handle)['results']), 25)  # the full report is kept
+        self.assertEqual(len(lm_backfill._state['results']), 25)     # and so is the live state
+
+    def test_a_restored_report_is_trimmed_too(self):
+        self.fill_state(25)
+        lm_backfill._update(status='done')
+        lm_backfill._save_report()
+        lm_backfill._state.clear()
+        lm_backfill._state['status'] = 'idle'
+        state = lm_backfill.status()
+        self.assertTrue(state['from_report'])
+        self.assertEqual(len(state['results']), 20)
+        self.assertEqual(state['results_total'], 25)

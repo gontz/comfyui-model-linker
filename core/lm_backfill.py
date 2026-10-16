@@ -21,6 +21,7 @@ from .lm_sidecar import lm_target, sidecar_path
 logger = logging.getLogger(__name__)
 
 REPORT_FILENAME = 'lm-backfill.json'
+STATUS_RESULTS = 20  # results status() returns; the report on disk keeps every one
 PAUSE_BETWEEN_MODELS = 1.0   # be polite to HuggingFace's API
 
 _lock = threading.Lock()
@@ -117,16 +118,26 @@ def status() -> Dict[str, Any]:
     is left alive to ever finish it. That status is relabelled
     'interrupted' here, so the UI shows it as what it is instead of
     "still working" with a disabled button and a poll loop that never ends.
+
+    Only the last STATUS_RESULTS results are returned, with `results_total`
+    counting them all: the dialog polls this every second or two, and a run
+    over a whole library would otherwise resend every result each time. The
+    full list stays in the live state and in the report on disk.
     """
     with _lock:
+        result = None
         if _state.get('status') == 'idle':
             saved = _read(_report_path())
             if saved:
                 result = {**saved, 'from_report': True}
                 if result.get('status') == 'running':
                     result['status'] = 'interrupted'
-                return result
-        return json.loads(json.dumps(_state))
+        if result is None:
+            result = json.loads(json.dumps(_state))
+    results = result.get('results') if isinstance(result.get('results'), list) else []
+    result['results_total'] = len(results)
+    result['results'] = results[-STATUS_RESULTS:]
+    return result
 
 
 def _update(**fields: Any) -> None:

@@ -2,7 +2,7 @@
 @author: Model Linker Team
 @title: ComfyUI Model Linker
 @nickname: Model Linker
-@version: 1.0.0
+@version: 1.2.0
 @description: Extension for relinking missing models in ComfyUI workflows using fuzzy matching
 """
 
@@ -98,8 +98,6 @@ class ModelLinkerExtension:
                 import requests  # noqa: F401
                 from .core import lookups, routes_downloads
                 routes_downloads.register(routes, web)
-                from .core import routes_export
-                routes_export.register(routes, web)
                 lookups_available = True
             except Exception as e:
                 lookups = None
@@ -109,6 +107,13 @@ class ModelLinkerExtension:
                 else:
                     self.logger.error(f"Model Linker: downloads and online lookups failed to load: {e}",
                                       exc_info=True)
+            # Separately: a failure in Export must not take lookups down too
+            if lookups_available:
+                try:
+                    from .core import routes_export
+                    routes_export.register(routes, web)
+                except Exception as e:
+                    self.logger.error(f"Model Linker: Export failed to load: {e}", exc_info=True)
 
             @routes.post("/model_linker/analyze")
             async def analyze_workflow(request):
@@ -125,6 +130,9 @@ class ModelLinkerExtension:
                     
                     # Analyze and find matches
                     result = await asyncio.to_thread(analyze_and_find_matches, workflow_json)
+                    # Without it the frontend hides what needs `requests`
+                    # (Download all found, Export) instead of letting it 404
+                    result['lookups_available'] = lookups_available
 
                     if lookups_available:
                         # Only reads the store and queues work; never waits on the

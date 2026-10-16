@@ -167,7 +167,12 @@ class WriteTests(SidecarTestCase):
     def setUp(self):
         super().setUp()
         self.notified = []
+        # Sidecars are written only when Lora Manager is installed; stand one
+        # in rather than depend on whether this machine happens to have it.
+        self.lm_dir = os.path.join(self.root, 'custom_nodes', 'comfyui-lora-manager')
+        os.makedirs(self.lm_dir)
         patches = [
+            mock.patch.object(lm_sidecar, '_LORA_MANAGER_DIR', self.lm_dir),
             mock.patch.object(lm_sidecar, 'notify_lora_manager',
                               lambda prefix, path, fetch=False: self.notified.append((prefix, fetch))),
             mock.patch.object(lm_sidecar, 'centralized_sidecars', return_value=False),
@@ -213,6 +218,13 @@ class WriteTests(SidecarTestCase):
         self.assertEqual(lm_sidecar.write_sidecar(self.model, 'loras', SHA), 'exists')
         with open(path, encoding='utf-8') as handle:
             self.assertEqual(handle.read(), '{"favorite": true}')
+
+    def test_nothing_happens_without_lora_manager(self):
+        # No CivitAI call, no preview, no file - and no notification
+        with mock.patch.object(lm_sidecar, '_LORA_MANAGER_DIR', os.path.join(self.root, 'not-installed')),              mock.patch.object(civitai_meta, 'version_for_sha256', side_effect=AssertionError('asked CivitAI')),              mock.patch.object(lm_sidecar, 'download_preview', side_effect=AssertionError('fetched a preview')):
+            self.assertEqual(lm_sidecar.write_sidecar(self.model, 'loras', SHA), 'skipped')
+        self.assertEqual(sorted(os.listdir(self.root)), ['custom_nodes', 'rebel.safetensors'])
+        self.assertEqual(self.notified, [])
 
     def test_centralized_mode_is_left_alone(self):
         with mock.patch.object(lm_sidecar, 'centralized_sidecars', return_value=True):

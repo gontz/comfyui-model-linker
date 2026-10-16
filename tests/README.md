@@ -25,16 +25,43 @@ python -m unittest discover -t . -s tests -p "test_matcher.py" -v
 | File | Covers |
 |---|---|
 | `test_categories.py` | alias groups — one folder reachable under several category names |
-| `test_matcher.py` | banded, family-aware scoring; category preference |
-| `test_scanner.py` | what counts as a model, linked directories, the scan cache |
+| `test_matcher.py` | banded, family-aware scoring; category preference; word-order similarity for reordered filename tokens |
+| `test_scanner.py` | what counts as a model, linked directories, the scan cache; `NON_MODEL_CATEGORIES` (custom_nodes, configs, datasets) excluded from scanning |
 | `test_linker.py` | physical-file identity, candidate selection, the picker's catalogue |
-| `test_analyzer.py` | reading references out of a workflow, including subgraphs |
+| `test_analyzer.py` | reading references out of a workflow, including subgraphs; `NON_MODEL_CATEGORIES` filtered from category guesses |
 | `test_adapters.py` | node packs storing references in their own shape |
 | `test_updater.py` | patching paths back in, including into subgraph definitions |
-| `test_overrides.py` | persisted user selections |
+| `test_overrides.py` | persisted user selections; `resolutions_to_record()` drops `record_override: false` entries (Swap) |
 | `test_reveal.py` | opening the file manager: what it refuses, and how it launches |
-| `test_inventory.py` | the found-on-disk list that accompanies the missing one |
-| `js/` | `web/`: registration, escaping, picker filtering, reference identity, overlapping analyses |
+| `test_inventory.py` | the found-on-disk list that accompanies the missing one; `present_models` now reports `NON_MODEL_CATEGORIES` consistently |
+| `test_node_schema.py` | per-node-type category introspection via the `get_filename_list` sentinel, thread-safe during concurrent analyses |
+| `test_node.py` | the `ModelLinker` node: no inputs/outputs, never executes |
+| `test_settings.py` | the settings store: tokens never echoed in errors, `auto_lookup` and other options, control-character token rejection |
+| `test_sources.py` | the ported download sources (`civitai`, `civarchive`, `huggingface`, `hf_index`, `popular`, `model_list`); host checks are exact, not substring |
+| `test_source_chain.py` | `find_download_source`/`find_by_hash`; never contacts a workflow's own URL |
+| `test_lookups.py` | the background lookup store/worker; `lookup_key()` scoping (`url:<16hex>:<key>` when a workflow URL is present) |
+| `test_downloader.py` | the download queue: physical-identity duplicate guard, `NON_MODEL_CATEGORIES` refused as destinations, no-clobber renames, https enforced on every redirect hop, hash verified before naming |
+| `test_hf_routing.py` | the HuggingFace multi-connection engine: pinned `https://huggingface.co` endpoint, path containment, never marks `completed` before hashing |
+| `test_lm_sidecar.py` | Lora Manager sidecar/preview writing: no-clobber landing, case-insensitive folder discovery, `autov3` omitted (not `null`) when CivitAI has none; validates against Lora Manager's published schema when it is installed alongside |
+| `test_online_search.py` | user-initiated similar-model search; refuses a candidate whose basename matches any on-screen card |
+| `test_hf_identify.py` | identifying a HuggingFace repo by SHA-256 |
+| `test_lm_backfill.py` | the Lora Manager HuggingFace backfill: no forced scans, `linked_elsewhere` for non-HF links, `hydrated` verified against pre-hydration values (else `no_card`), AI gated to models with no trigger words/notes/usage tips/base model, `trainedWords_before` restore trail, `interrupted` after a restart, `limit` |
+| `test_exporter.py` | `strip_secrets` (userinfo, fragment, `;params`, secret query keys incl. AWS/GCS, losslessly); the exported note and node links |
+| `js/test_extension.mjs` | registration (`commands`, `settings`, `afterConfigureGraph`, `nodeCreated`, `getCanvasMenuItems`); only `scripts/app.js`/`scripts/api.js` imported |
+| `js/test_escaping.mjs` | escaping workflow-supplied strings into HTML; URLs through `safeHttpUrl()` |
+| `js/test_reference_keys.mjs` | `refSlot()`/`refKey()` reference identity |
+| `js/test_picker.mjs` | model picker filtering |
+| `js/test_analyze_race.mjs` | overlapping analyses: the latest request wins, a superseded answer is discarded |
+| `js/test_perfect_match.mjs` | `isPerfectMatch()`, used instead of comparing confidence to 100 directly |
+| `js/test_settings_dialog.mjs` | the ⚙ Settings dialog: tokens, `auto_lookup`, Lora Manager HuggingFace fill controls |
+| `js/test_downloads.mjs` | `DownloadController`: keyed by canonical file key, reconnect after reload, 🔎 Search similar, cancel |
+| `js/test_locate.mjs` | Locate, including into a nested subgraph; the empty-result notification when a subgraph has no live instance |
+| `js/test_swap.mjs` | Swap: one queued resolution per node sharing a model, `record_override: false`, queue-panel removal by `swap_group` key |
+| `js/test_export.mjs` | Export: `strip_secrets` round-trip, the "Model links" note, the muted Model Linker node, re-applying without duplicating |
+
+Suites that need `requests` (`test_sources.py`, `test_source_chain.py`, `test_downloader.py`,
+`test_hf_routing.py`, `test_online_search.py`, `test_hf_identify.py`, `test_lm_backfill.py`,
+`test_lm_sidecar.py`) are reported as skipped, not failing, when it is not installed.
 
 `support.py` holds the fixtures. `LibraryTestCase` gives each test a temporary
 `models/` tree wired into the fake `folder_paths`; `add_models` creates files

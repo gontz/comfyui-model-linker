@@ -6,18 +6,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ComfyUI Model Linker is a ComfyUI extension that helps users relink missing models in workflows. It scans workflow nodes for model references that no longer exist on disk, uses fuzzy matching (via `difflib.SequenceMatcher`) to suggest replacements, and remembers user selections as persistent overrides.
 
-This is **not** a custom node — it provides no `NODE_CLASS_MAPPINGS`. It registers API routes on `PromptServer` and loads a web UI via `WEB_DIRECTORY`.
+It registers one node, **Model Linker**, which has no inputs or outputs and never executes — it marks shared workflows and carries buttons, and Export adds it muted so the workflow still runs where this extension is not installed. The rest is API routes on `PromptServer` and a web UI via `WEB_DIRECTORY`.
 
 ### This fork does not track upstream
 
 The repo began as a fork of [kianxyzw/comfyui-model-linker](https://github.com/kianxyzw/comfyui-model-linker)
-(MIT — see `LICENSE` and `NOTICE.md`), but **`main` is this fork's own line of work**. The
-`upstream` remote has been removed deliberately.
+(MIT — see `LICENSE` and `NOTICE.md`), but **`main` is this fork's own line of work**. An
+`upstream` remote exists locally, fetch-only — its push URL is `DISABLED` — and is used
+only as the object source for `git show bec5c80:<path>` ports.
 
-- **Do not add an `upstream` remote, and do not merge or rebase from kianxyzw.** The last
-  sync brought in a download subsystem whose frontend was written against the monolithic
-  `web/linker.js` this project has since split into `web/modules/`; reconciling the two
-  cost a full manual merge and lost upstream's UI layer anyway.
+- **Never merge or rebase from kianxyzw, and never re-enable pushing to `upstream`.** The
+  last sync brought in a download subsystem whose frontend was written against the
+  monolithic `web/linker.js` this project has since split into `web/modules/`; reconciling
+  the two cost a full manual merge and lost upstream's UI layer anyway.
 - **Downloads were reinstated on 2026-10-14 by the user's decision**, redesigned so the
   objections below no longer hold — see `docs/superpowers/specs/2026-10-14-upstream-parity-design.md`
   and the plans beside it. Upstream code for it is ported file-by-file with
@@ -42,15 +43,70 @@ Recover any of it with `git show <that commit>^:core/downloader.py` and so on.
 The reinstated design answers both points: `/analyze` only reads a persistent lookup
 store and queues work for a background thread, so it stays as fast as before; lookups
 can be switched off (`auto_lookup` in ⚙ Settings); and nothing contacts a workflow's own
-URL during lookup. Plan C Task 5 completes this documentation.
+URL during lookup.
 
 **Not to be confused with the download link we do offer:** `properties.models[].url` from
 the workflow itself is surfaced as `source_url` and rendered by the dialog. That is local,
 requires no network call during analysis, and stays.
 
+### Downloads and online lookups (reinstated 2026-10-14)
+
+- **Lookups run in the background.** `/analyze` answers from disk alone and queues each
+  missing model's lookup on a worker thread; results land later via `/lookups` polling
+  and persist in `data/lookups.json` (gitignored), keyed by `core/lookups.lookup_key()` —
+  see "Workflow Metadata" below for the key format. `auto_lookup` (⚙ Settings) turns the
+  background worker off; Export still honours it, except when the user explicitly presses
+  "Find links" in the Export dialog, which is a one-time, user-initiated request.
+- **Nothing contacts a workflow's own URL during lookup.** `core/source_chain.py` looks
+  up a model by name/hash against HuggingFace and CivitAI; a workflow-supplied
+  `properties.models[].url` is never fetched to confirm or refresh it — it is only
+  surfaced to the user as-is (see "Not to be confused with" above).
+- **Similar-model search is user-initiated** (🔎 Search similar in the dialog) and runs
+  only on request. A chosen candidate downloads and keeps its own filename — never the
+  missing model's name — and `core/online_search.py` refuses any candidate whose basename
+  matches a model already shown on screen, since category folders are often junctions to
+  one shared directory and such a match would be a duplicate, not a new file.
+- **Filling empty Lora Manager info from HuggingFace** is a server job started from
+  ⚙ Settings (not automatic), implemented in `core/lm_backfill.py`; its last report
+  persists in `data/lm-backfill.json` (gitignored). See "Lora Manager sidecars" below.
+- **Modules:** `core/settings.py`, `core/routes_settings.py`, `core/sources/*`
+  (`civitai`, `civarchive`, `huggingface`, `hf_index`, `popular`, `model_list`) with
+  `metadata/*.json` and `tools/build_hf_index.py`, `core/source_chain.py`,
+  `core/lookups.py`, `core/downloader.py`, `core/hf_downloader.py`/`core/_hf_worker.py`,
+  `core/civitai_meta.py`, `core/lm_sidecar.py`, `core/online_search.py`, `core/lm_api.py`,
+  `core/hf_identify.py`, `core/lm_backfill.py`, `core/exporter.py`, and
+  `core/routes_downloads.py`/`core/routes_export.py`.
+- **Everything above registers only when `requests` imports** (`__init__.py`'s guarded
+  registration block) — without it, relinking from disk (`/analyze`, `/resolve`) still
+  works; only `/settings` and `/settings/check/{provider}` (the settings store itself)
+  register unconditionally.
+
+### Lora Manager sidecars
+
+- **Format contract:** implemented from
+  [Lora Manager's published metadata format](https://github.com/willmiao/ComfyUI-Lora-Manager)
+  (its sidecar JSON schema, v1.2.5 at the time this was written). Lora Manager is
+  GPL-3.0; this extension is MIT, so the format is *implemented*, not copied — no code
+  was ported from it, only the documented shape (`core/lm_sidecar.py`,
+  `core/civitai_meta.py`).
+- **`autov3` is OMITTED, never written as `null`,** when CivitAI has no AutoV3 hash for
+  a version. This is a deliberate deviation from the upstream spec: a `null` tells Lora
+  Manager "checked, unavailable" and stops it computing the hash itself from the
+  safetensors header on its own next pass — omitting the key instead leaves that door
+  open (`autov3_for()` in `core/lm_sidecar.py`).
+- **`file_path` uses the registered directory, not `realpath`** — the one deliberate
+  exception to "Physical File Identity" below. Lora Manager indexes by its own configured
+  path, so writing the resolved (junction-following) path would mismatch its catalogue.
+- **Never overwrites an existing sidecar or preview.** Both land via a unique temp file
+  and `downloader._rename_no_clobber()`; a collision (Lora Manager's own file already
+  there) is reported, not replaced — `core/lm_sidecar.py`.
+- **The Lora Manager folder is discovered case-insensitively** (`entry.lower() ==
+  _LORA_MANAGER_FOLDER`), since installs vary in how they case the directory name.
+
 ## Development Environment
 
-- **Python >=3.8**, no external dependencies beyond ComfyUI's own (aiohttp, folder_paths, server)
+- **Python >=3.9**; `requests` (declared; downloads and lookups need it); optional
+  `huggingface_hub` ≥1.1 for multi-connection HuggingFace downloads; optional `rapidfuzz`
 - **JavaScript**: ES6 modules loaded by ComfyUI from `web/`
 - **Activate venv**: `call c:\ComfyUI\.venv\Scripts\activate`
 - **No linter, no build step** — the extension is loaded directly by ComfyUI at startup
@@ -81,7 +137,7 @@ Frontend → POST /model_linker/resolve → core/linker.py
 
 | Module | Responsibility |
 |---|---|
-| `__init__.py` | Extension entry point; registers 7 aiohttp API routes on `PromptServer` |
+| `__init__.py` | Extension entry point; registers the `ModelLinker` node (`NODE_CLASS_MAPPINGS`) and the core aiohttp API routes on `PromptServer`, in a guarded block that degrades gracefully without `requests` |
 | `core/linker.py` | High-level API: `analyze_and_find_matches()`, `apply_resolution()` |
 | `core/scanner.py` | Discovers model files using ComfyUI's `folder_paths` |
 | `core/matcher.py` | Banded, model-family-aware matching (rapidfuzz when available) |
@@ -90,7 +146,7 @@ Frontend → POST /model_linker/resolve → core/linker.py
 | `core/node_schema.py` | Asks installed node classes which folder each widget loads from |
 | `core/node_adapters.py` | Per-node-pack readers for references stored in non-standard shapes |
 | `core/workflow_updater.py` | Patches `widgets_values` in workflow nodes, supports subgraph nodes |
-| `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections |
+| `core/overrides.py` | CRUD for `data/overrides.json` — persistent user model selections; `resolutions_to_record()` drops any resolution sent with `record_override: false` (Swap) before it reaches `record_overrides()` |
 | `web/linker.js` | Frontend entry point; the dialog and helpers live in `web/modules/` |
 
 ### API Routes
@@ -111,6 +167,23 @@ Both `/preview` and `/reveal` take a **category and filename, never a path**, an
 the resolved file sits inside a directory registered for that category. `/reveal` runs a
 program on the host, so it additionally refuses any request that did not come from this
 machine.
+
+`/resolve` saves no override for a resolution sent with `record_override: false`
+(Swap) — see `core/overrides.resolutions_to_record()`.
+
+Registered only when `requests` imports (`core/routes_downloads.py`,
+`core/routes_export.py` — see "Downloads and online lookups" above):
+- `GET /lookups`, `POST /lookups/refresh`
+- `POST /download`, `GET /progress`, `GET /progress/{download_id}`,
+  `POST /cancel/{download_id}`
+- `POST /search` — user-initiated similar-model search
+- `GET /lm-backfill`, `POST /lm-backfill/start`, `POST /lm-backfill/cancel`
+- `POST /export/lookup`, `POST /export/markdown`, `POST /export/hash`,
+  `GET /export/hash/{job_id}`
+
+Registered unconditionally (`core/routes_settings.py` — the settings store itself needs
+no `requests`):
+- `GET /settings`, `POST /settings`, `POST /settings/check/{provider}`
 
 ## Critical Conventions
 
@@ -230,13 +303,26 @@ imports work with no build step. Import paths climb one level further from `web/
 | `web/linker.js` | Entry point only: `registerExtension`, and opening the dialog |
 | `web/modules/linker-dialog.js` | The main dialog: missing models, suggestions, model picker |
 | `web/modules/overrides-dialog.js` | The saved-overrides manager |
-| `web/modules/util.js` | `escapeHtml`, `safeHttpUrl`, `refSlot`/`refKey`, `isSelectableModel`, `notifyError` |
+| `web/modules/util.js` | `escapeHtml`, `safeHttpUrl`, `refSlot`/`refKey`, `isSelectableModel`, `notifyError`, `presentModelGroupKey`/`groupPresentModels` |
 | `web/modules/dom.js` | `$el` |
+| `web/modules/settings-dialog.js` | The ⚙ Settings dialog: API tokens, `auto_lookup`, Lora Manager HuggingFace fill |
+| `web/modules/downloads.js` | `DownloadController` — tracks downloads by canonical file key, drives the progress UI, 🔎 Search similar |
+| `web/modules/export-dialog.js` | The Export dialog: public links, the "Model links" note, the muted Model Linker node |
 
 - `$el()` is defined **locally**; `scripts/ui.js` is deprecated (announced for removal in
   frontend v1.34) and must not be imported. Only `scripts/app.js` and `scripts/api.js` are
-- Registers `commands`, `menuCommands`, `keybindings`, `settings` and `getCanvasMenuItems`.
-  Never scrape the DOM for a place to inject UI — the frontend is Vue-rendered
+- Registers `commands`, `menuCommands`, `keybindings`, `settings`, `getCanvasMenuItems`,
+  `afterConfigureGraph` and `nodeCreated`. Never scrape the DOM for a place to inject UI —
+  the frontend is Vue-rendered. `afterConfigureGraph` (fired for every graph ComfyUI loads,
+  including a reload) replaces any popup-injection approach for the load-time missing-model
+  notice; it is deduped per workflow via
+  `app.extensionManager.workflow.activeWorkflow.path` (the `ModelLinker.OpenOnMissing`
+  setting gates whether it opens the dialog at all)
+- A graph mutation the user triggers through this extension (Swap, Locate, Export) is one
+  undo step via `app.canvas?.emitBeforeChange?.()` / `app.canvas?.emitAfterChange?.()` (the
+  second in a `finally`) — not `graph.beforeChange()/afterChange()`, which in frontend 1.55
+  only call `canvas.onBeforeChange` (nothing assigns it), and the root graph has no canvas
+  attached while a subgraph is open
 - Use `app.extensionManager.toast` for errors, never `alert()`/`confirm()` (they block the page)
 - **Escape everything interpolated into HTML.** Model names, node types and original paths
   all come from the workflow file, which may have been downloaded from anywhere. This holds

@@ -46,17 +46,25 @@ export class ModelLinker {
     }
 
     openExport() {
-        if (!this.dialog) this.dialog = new LinkerManagerDialog();
-        // show() starts an analysis; openExport() starts a newer one, which
-        // supersedes it and is the one the Export dialog is built from
-        this.dialog.show();
-        this.dialog.openExport();
+        try {
+            if (!this.dialog) this.dialog = new LinkerManagerDialog();
+            // show() starts an analysis; openExport() starts a newer one, which
+            // supersedes it and is the one the Export dialog is built from
+            this.dialog.show();
+            this.dialog.openExport();
+        } catch (error) {
+            console.error("🔗 Model Linker: Error opening Export:", error);
+            notifyError("Could not open Export", error);
+        }
     }
 
     // ComfyUI fires afterConfigureGraph for every graph it loads, including
     // tab switches, so the check is debounced and each workflow's missing set
-    // is announced once per session.
+    // is announced once per session. A workflow the Export dialog was built
+    // from is one of these, so it is closed immediately rather than left
+    // open to write by node id into a tab that is no longer the one on screen.
     onGraphLoaded() {
+        this.dialog?.exportDialog?.close();
         clearTimeout(this.loadTimer);
         this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
     }

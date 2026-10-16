@@ -45,9 +45,21 @@ def register(routes, web) -> None:
         models = data.get('models') if isinstance(data, dict) else None
         if not isinstance(models, list) or len(models) > MAX_MODELS:
             return _bad(web, 'models must be a list')
-        clean = [{'name': m.get('name', ''), 'url': exporter.strip_secrets(m.get('url', '')),
-                  'directory': m.get('directory', '')}
-                 for m in models if isinstance(m, dict) and isinstance(m.get('url'), str)]
+        clean = []
+        for m in models:
+            if not isinstance(m, dict):
+                return _bad(web, 'each model must be an object')
+            name, directory = m.get('name', ''), m.get('directory', '')
+            if not isinstance(name, str) or not isinstance(directory, str):
+                return _bad(web, 'name and directory must be strings')
+            url = m.get('url')
+            # A model with no link, or one that is not https, gets no entry -
+            # the note is the one place a credential could slip back in, so
+            # only a link that has already been through strip_secrets' own
+            # scheme check is ever allowed through
+            if not isinstance(url, str) or not url.lower().startswith('https://'):
+                continue
+            clean.append({'name': name, 'url': exporter.strip_secrets(url), 'directory': directory})
         return web.json_response({'markdown': exporter.build_model_links_markdown(clean)})
 
     @routes.post("/model_linker/export/hash")

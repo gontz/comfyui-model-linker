@@ -15,6 +15,29 @@ class LinkTests(unittest.TestCase):
                          'https://civitai.com/api/download/models/1?type=Model')
         self.assertEqual(exporter.strip_secrets('https://x.example/a?SIG=1&Signature=2'), 'https://x.example/a')
 
+    def test_userinfo_is_stripped(self):
+        self.assertEqual(exporter.strip_secrets('https://user:pass@host/path'), 'https://host/path')
+
+    def test_userinfo_is_stripped_but_the_port_and_ipv6_brackets_survive(self):
+        self.assertEqual(exporter.strip_secrets('https://user:pass@[::1]:8443/path'), 'https://[::1]:8443/path')
+
+    def test_a_fragment_is_stripped(self):
+        self.assertEqual(exporter.strip_secrets('https://host/path#token=FRAG'), 'https://host/path')
+
+    def test_aws_presigned_params_are_stripped(self):
+        self.assertEqual(
+            exporter.strip_secrets('https://host/path?X-Amz-Signature=abc&X-Amz-Credential=def'
+                                    '&X-Amz-Security-Token=ghi&foo=bar'),
+            'https://host/path?foo=bar')
+
+    def test_old_style_path_params_are_stripped(self):
+        self.assertEqual(exporter.strip_secrets('https://host/path;token=abc'), 'https://host/path')
+
+    def test_every_kind_of_credential_together(self):
+        self.assertEqual(
+            exporter.strip_secrets('https://user:pass@host/path;token=abc?X-Amz-Signature=x&foo=bar#token=FRAG'),
+            'https://host/path?foo=bar')
+
     def test_existing_link_wins_and_is_stripped(self):
         # No **kwargs: a leftover fetch_size=False raises TypeError here, which
         # lookup_links swallows into None - and this test fails on it
@@ -56,7 +79,8 @@ class HashJobTests(LibraryTestCase):
     def test_hash_then_look_up(self):
         base = self.add_models('loras', ['h.safetensors'], ['.safetensors'])
         path = os.path.join(base, 'h.safetensors')
-        expected = hashlib.sha256(open(path, 'rb').read()).hexdigest()
+        with open(path, 'rb') as f:
+            expected = hashlib.sha256(f.read()).hexdigest()
         job = exporter.start_hash_job(path, lambda sha, name: {'url': 'https://civitai.com/x?token=t', 'source': 'civitai'})
         deadline = time.time() + 5
         while exporter.get_hash_job(job)['status'] not in ('done', 'error') and time.time() < deadline:

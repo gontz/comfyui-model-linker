@@ -173,12 +173,17 @@ export class ExportDialog {
     }
 
     async findByHash(i) {
+        if (this._hashBusy?.has(i)) return;   // ignore a double press on the same row
         const row = this.rows[i];
+        (this._hashBusy ??= new Set()).add(i);
         try {
             const { job_id } = await this.request("/model_linker/export/hash", { category: row.category, filename: row.original_path });
+            if (this.rows[i] !== row) return;   // the dialog moved on while this was in flight
             for (;;) {
                 await new Promise((resolve) => setTimeout(resolve, 1000));
+                if (this.rows[i] !== row) return;
                 const job = await this.request(`/model_linker/export/hash/${encodeURIComponent(job_id)}`);
+                if (this.rows[i] !== row) return;
                 if (job.status === "hashing") { this.setRow(i, "", `Hashing ${Math.round((job.progress || 0) * 100)}%`); continue; }
                 if (job.status === "looking_up") { this.setRow(i, "", "Looking up…"); continue; }
                 const url = safeHttpUrl(job.result?.url);
@@ -187,89 +192,136 @@ export class ExportDialog {
             }
         } catch (error) {
             notifyError("Hash lookup failed", error);
+        } finally {
+            this._hashBusy?.delete(i);
         }
     }
 
+    /**
+     * Resolve every row's link through the server (found, pasted or the
+     * workflow's own, http or https - strip_secrets cleans any of them), then
+     * write the result into the workflow: a "Model links" note, the loader
+     * nodes' own `properties.models`, and a muted marker node.
+     *
+     * A link only ever reaches the note or a node's properties once it is
+     * https - the one scheme every written link is checked against - so a
+     * row whose resolved link turns out to be http, cleared, or never found
+     * is treated exactly like one with no link at all: nothing new is
+     * written for it, and anything stale already sitting in a node's
+     * properties for that file is removed, whatever "write links into the
+     * loader nodes" is set to. That option only gates ADDING a new entry.
+     */
     async apply() {
-        const graph = app.graph;
-        const LG = globalThis.LiteGraph;
-        if (!graph || !LG) { notifyError("Export", new Error("Canvas not available")); return; }
-
-        // Every link written into the workflow - found, pasted, or the
-        // workflow's own - goes through the server's strip_secrets first. These
-        // rows all have a link, so nothing is searched and nothing leaves the machine.
-        const candidates = this.rows.filter((row) => safeHttpUrl(row.url)?.startsWith("https://"));
-        let linked = [];
-        if (candidates.length) {
-            try {
-                const { links } = await this.request("/model_linker/export/lookup", { models: lookupPayload(candidates) });
-                linked = candidates
-                    .map((row, n) => ({ ...row, url: safeHttpUrl(links?.[n]?.url) || "" }))
-                    .filter((row) => row.url.startsWith("https://"));
-            } catch (error) { notifyError("Could not prepare the links", error); return; }
-        }
-
-        let markdown = "";
-        if (this.option("note") && linked.length) {
-            try {
-                ({ markdown } = await this.request("/model_linker/export/markdown", {
-                    models: linked.map((row) => ({ name: row.name, url: row.url, directory: row.category })),
-                }));
-            } catch (error) { notifyError("Could not build the links note", error); return; }
-        }
-
-        app.canvas?.emitBeforeChange?.();
+        if (this._applying) return;   // ignore a double press
+        this._applying = true;
         try {
-            const nodes = graph._nodes || graph.nodes || [];
-            const minX = Math.min(...nodes.map((n) => n.pos?.[0] ?? 0), 0);
-            const minY = Math.min(...nodes.map((n) => n.pos?.[1] ?? 0), 0);
-            let note = null;
-            if (markdown) {
-                note = nodes.find((n) => n.properties?.model_linker_note)
-                    || LG.createNode("MarkdownNote") || LG.createNode("Note");
-                if (!note.graph) {
-                    note.pos = [minX - 480, minY];
-                    note.size = [440, 560];
-                    note.title = "Model links";
-                    note.color = "#222";
-                    note.bgcolor = "#000";
-                    note.properties = { ...(note.properties || {}), model_linker_note: true };
-                    graph.add(note);
-                }
-                if (note.widgets?.[0]) note.widgets[0].value = markdown;
-                note.widgets_values = [markdown];
+            const rows = this.rows;   // snapshot: bail if the dialog moves on under us
+            const graph = app.graph;
+            const LG = globalThis.LiteGraph;
+            if (!graph || !LG) { notifyError("Export", new Error("Canvas not available")); return; }
+
+            const candidates = rows.filter((row) => safeHttpUrl(row.url));
+            const resolved = new Map();
+            if (candidates.length) {
+                let links;
+                try {
+                    ({ links } = await this.request("/model_linker/export/lookup", { models: lookupPayload(candidates) }));
+                } catch (error) { notifyError("Could not prepare the links", error); return; }
+                if (rows !== this.rows) return;
+                candidates.forEach((row, n) => resolved.set(row.key, safeHttpUrl(links?.[n]?.url) || ""));
             }
-            if (this.option("properties")) {
-                for (const row of linked) {
+            const finalUrl = (row) => {
+                const url = resolved.get(row.key) || "";
+                return url.startsWith("https://") ? url : "";
+            };
+            const linked = rows.filter((row) => finalUrl(row)).map((row) => ({ ...row, url: finalUrl(row) }));
+
+            let markdown = "";
+            if (this.option("note") && linked.length) {
+                try {
+                    ({ markdown } = await this.request("/model_linker/export/markdown", {
+                        models: linked.map((row) => ({ name: row.name, url: row.url, directory: row.category })),
+                    }));
+                } catch (error) { notifyError("Could not build the links note", error); return; }
+                if (rows !== this.rows) return;
+            }
+
+            app.canvas?.emitBeforeChange?.();
+            try {
+                const nodes = graph._nodes || graph.nodes || [];
+                const minX = Math.min(...nodes.map((n) => n.pos?.[0] ?? 0), 0);
+                const minY = Math.min(...nodes.map((n) => n.pos?.[1] ?? 0), 0);
+                const existingNote = nodes.find((n) => n.properties?.model_linker_note);
+                let note = existingNote || null;
+                if (markdown) {
+                    note = existingNote || LG.createNode("MarkdownNote") || LG.createNode("Note");
+                    if (!note.graph) {
+                        note.pos = [minX - 480, minY];
+                        note.size = [440, 560];
+                        note.title = "Model links";
+                        note.color = "#222";
+                        note.bgcolor = "#000";
+                        note.properties = { ...(note.properties || {}), model_linker_note: true };
+                        graph.add(note);
+                    }
+                    if (note.widgets?.[0]) note.widgets[0].value = markdown;
+                    note.widgets_values = [markdown];
+                } else if (existingNote) {
+                    // A re-apply that now finds no links leaves no stale note
+                    // (and no stale credential inside one) behind
+                    if (existingNote.widgets?.[0]) existingNote.widgets[0].value = "";
+                    existingNote.widgets_values = [""];
+                }
+
+                // Always scrub: a credential already sitting in a node's
+                // properties.models must never survive export. Adding a new
+                // entry is the only part the "properties" option gates.
+                for (const row of rows) {
+                    const url = finalUrl(row);
                     for (const ref of row.refs) {
                         for (const node of this.linker.liveNodesFor(ref)) {
                             const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
-                            const entry = { name: ref.original_path, url: row.url, directory: row.category };
-                            const at = models.findIndex((m) => m?.name === entry.name);
-                            if (at >= 0) models[at] = { ...models[at], ...entry }; else models.push(entry);
-                            node.properties = { ...(node.properties || {}), models };
+                            const at = models.findIndex((m) => m?.name === ref.original_path);
+                            if (at >= 0) {
+                                const { url: _stale, ...rest } = models[at];
+                                models[at] = url ? { ...rest, url } : rest;
+                                node.properties = { ...(node.properties || {}), models };
+                            } else if (this.option("properties") && url) {
+                                models.push({ name: ref.original_path, url, directory: row.category });
+                                node.properties = { ...(node.properties || {}), models };
+                            }
                         }
                     }
                 }
-            }
-            if (this.option("node") && !nodes.find((n) => n.type === "ModelLinker")) {
-                const marker = LG.createNode("ModelLinker");
-                if (marker) {
-                    // Muted (LiteGraph NEVER): graphToPrompt leaves it out. ComfyUI
-                    // rejects a whole prompt naming a node type it does not have,
-                    // so an unmuted marker would stop the shared workflow running
-                    // anywhere Model Linker is not installed.
-                    marker.mode = 2;
-                    marker.pos = note ? [note.pos[0], note.pos[1] - 120] : [minX - 480, minY - 120];
-                    graph.add(marker);
+
+                if (this.option("node")) {
+                    const existingMarker = nodes.find((n) => n.type === "ModelLinker");
+                    if (existingMarker) {
+                        // Re-mute on every re-apply: nothing should be able to
+                        // leave this live behind the user's back
+                        existingMarker.mode = 2;
+                    } else {
+                        const marker = LG.createNode("ModelLinker");
+                        if (marker) {
+                            // Muted (LiteGraph NEVER): graphToPrompt leaves it out.
+                            // ComfyUI rejects a whole prompt naming a node type it
+                            // does not have, so an unmuted marker would stop the
+                            // shared workflow running anywhere Model Linker isn't.
+                            marker.mode = 2;
+                            marker.pos = note ? [note.pos[0], note.pos[1] - 120] : [minX - 480, minY - 120];
+                            graph.add(marker);
+                        }
+                    }
                 }
+            } finally {
+                app.canvas?.emitAfterChange?.();
+                graph.setDirtyCanvas?.(true, true);
             }
+            app.extensionManager?.toast?.add({ severity: "success", summary: "Model Linker",
+                detail: `Export applied (${linked.length} link${linked.length === 1 ? "" : "s"}). Save the workflow to keep it.`, life: 5000 });
+            this.close();
         } finally {
-            app.canvas?.emitAfterChange?.();
-            graph.setDirtyCanvas?.(true, true);
+            this._applying = false;
         }
-        app.extensionManager?.toast?.add({ severity: "success", summary: "Model Linker",
-            detail: `Export applied (${linked.length} link${linked.length === 1 ? "" : "s"}). Save the workflow to keep it.`, life: 5000 });
-        this.close();
     }
 }

@@ -28,7 +28,11 @@ CATEGORY_ORDER = [
 
 # Query parameters that carry credentials and must never end up in a
 # shared workflow
-SECRET_PARAMS = {'token', 'key', 'api_key', 'apikey', 'access_token', 'auth', 'hf_token', 'sig', 'signature'}
+SECRET_PARAMS = {
+    'token', 'key', 'api_key', 'apikey', 'access_token', 'auth', 'hf_token', 'sig', 'signature',
+    # AWS presigned URLs (S3-backed hosts hand these out for a time-limited GET)
+    'x-amz-signature', 'x-amz-credential', 'x-amz-security-token',
+}
 
 _hash_jobs: Dict[str, Dict[str, Any]] = {}
 _hash_cache: Dict[tuple, str] = {}
@@ -36,7 +40,15 @@ _hash_lock = threading.Lock()
 
 
 def strip_secrets(url: str) -> str:
-    """Remove credential query parameters (token=, key=, ...) from a URL."""
+    """
+    Remove every credential a URL can carry, not only `?token=...`:
+
+    - userinfo (`user:pass@host`)
+    - secret query parameters (the set above, case-insensitive)
+    - an old-style path parameter (`;token=...` on the last segment)
+    - any fragment - nothing downstream needs one, and a token hidden there
+      would otherwise survive untouched
+    """
     if not url or not isinstance(url, str):
         return ''
     url = url.strip()
@@ -48,7 +60,10 @@ def strip_secrets(url: str) -> str:
         return url
     query = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
              if k.lower() not in SECRET_PARAMS]
-    return urlunparse(parsed._replace(query=urlencode(query)))
+    # netloc is "user:pass@host:port" (or "user:pass@[::1]:port"); everything
+    # after the last '@' is the host and port, brackets and all - keep only that
+    netloc = parsed.netloc.rsplit('@', 1)[-1]
+    return urlunparse(parsed._replace(netloc=netloc, params='', query=urlencode(query), fragment=''))
 
 
 def _category_sort_key(category: str):

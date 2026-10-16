@@ -350,6 +350,9 @@ class ModelLinkerExtension:
                     self.logger.debug(f"Model Linker preview error: {e}")
                     return web.Response(status=404)
 
+            from .core import routes_settings
+            routes_settings.register(routes, web)
+
             self.routes_setup = True
             self.logger.info("Model Linker: API routes registered successfully")
             return True

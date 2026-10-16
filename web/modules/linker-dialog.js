@@ -5,6 +5,7 @@ import { api } from "../../../scripts/api.js";
 
 import { $el } from "./dom.js";
 import { ManageOverridesDialog } from "./overrides-dialog.js";
+import { SettingsDialog } from "./settings-dialog.js";
 import {
     escapeHtml,
     isPerfectMatch,
@@ -277,6 +278,25 @@ export class LinkerManagerDialog {
                 })
             ]),
             $el("div", { style: { display: "flex", gap: "8px", alignItems: "center" } }, [
+                $el("button", {
+                    id: "model-linker-settings-btn",
+                    title: "Tokens and background lookups",
+                    textContent: "⚙ Settings",
+                    onclick: () => { if (!this.settingsDialog) this.settingsDialog = new SettingsDialog(); this.settingsDialog.show(); },
+                    style: {
+                        background: "none",
+                        border: "1px solid var(--border-color)",
+                        fontSize: "14px",
+                        cursor: "pointer",
+                        color: "var(--input-text)",
+                        padding: "2px 8px",
+                        height: "30px",
+                        borderRadius: "4px",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center"
+                    }
+                }),
                 $el("button", {
                     id: "model-linker-overrides-btn",
                     title: "Manage overrides",

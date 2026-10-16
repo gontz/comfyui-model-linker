@@ -137,6 +137,10 @@ def main():
     revision = request.get("revision") or "main"
     local_dir = request["local_dir"]
     token = request.get("token", False)
+    # Pinned by the caller rather than left to huggingface_hub's own
+    # HF_ENDPOINT environment-variable resolution, so the token can never be
+    # sent to a mirror the inherited environment happens to name.
+    endpoint = request.get("endpoint") or "https://huggingface.co"
 
     try:
         import huggingface_hub
@@ -153,6 +157,7 @@ def main():
             revision=revision,
             local_dir=local_dir,
             token=token,
+            endpoint=endpoint,
             tqdm_class=_ProgressTqdm,
         )
         log("download finished", elapsed=round(time.time() - t0, 2))

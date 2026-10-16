@@ -441,7 +441,7 @@ def _run_hf(download_id: str, job: Dict[str, Any], engine) -> str:
     """HuggingFace engine (Task 5). Returns the SHA-256 of the file it wrote."""
     hf, parsed = engine
     dest = job['dest']
-    hf.download_hf_model(parsed['repo'], parsed['filename'], os.path.dirname(dest),
+    success = hf.download_hf_model(parsed['repo'], parsed['filename'], os.path.dirname(dest),
                          os.path.basename(dest), download_id,
                          revision=parsed.get('branch', 'main'), display_url=job['url'])
     # The engine updates the record in place (Task 5), so `identity` - which
@@ -452,7 +452,10 @@ def _run_hf(download_id: str, job: Dict[str, Any], engine) -> str:
     record = get_progress(download_id)
     if record.get('status') == 'cancelled':
         raise _Cancelled()
-    if record.get('status') != 'completed':
+    # The engine never sets the terminal 'completed' status itself - it has
+    # no sha256 yet - so success is decided from its return value, not from
+    # the record's status.
+    if not success:
         raise DownloadError(record.get('error') or 'Download failed',
                             auth_required=record.get('auth_required'))
     _set(download_id, status='verifying', speed=0, progress=0)

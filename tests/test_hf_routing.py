@@ -1,5 +1,7 @@
 """Which engine takes a URL - decided by the real host."""
 
+import json
+import os
 import unittest
 from unittest import mock
 
@@ -81,3 +83,242 @@ class RecordTests(LibraryTestCase):
         self.assertEqual(record['status'], 'error')
         self.assertEqual(record['category'], 'loras')
         self.assertTrue(record['path'].endswith('x.safetensors'))
+
+
+def _line(event, **fields):
+    return json.dumps({"event": event, **fields}) + "\n"
+
+
+class _FakeStdin:
+    def __init__(self):
+        self.written = ''
+
+    def write(self, s):
+        self.written += s
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeStderr:
+    def __init__(self, lines=None):
+        self._lines = list(lines or [])
+
+    def readlines(self):
+        return list(self._lines)
+
+
+class _FakeProc:
+    """
+    Stand-in for subprocess.Popen, real enough to catch the difference
+    between "wait for it" and "kill it": `poll()` reports still-running
+    until `wait()` or `kill()` is called, so a fake worker that simply
+    finished producing its stdout (the normal case) is not mistaken for one
+    that needs to be terminated.
+
+    `stdout_lines` is any iterable of newline-delimited JSON lines - a list,
+    or a generator for tests that need a side effect timed against a
+    specific line being read. `stderr_lines` is a fixed list.
+    """
+
+    def __init__(self, stdout_lines, stderr_lines=None):
+        self.stdin = _FakeStdin()
+        self.stdout = iter(stdout_lines)
+        self.stderr = _FakeStderr(stderr_lines)
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls = 0
+        self._exited = False
+
+    def poll(self):
+        return 0 if self._exited else None
+
+    def wait(self, timeout=None):
+        self.wait_calls += 1
+        self._exited = True
+        return 0
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+        self._exited = True
+
+
+class EngineGuaranteesTests(LibraryTestCase):
+    """
+    Pins each controller ruling from the Task 5 fix round against a fake
+    worker process - no network, no real subprocess, nothing left running.
+    """
+
+    def setUp(self):
+        super().setUp()
+        try:
+            from core import hf_downloader
+        except ImportError:
+            self.skipTest('huggingface_hub >= 1.1 is not installed')
+        self.hf = hf_downloader
+        self.loras = self.add_models('loras', [], ['.safetensors'])
+        patcher = mock.patch.object(hf_downloader, 'get_token', return_value=None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _seed(self, dest_filename):
+        """A progress record the way downloader.start_download would have
+        left it, without going through the real queue/worker machinery."""
+        download_id = downloader.generate_download_id()
+        dest_path = os.path.join(self.loras, dest_filename)
+        downloader.download_progress[download_id] = {
+            'status': 'queued', 'progress': 0, 'total_size': 0,
+            'downloaded': 0, 'speed': 0, 'filename': dest_filename, 'url': 'u',
+            'error': None, 'start_time': None, 'category': 'loras', 'path': dest_path,
+            'identity': downloader._identity(dest_path),
+        }
+        self.addCleanup(downloader.download_progress.pop, download_id, None)
+        self.addCleanup(downloader.cancelled_downloads.discard, download_id)
+        return download_id, dest_path
+
+    def _run(self, download_id, proc, dest_filename, filename=None):
+        with mock.patch.object(self.hf.subprocess, 'Popen', lambda *a, **k: proc):
+            return self.hf.download_hf_model(
+                'o/r', filename or dest_filename, self.loras, dest_filename, download_id)
+
+    # -- item 1: free space >= size + headroom, even with no expected_size --
+
+    def test_insufficient_disk_space_aborts_and_cleans_up(self):
+        download_id, dest_path = self._seed('big.safetensors')
+        proc = _FakeProc([_line('progress', n=1024, total=10 ** 15)])
+
+        result = self._run(download_id, proc, 'big.safetensors')
+
+        self.assertFalse(result)
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'error')
+        self.assertIn('disk space', record['error'].lower())
+        self.assertFalse(os.path.exists(dest_path))
+        self.assertFalse(os.path.exists(self.hf._staging_dir(self.loras, download_id)))
+        self.assertGreaterEqual(proc.terminate_calls, 1)
+
+    # -- ruling 4: the token never reaches the UI/console in error text ------
+
+    def test_token_is_redacted_from_the_error_record(self):
+        download_id, dest_path = self._seed('x.safetensors')
+        self.hf.get_token.return_value = 'hf_SECRETTOKEN'
+        proc = _FakeProc([_line('error', message='rejected: Bearer hf_SECRETTOKEN')])
+
+        result = self._run(download_id, proc, 'x.safetensors')
+
+        self.assertFalse(result)
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'error')
+        self.assertIn('***', record['error'])
+        self.assertNotIn('hf_SECRETTOKEN', record['error'])
+
+    # -- ruling 2: never clobber a destination that appeared meanwhile ------
+
+    def test_done_with_existing_destination_does_not_overwrite(self):
+        download_id, dest_path = self._seed('y.safetensors')
+        with open(dest_path, 'w') as f:
+            f.write('already here')
+        staging = self.hf._staging_dir(self.loras, download_id)
+        os.makedirs(staging, exist_ok=True)
+        result_path = os.path.join(staging, 'y.safetensors')
+        with open(result_path, 'w') as f:
+            f.write('new payload')
+        proc = _FakeProc([_line('done', path=result_path)])
+
+        result = self._run(download_id, proc, 'y.safetensors')
+
+        self.assertFalse(result)
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'error')
+        with open(dest_path) as f:
+            self.assertEqual(f.read(), 'already here')
+        self.assertFalse(os.path.exists(staging))
+
+    # -- rulings 7/8 and item 1's terminate fix: the success path -----------
+
+    def test_done_lands_the_file_and_leaves_a_non_terminal_status(self):
+        download_id, dest_path = self._seed('z.safetensors')
+        staging = self.hf._staging_dir(self.loras, download_id)
+        os.makedirs(staging, exist_ok=True)
+        result_path = os.path.join(staging, 'z.safetensors')
+        with open(result_path, 'w') as f:
+            f.write('payload')
+        self.hf.get_token.return_value = 'hf_ABC'
+        proc = _FakeProc([_line('done', path=result_path)])
+
+        result = self._run(download_id, proc, 'z.safetensors')
+
+        self.assertTrue(result)
+        record = downloader.get_progress(download_id)
+        # Ruling 7: never the terminal 'completed' status - no sha256 yet,
+        # only downloader._run sets that, after hashing.
+        self.assertEqual(record['status'], 'verifying')
+        with open(dest_path) as f:
+            self.assertEqual(f.read(), 'payload')
+        self.assertFalse(os.path.exists(staging))
+        # A worker that already finished producing output must not be
+        # terminated - only waited for.
+        self.assertEqual(proc.terminate_calls, 0)
+        # Ruling 8: the endpoint is pinned rather than left to the
+        # inherited environment's HF_ENDPOINT.
+        sent = json.loads(proc.stdin.written)
+        self.assertEqual(sent['endpoint'], 'https://huggingface.co')
+        self.assertEqual(sent['token'], 'hf_ABC')
+
+    # -- ruling 2 (cancellation half): a real kill, nothing left behind -----
+
+    def test_cancel_mid_stream_leaves_nothing_at_dest(self):
+        download_id, dest_path = self._seed('c.safetensors')
+
+        def stdout_lines():
+            # Set before the line is ever queued for the main loop to read,
+            # so it is guaranteed visible by the time it matters - no race
+            # to get right in the test.
+            downloader.cancelled_downloads.add(download_id)
+            yield _line('progress', n=1, total=100)
+
+        proc = _FakeProc(stdout_lines())
+
+        result = self._run(download_id, proc, 'c.safetensors')
+
+        self.assertFalse(result)
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'cancelled')
+        self.assertFalse(os.path.exists(dest_path))
+        self.assertFalse(os.path.exists(self.hf._staging_dir(self.loras, download_id)))
+        self.assertGreaterEqual(proc.terminate_calls, 1)
+
+    # -- item 9: an unsafe path inside the repo ------------------------------
+
+    def test_unsafe_repo_path_is_refused_before_anything_is_spawned(self):
+        for bad in ('../evil.safetensors', '/evil.safetensors', '\\evil.safetensors', 'C:evil.safetensors'):
+            with self.subTest(bad=bad):
+                download_id, dest_path = self._seed('d.safetensors')
+
+                # Not an exception: a Popen that *would* succeed, so the
+                # assertion below actually discriminates "never spawned"
+                # from "spawned, but its exception happened to also produce
+                # an error record" - the old code already did the latter.
+                spawn_calls = []
+
+                def spy(*args, **kwargs):
+                    spawn_calls.append(True)
+                    return _FakeProc([])
+
+                with mock.patch.object(self.hf.subprocess, 'Popen', spy):
+                    result = self.hf.download_hf_model('o/r', bad, self.loras, 'd.safetensors', download_id)
+
+                self.assertFalse(result)
+                self.assertEqual(spawn_calls, [], 'a worker process must never be spawned for an unsafe repo path')
+                record = downloader.get_progress(download_id)
+                self.assertEqual(record['status'], 'error')
+
+    def test_unsafe_repo_path_check_is_a_segment_check_not_a_substring_check(self):
+        self.assertFalse(self.hf._unsafe_repo_path('a..b/x.safetensors'))
+        self.assertFalse(self.hf._unsafe_repo_path('sub/model.safetensors'))

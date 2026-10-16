@@ -344,6 +344,12 @@ def download_hf_model(
     _remove_staging(staging)
     stderr_tail = ''.join(stderr_lines).strip()
     final_error = error_msg or (stderr_tail[-500:] if stderr_tail else None) or "Download failed for an unknown reason"
+    # The token never goes into a URL or a log line (project rule) - but an
+    # HTTP client error can echo request headers back into its own exception
+    # message, and that message is what lands here from the worker. Scrub it
+    # before it is stored (served to the UI by /progress) or printed.
+    if isinstance(token, str) and token:
+        final_error = final_error.replace(token, '***')
     with download_lock:
         download_progress[download_id]['status'] = 'error'
         download_progress[download_id]['error'] = final_error

@@ -60,6 +60,10 @@ class RecordTests(LibraryTestCase):
     def test_duplicate_guard_holds_while_the_engine_runs(self):
         url = 'https://huggingface.co/o/r/resolve/main/x.safetensors'
         download_id = downloader.start_download(url, 'loras', 'x.safetensors')
+        # _ensure_workers is mocked, so nothing ever drains the queue entry
+        # this created; without this, a later test's real worker could pop it
+        # and retry a download against this test's already-removed temp dir.
+        self.addCleanup(downloader._jobs.pop, download_id, None)
         refused = []
 
         def popen(*args, **kwargs):

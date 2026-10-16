@@ -62,6 +62,10 @@ export class DownloadController {
         this.records = {};          // download id -> progress record
         this.progressTimer = null;
         this.lookupTimer = null;
+        // Guards re-arming a poll once the dialog has closed: a fetch already
+        // in flight when close() runs still resolves and would otherwise
+        // schedule the next timer on a hidden dialog, leaking it forever.
+        this.live = false;
     }
 
     blockId(missing) {
@@ -122,6 +126,7 @@ export class DownloadController {
     }
 
     afterRender(container, data) {
+        this.live = true;
         this.container = container;
         this.missing = new Map((data.missing_models || []).map((m) => [refSlot(m), m]));
         if (!container._mlDownloadsWired) {
@@ -198,7 +203,7 @@ export class DownloadController {
     }
 
     scheduleProgressPoll() {
-        if (!this.progressTimer) this.progressTimer = setTimeout(() => this.pollProgress(), 1000);
+        if (this.live && !this.progressTimer) this.progressTimer = setTimeout(() => this.pollProgress(), 1000);
     }
 
     async pollProgress() {
@@ -210,6 +215,7 @@ export class DownloadController {
             this.scheduleProgressPoll();
             return;
         }
+        if (!this.live) return;
         let active = false;
         const finished = [];
         for (const [slot, id] of this.byRef) {
@@ -240,6 +246,7 @@ export class DownloadController {
         } catch (error) {
             return;
         }
+        if (!this.live) return;
         let any = false;
         for (const [id, record] of Object.entries(all)) {
             if (downloadState(null, record).kind !== "active") continue;
@@ -255,7 +262,7 @@ export class DownloadController {
     }
 
     scheduleLookupPoll() {
-        if (!this.lookupTimer) this.lookupTimer = setTimeout(() => this.pollLookups(), 2000);
+        if (this.live && !this.lookupTimer) this.lookupTimer = setTimeout(() => this.pollLookups(), 2000);
     }
 
     async pollLookups() {
@@ -269,6 +276,7 @@ export class DownloadController {
             this.scheduleLookupPoll();
             return;
         }
+        if (!this.live) return;
         for (const missing of waiting) {
             const result = data.results?.[missing.lookup_key];
             if (!result || result.state === "pending") continue;
@@ -316,6 +324,7 @@ export class DownloadController {
     }
 
     stop() {
+        this.live = false;
         clearTimeout(this.progressTimer);
         clearTimeout(this.lookupTimer);
         this.progressTimer = this.lookupTimer = null;

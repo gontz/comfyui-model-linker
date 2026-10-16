@@ -10,6 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-10-14-upstream-parity-design.md`
 
+**Revisions (2026-10-16, after a review against the code):**
+- Task 3 also escapes `missing.node_id` and makes `refSlot()` id-safe; both come from the workflow file.
+- Task 4's assertion matches the real schema shape (`{'lora_name': 'loras'}`).
+
 ## Global Constraints
 
 - Python floor: `requires-python = ">=3.9"` (was 3.8; `asyncio.to_thread` needs 3.9).
@@ -317,13 +321,14 @@ git commit -m "Flag suggestions from folders the node cannot load from"
 
 **Files:**
 - Modify: `web/modules/linker-dialog.js` (`renderMissingModel`, lines 1267–1430)
-- Test: `tests/js/test_escaping.mjs`
+- Modify: `web/modules/util.js` (`refSlot`, lines 40–43)
+- Test: `tests/js/test_escaping.mjs`, `tests/js/test_reference_keys.mjs`
 
 **Interfaces:**
 - Consumes: `escapeHtml(value) -> string` from `web/modules/util.js`.
-- Produces: nothing new.
+- Produces: `refSlot(ref)` output contains only `[A-Za-z0-9_-]`, so it is safe inside an `id="…"` attribute and in a `#…` CSS selector. Every later task builds element ids through it and needs no escaping of its own.
 
-`renderMissingModel` interpolates `missing.subgraph_name`, `missing.node_type`, `missing.original_path`, `missing.category`, `match.model?.relative_path`, `label` and `folderPath` raw. All come from the workflow file or the filesystem, and the dialog opens automatically on load in Plan C — so a shared workflow could run script in the page.
+`renderMissingModel` interpolates `missing.subgraph_name`, `missing.node_type`, `missing.node_id`, `missing.original_path`, `missing.category`, `match.model?.relative_path`, `label` and `folderPath` raw. `refSlot()` builds element ids from `node_id` and `subgraph_id`, which the workflow file also supplies (`util.js:40-43`). All come from the workflow file or the filesystem, and the dialog opens automatically on load in Plan C — so a shared workflow could run script in the page.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -339,6 +344,7 @@ Append inside the default export of `tests/js/test_escaping.mjs`, before its `re
     const raw = [
       /\$\{missing\.subgraph_name\}/,
       /\$\{missing\.node_type\}/,
+      /\$\{missing\.node_id\}/,
       /\$\{missing\.original_path\}/,
       /\$\{missing\.category \|\| 'unknown'\}/,
       /title="\$\{match\.model\?\.relative_path/,
@@ -350,6 +356,16 @@ Append inside the default export of `tests/js/test_escaping.mjs`, before its `re
       check(`renderMissingModel escapes ${pattern}`, !pattern.test(body));
     }
   }
+
+  // Element ids are built from workflow-supplied node and subgraph ids
+  {
+    const { refSlot } = await loadModule('modules/util.js');
+    const slot = refSlot({ node_id: '1" onmouseover="x', widget_index: 0,
+                           subgraph_id: '#a b:c<d>' });
+    check('refSlot output is attribute- and selector-safe', /^[A-Za-z0-9_-]+$/.test(slot));
+    check('refSlot keeps plain ids readable',
+          refSlot({ node_id: 12, widget_index: 0 }) === '12-0-n-top');
+  }
 ```
 
 (If `readSource` is not yet imported in that file, add it to the `import { ... } from './harness.mjs'` line.)
@@ -357,7 +373,7 @@ Append inside the default export of `tests/js/test_escaping.mjs`, before its `re
 - [ ] **Step 2: Run to verify it fails**
 
 Run: `node tests/js/run.mjs`
-Expected: seven FAILs under `renderMissingModel escapes`.
+Expected: eight FAILs under `renderMissingModel escapes`, and `refSlot output is attribute- and selector-safe` FAILS.
 
 - [ ] **Step 3: Implement**
 
@@ -369,16 +385,31 @@ At the top of `renderMissingModel(missing)` add:
         const nodeType = escapeHtml(missing.node_type);
         const originalPath = escapeHtml(missing.original_path);
         const categoryText = escapeHtml(missing.category || 'unknown');
+        const nodeId = escapeHtml(missing.node_id);
 ```
 
 Then replace:
 - `${missing.subgraph_name}` → `${subgraphName}`
 - `${missing.node_type}` → `${nodeType}`
+- `${missing.node_id}` → `${nodeId}` (all three occurrences, in the subgraph, subgraph-node and node labels)
 - `<code>${missing.original_path}</code>` → `<code>${originalPath}</code>`
 - `${missing.category || 'unknown'}` → `${categoryText}`
 - `` html += `<code title="${match.model?.relative_path || label}">${label}</code> `; `` →
   `` html += `<code title="${escapeHtml(match.model?.relative_path || label)}">${escapeHtml(label)}</code> `; ``
 - `` title="${folderPath}">📁 ${folderPath}</div>` `` → `` title="${escapeHtml(folderPath)}">📁 ${escapeHtml(folderPath)}</div>` ``
+
+In `web/modules/util.js`, make `refSlot` return only id-safe characters:
+
+```js
+export function refSlot(ref) {
+    const list = (ref.list_index === undefined || ref.list_index === null) ? 'n' : ref.list_index;
+    // Used in id="…" attributes and #… selectors, from workflow-supplied ids
+    return `${ref.node_id}-${ref.widget_index}-${list}-${ref.subgraph_id || 'top'}`
+        .replace(/[^A-Za-z0-9_-]/g, '_');
+}
+```
+
+`refKey` is unchanged: it is a Map key, never markup. `tests/js/test_reference_keys.mjs` must still pass (two loras on one node get distinct slots).
 
 - [ ] **Step 4: Run the whole suite**
 
@@ -392,7 +423,7 @@ Save a copy of any workflow with a `CheckpointLoaderSimple` whose `ckpt_name` is
 - [ ] **Step 6: Commit**
 
 ```bash
-git add web/modules/linker-dialog.js tests/js/test_escaping.mjs
+git add web/modules/linker-dialog.js web/modules/util.js tests/js/test_escaping.mjs
 git commit -m "Escape workflow names in the missing-model card"
 ```
 
@@ -456,7 +487,8 @@ class LateRegistrationTests(unittest.TestCase):
         self.nodes.NODE_CLASS_MAPPINGS['LateLoraLoader'] = LateLoraLoader
         schema = node_schema.get_node_schema('LateLoraLoader')
         self.assertIsNotNone(schema)
-        self.assertIn('loras', schema['categories'])
+        # categories maps widget name -> folder category (node_schema.py:170)
+        self.assertEqual(schema['categories'], {'lora_name': 'loras'})
 ```
 
 - [ ] **Step 2: Run to verify it fails**
@@ -489,7 +521,7 @@ with:
 - [ ] **Step 4: Run the whole suite**
 
 Run: `python tests/run.py`
-Expected: all pass. If `schema['categories']` has a different shape than a list of names, read `_introspect`'s return statement (`core/node_schema.py:170`) and adjust only the assertion.
+Expected: all pass.
 
 - [ ] **Step 5: Commit**
 

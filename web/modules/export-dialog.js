@@ -207,14 +207,38 @@ export class ExportDialog {
      * basename on both sides): otherwise the scrub below would miss an entry
      * the analyzer itself attributed to this reference, leaving a credential
      * in place and letting a brand-new entry get pushed alongside it.
+     *
+     * `claimed` is the set of indices another ref on this same node already
+     * claims by its OWN exact name match - skipped by the basename fallback,
+     * so two widgets sharing a basename (DualCLIPLoader's two
+     * `t5.safetensors` under different subfolders) with an exact entry for
+     * only one of them can never have the other's change land on it.
      */
-    static findModelEntry(models, name) {
+    static findModelEntry(models, name, claimed) {
         let at = models.findIndex((m) => m?.name === name);
         if (at < 0) {
             const base = basename(name);
-            at = models.findIndex((m) => basename(m?.name) === base);
+            at = models.findIndex((m, i) => basename(m?.name) === base && !claimed?.has(i));
         }
         return at;
+    }
+
+    static isHttpUrl(value) {
+        return /^https?:\/\//i.test(value || "");
+    }
+
+    /**
+     * A non-http(s) URL (`s3://...`, etc.) that `strip_secrets` never
+     * touches server-side (it is a no-op there for any scheme but http(s)):
+     * kept only if it carries no credential-shaped part of its own.
+     */
+    static cleanNonHttpUrl(value) {
+        try {
+            const parsed = new URL(value);
+            return !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
+        } catch (e) {
+            return false;
+        }
     }
 
     /**
@@ -223,13 +247,19 @@ export class ExportDialog {
      * write the result into the workflow: a "Model links" note, the loader
      * nodes' own `properties.models`, and a muted marker node.
      *
-     * Two different things both need "the link", and they are not the same
-     * value: an EXISTING `properties.models` entry is always updated (or
-     * cleared) to the server's stripped answer, whatever its scheme - an
-     * `http://` mirror with no credential is not a reason to delete it. A
-     * BRAND-NEW entry, and the note, are restricted to https - the one scheme
-     * ever added fresh. Only adding a new entry is gated by "write links
-     * into the loader nodes"; scrubbing an existing one never is.
+     * Three kinds of `properties.models` entry, three different rules:
+     * - MATCHED (a ref resolves to it): with "write links into the loader
+     *   nodes" on, it is updated (or cleared) to the row's resolved link,
+     *   same as adding one. Off, it is only ever scrubbed of its OWN
+     *   credential - the row's resolved link replaces it only when that
+     *   turns out to be the very same address (nothing to replace, only to
+     *   clean); a genuinely different one (user-pasted, hash-found, or found
+     *   online) is never substituted.
+     * - A BRAND-NEW entry (no ref matched anything already there) is only
+     *   ever added when the option is on, and only from an https link - the
+     *   one scheme ever added fresh. Same restriction for the note.
+     * - ORPHAN (no ref claims it at all): the option has no say over these
+     *   either way - they are only ever scrubbed, never added or replaced.
      */
     async apply() {
         if (this._applying) return;   // ignore a double press
@@ -240,22 +270,129 @@ export class ExportDialog {
             const LG = globalThis.LiteGraph;
             if (!graph || !LG) { notifyError("Export", new Error("Canvas not available")); return; }
 
+            const writeLinksOn = this.option("properties");
+
+            // Every node a reference resolves to, and every ref (from any
+            // row) that resolves there too - the basename fallback above
+            // needs the full set per node, not just the one ref being
+            // matched right now.
+            const nodeRefs = new Map();
+            for (const row of rows) {
+                for (const ref of row.refs) {
+                    for (const node of this.linker.liveNodesFor(ref)) {
+                        if (!nodeRefs.has(node)) nodeRefs.set(node, []);
+                        nodeRefs.get(node).push(ref);
+                    }
+                }
+            }
+            const claimedByNode = new Map();
+            const matchFor = (node, models, name) => {
+                if (!claimedByNode.has(node)) {
+                    const claimed = new Set();
+                    for (const ref of nodeRefs.get(node) || []) {
+                        const exact = models.findIndex((m) => m?.name === ref.original_path);
+                        if (exact >= 0) claimed.add(exact);
+                    }
+                    claimedByNode.set(node, claimed);
+                }
+                return ExportDialog.findModelEntry(models, name, claimedByNode.get(node));
+            };
+
+            // Which entry (if any) every (node, ref) pair matches, decided
+            // purely by name - safe to work out before any network
+            // round-trip or mutation. Every OTHER entry on a node a ref
+            // resolves to, that no ref claims at all, is an orphan.
+            const matchByRow = new Map();      // row -> [{node, ref, at}]
+            const touchedByNode = new Map();   // node -> Set<index>
+            for (const row of rows) {
+                const matches = [];
+                for (const ref of row.refs) {
+                    for (const node of this.linker.liveNodesFor(ref)) {
+                        const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
+                        const at = matchFor(node, models, ref.original_path);
+                        matches.push({ node, ref, at });
+                        if (at >= 0) {
+                            if (!touchedByNode.has(node)) touchedByNode.set(node, new Set());
+                            touchedByNode.get(node).add(at);
+                        }
+                    }
+                }
+                matchByRow.set(row, matches);
+            }
+            const orphans = [];   // { node, index, url }
+            for (const node of nodeRefs.keys()) {
+                const touched = touchedByNode.get(node) ?? new Set();
+                const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
+                models.forEach((entry, index) => {
+                    if (touched.has(index)) return;
+                    if (typeof entry?.url === "string" && entry.url) orphans.push({ node, index, url: entry.url });
+                });
+            }
+
             const candidates = rows.filter((row) => safeHttpUrl(row.url));
-            const resolved = new Map();
-            if (candidates.length) {
+            const candidateRows = new Set(candidates);
+
+            // A matched entry's OWN current link, needed only when "write
+            // links" is off: the one case where what gets written is a
+            // choice between the row's resolved link and the entry's own,
+            // rather than simply the row's. A row with no usable link of its
+            // own resolves to "" regardless (see resolvedUrl below), so
+            // there is nothing to compare against and nothing to collect.
+            const selfCandidates = [];   // { match, url }
+            if (!writeLinksOn) {
+                for (const [row, matches] of matchByRow) {
+                    if (!candidateRows.has(row)) continue;
+                    for (const match of matches) {
+                        if (match.at < 0) continue;
+                        const models = Array.isArray(match.node.properties?.models) ? match.node.properties.models : [];
+                        const url = models[match.at]?.url;
+                        if (typeof url === "string" && url) selfCandidates.push({ match, url });
+                    }
+                }
+            }
+
+            const httpOrphans = orphans.filter((o) => ExportDialog.isHttpUrl(o.url));
+            const httpSelf = selfCandidates.filter((s) => ExportDialog.isHttpUrl(s.url));
+
+            const resolved = new Map();          // row.key -> stripped candidate url (any scheme) or ""
+            const orphanResolved = new Map();    // orphan -> stripped url or ""
+            const selfResolved = new Map();      // match -> stripped url or ""
+
+            if (candidates.length || httpOrphans.length || httpSelf.length) {
+                // Every http(s) link needing a strip - the row candidates,
+                // plus an orphan's or a matched entry's own current link -
+                // goes through the server's strip_secrets in this one batch.
+                // Never reimplemented here.
+                const payload = [
+                    ...lookupPayload(candidates),
+                    ...httpOrphans.map((o) => ({ filename: basename(o.url) || "model", existing_url: o.url })),
+                    ...httpSelf.map((s) => ({ filename: basename(s.url) || "model", existing_url: s.url })),
+                ];
                 let links;
                 try {
-                    ({ links } = await this.request("/model_linker/export/lookup", { models: lookupPayload(candidates) }));
+                    ({ links } = await this.request("/model_linker/export/lookup", { models: payload }));
                 } catch (error) { notifyError("Could not prepare the links", error); return; }
                 if (rows !== this.rows) return;
-                candidates.forEach((row, n) => resolved.set(row.key, safeHttpUrl(links?.[n]?.url) || ""));
+                let i = 0;
+                candidates.forEach((row) => resolved.set(row.key, safeHttpUrl(links?.[i++]?.url) || ""));
+                httpOrphans.forEach((o) => orphanResolved.set(o, safeHttpUrl(links?.[i++]?.url) || ""));
+                httpSelf.forEach((s) => selfResolved.set(s.match, safeHttpUrl(links?.[i++]?.url) || ""));
             }
-            // Whatever the server sent back for this row - any scheme, or ""
-            // when there was nothing to resolve - what an EXISTING entry gets
-            // written (or cleared) to.
+            // Non-http(s) (s3://, etc.): strip_secrets itself is a no-op for
+            // any scheme but http(s), so a round-trip would tell us nothing.
+            // A bare, credential-free address is kept as is; one carrying
+            // userinfo, a query or a fragment is dropped outright.
+            orphans.filter((o) => !ExportDialog.isHttpUrl(o.url))
+                .forEach((o) => orphanResolved.set(o, ExportDialog.cleanNonHttpUrl(o.url) ? o.url : ""));
+            selfCandidates.filter((s) => !ExportDialog.isHttpUrl(s.url))
+                .forEach((s) => selfResolved.set(s.match, ExportDialog.cleanNonHttpUrl(s.url) ? s.url : ""));
+
+            // Whatever the server (or the non-http check above) sent back
+            // for this row - any scheme, or "" when there was nothing to
+            // resolve.
             const resolvedUrl = (row) => resolved.get(row.key) || "";
-            // The https-only view of the same answer: what a brand-new entry,
-            // or the note, may ever carry.
+            // The https-only view of the same answer: what a brand-new
+            // entry, or the note, may ever carry.
             const finalUrl = (row) => {
                 const url = resolvedUrl(row);
                 return url.startsWith("https://") ? url : "";
@@ -304,26 +441,54 @@ export class ExportDialog {
                     }
                 }
 
-                // Always scrub a matched existing entry; adding a brand-new
-                // one is the only part "write links into the loader nodes"
-                // gates, and the only part restricted to https.
+                // Matched entries: see the three-way rule in the doc comment
+                // above. Adding a brand-new entry is the only part "write
+                // links into the loader nodes" gates for these.
                 for (const row of rows) {
-                    const writeUrl = resolvedUrl(row);
                     const addUrl = finalUrl(row);
-                    for (const ref of row.refs) {
-                        for (const node of this.linker.liveNodesFor(ref)) {
-                            const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
-                            const at = ExportDialog.findModelEntry(models, ref.original_path);
-                            if (at >= 0) {
-                                const { url: _stale, ...rest } = models[at];
-                                models[at] = writeUrl ? { ...rest, url: writeUrl } : rest;
-                                node.properties = { ...(node.properties || {}), models };
-                            } else if (this.option("properties") && addUrl) {
-                                models.push({ name: ref.original_path, url: addUrl, directory: row.category });
-                                node.properties = { ...(node.properties || {}), models };
+                    const rowResolved = resolvedUrl(row);
+                    for (const match of matchByRow.get(row) || []) {
+                        const { node, ref, at } = match;
+                        const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
+                        if (at >= 0) {
+                            let writeUrl;
+                            if (!rowResolved) {
+                                // Nothing resolved for this row (cleared, or
+                                // never had a candidate - a non-http entry's
+                                // own link is never sent as one). An http
+                                // entry with nothing to replace it is
+                                // cleared; a clean non-http one survives.
+                                const current = models[at]?.url;
+                                writeUrl = (typeof current === "string" && current && !ExportDialog.isHttpUrl(current)
+                                    && ExportDialog.cleanNonHttpUrl(current)) ? current : "";
+                            } else if (writeLinksOn) {
+                                writeUrl = rowResolved;
+                            } else {
+                                const selfUrl = selfResolved.get(match) || "";
+                                writeUrl = rowResolved === selfUrl ? rowResolved : selfUrl;
                             }
+                            const { url: _stale, ...rest } = models[at];
+                            models[at] = writeUrl ? { ...rest, url: writeUrl } : rest;
+                            node.properties = { ...(node.properties || {}), models };
+                        } else if (writeLinksOn && addUrl) {
+                            models.push({ name: ref.original_path, url: addUrl, directory: row.category });
+                            node.properties = { ...(node.properties || {}), models };
                         }
                     }
+                }
+
+                // Orphans: no ref claims these at all, so "write links" has
+                // nothing to say about them - only ever scrubbed.
+                for (const orphan of orphans) {
+                    const { node, index, url } = orphan;
+                    const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
+                    const entry = models[index];
+                    if (!entry) continue;
+                    const nextUrl = orphanResolved.get(orphan) || "";
+                    if (nextUrl === url) continue;   // unchanged - nothing to write
+                    const { url: _stale, ...rest } = entry;
+                    models[index] = nextUrl ? { ...rest, url: nextUrl } : rest;
+                    node.properties = { ...(node.properties || {}), models };
                 }
 
                 if (this.option("node")) {

@@ -218,6 +218,42 @@ export default async function run() {
           nodeZ.properties.models[0]?.url === 'https://host/newx');
   });
 
+  // Scenario 3c (item 1 core bug): two widgets on ONE node sharing a
+  // basename - DualCLIPLoader's two t5.safetensors under different
+  // subfolders - with an EXACT properties.models entry for only one of
+  // them. The basename fallback must never land the other's change on the
+  // entry a DIFFERENT ref on the same node already claims by its exact name.
+  await withFakeCanvas(async () => {
+    const refFlux = { node_id: 60, widget_index: 0, original_path: 'flux/t5.safetensors', category: 'text_encoders' };
+    const refSd3 = { node_id: 60, widget_index: 1, original_path: 'sd3/t5.safetensors', category: 'text_encoders' };
+    const nodeDual = { properties: { models: [{ name: 'flux/t5.safetensors', url: 'https://workflow/flux-link', directory: 'text_encoders' }] } };
+    const linker = { liveNodesFor: (ref) => ((ref === refFlux || ref === refSd3) ? [nodeDual] : []) };
+    const rowFlux = { key: 'text_encoders|flux/t5.safetensors', name: 't5.safetensors', category: 'text_encoders', original_path: 'flux/t5.safetensors',
+      url: 'https://workflow/flux-link', sha256: '', present: true, refs: [refFlux] };
+    const rowSd3 = { key: 'text_encoders|sd3/t5.safetensors', name: 't5.safetensors', category: 'text_encoders', original_path: 'sd3/t5.safetensors',
+      url: 'https://user:pw@host/sd3-new?token=T', sha256: '', present: true, refs: [refSd3] };
+    const dialog = Object.create(ExportDialog.prototype);
+    dialog.rows = [rowFlux, rowSd3];
+    dialog.linker = linker;
+    dialog.option = (id) => id === 'properties';   // write links ON; note and node off
+    dialog.close = () => {};
+    const CLEAN = {
+      'https://workflow/flux-link': 'https://workflow/flux-link',
+      'https://user:pw@host/sd3-new?token=T': 'https://host/sd3-new',
+    };
+    dialog.request = async (path, body) => {
+      if (path !== '/model_linker/export/lookup') throw new Error('unexpected request: ' + path);
+      return { links: body.models.map((m) => (m.existing_url in CLEAN ? { url: CLEAN[m.existing_url] } : null)) };
+    };
+    await dialog.apply();
+    const dualModels = nodeDual.properties.models;
+    check('a DualCLIPLoader-shaped flux entry keeps its own link',
+          dualModels.find((m) => m.name === 'flux/t5.safetensors')?.url === 'https://workflow/flux-link');
+    check('an sd3 entry is added rather than overwriting flux\'s', dualModels.length === 2);
+    check('the added sd3 entry carries the server\'s clean link',
+          dualModels.find((m) => m.name === 'sd3/t5.safetensors')?.url === 'https://host/sd3-new');
+  });
+
   // Scenario 4 (item 2a, real close()): closing the dialog - as a tab switch
   // now does - while apply() is still awaiting the lookup must stop it from
   // writing anything, and must release the in-flight guard.
@@ -298,12 +334,135 @@ export default async function run() {
           existingNote.widgets_values[0] === 'old content');
   });
 
+  // Scenario 8 (item 3): an entry no ref claims at all still carries
+  // whatever link the workflow shipped with - the binding focus (no token
+  // in the shared workflow) makes no exception for it. Covers an http(s)
+  // credentialed orphan (scrubbed via the server, in the SAME batch as
+  // everything else - no extra network round-trip) and non-http ones (kept
+  // if clean, dropped if not - strip_secrets itself never touches that
+  // scheme, so there is nothing for the server to do with them).
+  await withFakeCanvas(async () => {
+    const refUsed = { node_id: 70, widget_index: 0, original_path: 'used.safetensors', category: 'loras' };
+    const nodeShared = { properties: { models: [
+      { name: 'used.safetensors', url: 'https://h/used', directory: 'loras' },
+      { name: 'orphan.safetensors', url: 'https://h/orphan?token=OLD', directory: 'loras' },
+      { name: 'clean.safetensors', url: 's3://bucket/clean.safetensors', directory: 'loras' },
+      { name: 'risky.safetensors', url: 's3://user:pass@bucket/risky.safetensors?x=1', directory: 'loras' },
+    ] } };
+    const linker = { liveNodesFor: (ref) => (ref === refUsed ? [nodeShared] : []) };
+    const rowUsed = { key: 'loras|used.safetensors', name: 'used.safetensors', category: 'loras', original_path: 'used.safetensors',
+      url: 'https://h/used', sha256: '', present: true, refs: [refUsed] };   // same as its own entry - isolates the orphan behaviour
+    const dialog = Object.create(ExportDialog.prototype);
+    dialog.rows = [rowUsed];
+    dialog.linker = linker;
+    dialog.option = () => false;   // "write links" (and everything else) off - orphans are scrubbed regardless
+    dialog.close = () => {};
+    const CLEAN = { 'https://h/used': 'https://h/used', 'https://h/orphan?token=OLD': 'https://h/orphan' };
+    dialog.request = async (path, body) => {
+      if (path !== '/model_linker/export/lookup') throw new Error('unexpected request: ' + path);
+      return { links: body.models.map((m) => (m.existing_url in CLEAN ? { url: CLEAN[m.existing_url] } : null)) };
+    };
+    await dialog.apply();
+    const models = nodeShared.properties.models;
+    check('the matched entry is left as is', models.find((m) => m.name === 'used.safetensors')?.url === 'https://h/used');
+    check('an http(s) orphan is scrubbed of its credential',
+          models.find((m) => m.name === 'orphan.safetensors')?.url === 'https://h/orphan');
+    check('a clean non-http orphan survives untouched',
+          models.find((m) => m.name === 'clean.safetensors')?.url === 's3://bucket/clean.safetensors');
+    check('a risky non-http orphan is dropped',
+          !('url' in models.find((m) => m.name === 'risky.safetensors')));
+  });
+
+  // Scenario 9 (item 4): "write links into the loader nodes" governs
+  // whether a MATCHED entry may be REPLACED with a different link (one the
+  // user pasted, found by hash, or found online) - never whether its own
+  // existing credential gets scrubbed, which always happens regardless.
+  await withFakeCanvas(async () => {
+    const CLEAN = {
+      'https://h/original?token=T': 'https://h/original',
+      'https://user:pw@host/different-link?token=NEW': 'https://host/different-link',
+    };
+    const makeCase = () => {
+      const ref = { node_id: 80, widget_index: 0, original_path: 'm.safetensors', category: 'checkpoints' };
+      const node = { properties: { models: [{ name: 'm.safetensors', url: 'https://h/original?token=T', directory: 'checkpoints' }] } };
+      const linker = { liveNodesFor: (r) => (r === ref ? [node] : []) };
+      const row = { key: 'checkpoints|m.safetensors', name: 'm.safetensors', category: 'checkpoints', original_path: 'm.safetensors',
+        url: 'https://user:pw@host/different-link?token=NEW', sha256: '', present: true, refs: [ref] };
+      const dialog = Object.create(ExportDialog.prototype);
+      dialog.rows = [row];
+      dialog.linker = linker;
+      dialog.close = () => {};
+      dialog.request = async (path, body) => {
+        if (path !== '/model_linker/export/lookup') throw new Error('unexpected request: ' + path);
+        return { links: body.models.map((m) => (m.existing_url in CLEAN ? { url: CLEAN[m.existing_url] } : null)) };
+      };
+      return { node, dialog };
+    };
+
+    const off = makeCase();
+    off.dialog.option = () => false;
+    await off.dialog.apply();
+    check('with "write links" off, a different resolved link never replaces the existing one',
+          off.node.properties.models[0].url === 'https://h/original');
+
+    const on = makeCase();
+    on.dialog.option = (id) => id === 'properties';   // isolate the option under test - note/node stay off
+    await on.dialog.apply();
+    check('with "write links" on, the resolved link replaces the existing one, as before',
+          on.node.properties.models[0].url === 'https://host/different-link');
+  });
+
+  // Scenario 9b (item 4, a non-http matched entry): a MATCHED entry whose
+  // own link is non-http (s3://...) never becomes a lookup candidate in the
+  // first place - safeHttpUrl rejects that scheme, so its row's url is "" by
+  // default, not because anyone cleared anything. With "write links" off it
+  // must be judged the same way an orphan's non-http link is - kept if
+  // clean, dropped if not - never deleted outright just because there was
+  // nothing to compare it against.
+  await withFakeCanvas(async () => {
+    const refClean = { node_id: 90, widget_index: 0, original_path: 'clean-match.safetensors', category: 'checkpoints' };
+    const nodeClean = { properties: { models: [{ name: 'clean-match.safetensors', url: 's3://bucket/clean-match.safetensors', directory: 'checkpoints' }] } };
+    const linkerClean = { liveNodesFor: (r) => (r === refClean ? [nodeClean] : []) };
+    const rowClean = { key: 'checkpoints|clean-match.safetensors', name: 'clean-match.safetensors', category: 'checkpoints',
+      original_path: 'clean-match.safetensors', url: '', sha256: '', present: true, refs: [refClean] };
+    const dialogClean = Object.create(ExportDialog.prototype);
+    dialogClean.rows = [rowClean];
+    dialogClean.linker = linkerClean;
+    dialogClean.option = () => false;
+    dialogClean.close = () => {};
+    dialogClean.request = async (path) => { throw new Error('nothing to resolve: ' + path); };
+    await dialogClean.apply();
+    check('a matched entry with a clean non-http link survives with "write links" off',
+          nodeClean.properties.models[0].url === 's3://bucket/clean-match.safetensors');
+
+    const refRisky = { node_id: 91, widget_index: 0, original_path: 'risky-match.safetensors', category: 'checkpoints' };
+    const nodeRisky = { properties: { models: [{ name: 'risky-match.safetensors', url: 's3://user:pass@bucket/risky-match.safetensors?x=1', directory: 'checkpoints' }] } };
+    const linkerRisky = { liveNodesFor: (r) => (r === refRisky ? [nodeRisky] : []) };
+    const rowRisky = { key: 'checkpoints|risky-match.safetensors', name: 'risky-match.safetensors', category: 'checkpoints',
+      original_path: 'risky-match.safetensors', url: '', sha256: '', present: true, refs: [refRisky] };
+    const dialogRisky = Object.create(ExportDialog.prototype);
+    dialogRisky.rows = [rowRisky];
+    dialogRisky.linker = linkerRisky;
+    dialogRisky.option = () => false;
+    dialogRisky.close = () => {};
+    dialogRisky.request = async (path) => { throw new Error('nothing to resolve: ' + path); };
+    await dialogRisky.apply();
+    check('a matched entry with a risky non-http link is dropped with "write links" off',
+          !('url' in nodeRisky.properties.models[0]));
+  });
+
   // Scenario 7 (item 2b, faithful transcription - LinkerManagerDialog needs a
   // live DOM this harness does not have, same reason test_analyze_race.mjs
   // uses a stub rather than the real class): a tab switch while openExport()
-  // is still awaiting loadWorkflowData() must abort that request, so the
-  // Export dialog is never shown with the old tab's rows.
+  // is still awaiting loadWorkflowData() must stop it from showing the old
+  // tab's rows - but a bare abort would leave the MAIN dialog, if open,
+  // stuck on "Analyzing workflow..." forever. onGraphLoaded() instead starts
+  // a fresh loadWorkflowData() whenever one is in flight; that call aborts
+  // the old request itself (its own first line) before issuing a new one,
+  // so openExport()'s pending call still resolves to null, while the dialog
+  // completes a fresh render instead of hanging.
   {
+    const renders = [];   // every loadWorkflowData() call that actually rendered
     const dialog = {
       analyzeAbort: null,
       exportDialog: null,
@@ -311,15 +470,17 @@ export default async function run() {
         if (this.analyzeAbort) this.analyzeAbort.abort();
         const abort = new AbortController();
         this.analyzeAbort = abort;
+        const tag = `data-${++dialog.callCount}`;
         try {
           const data = await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => resolve({ tag: 'stale-tab-data' }), 30);
+            const timer = setTimeout(() => resolve({ tag }), 30);
             abort.signal.addEventListener('abort', () => {
               clearTimeout(timer);
               reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
             });
           });
           if (this.analyzeAbort !== abort) return null;
+          renders.push(tag);
           return data;
         } catch (error) {
           if (error.name === 'AbortError' || this.analyzeAbort !== abort) return null;
@@ -328,6 +489,7 @@ export default async function run() {
           if (this.analyzeAbort === abort) this.analyzeAbort = null;
         }
       },
+      callCount: 0,
       show() {},
       async openExport() {
         const data = await this.loadWorkflowData();
@@ -340,15 +502,19 @@ export default async function run() {
       dialog,
       onGraphLoaded() {
         this.dialog?.exportDialog?.close?.();
-        this.dialog?.analyzeAbort?.abort();
+        if (this.dialog?.analyzeAbort) this.dialog.loadWorkflowData();
       },
     };
     const opening = dialog.openExport();
     await new Promise((resolve) => setTimeout(resolve, 5));
-    modelLinker.onGraphLoaded();   // tab switch, while the analysis is still in flight
+    modelLinker.onGraphLoaded();   // tab switch, while the first analysis is still in flight
     await opening;
-    check('a tab switch aborts an in-flight openExport, so it never shows stale rows',
+    await new Promise((resolve) => setTimeout(resolve, 40));   // let the fresh analysis settle too
+
+    check('a tab switch stops an in-flight openExport from showing stale rows',
           dialog.exportDialog === null);
+    check('the main dialog is not left stuck on "Analyzing workflow..." - a fresh render completes',
+          renders.includes('data-2'));
   }
 
   // --- source-level checks for what is impractical to drive end-to-end ----
@@ -361,14 +527,20 @@ export default async function run() {
   check('touching the note at all is gated by the "note" option',
         /if \(this\.option\("note"\)\) \{\s*if \(markdown\)/.test(src));
   check('close() invalidates the dialog\'s rows', /close\(\) \{[\s\S]{0,200}?this\.rows = \[\];/.test(src));
+  check('the basename fallback is guarded against entries another ref already claims',
+        /findModelEntry\(models, name, claimed\)/.test(src) && /!claimed\?\.has\(i\)/.test(src));
+  check('orphan entries (no ref claims them) are collected for scrubbing', /const orphans = \[\];/.test(src));
+  check('a matched entry\'s own link is only needed when "write links" is off',
+        /if \(!writeLinksOn\) \{/.test(src) && /selfCandidates/.test(src));
   check('names and urls are escaped', /escapeHtml\(row\.name\)/.test(src) && /escapeHtml\(row\.url/.test(src));
   check('lookups can be asked for by hand', /lookUp\(\{ manual: true \}\)/.test(src));
 
   const linkerSrc = readSource('linker.js');
   check('the export dialog is closed when another workflow loads',
         /onGraphLoaded\(\)\s*\{\s*this\.dialog\?\.exportDialog\?\.close\(\);/.test(linkerSrc));
-  check('a tab switch also aborts the dialog\'s in-flight analysis',
-        /onGraphLoaded\(\)\s*\{[\s\S]{0,300}?analyzeAbort\?\.abort\(\)/.test(linkerSrc));
+  check('a tab switch re-analyses rather than leaving the dialog stuck, when one is in flight',
+        /onGraphLoaded\(\)\s*\{[\s\S]{0,300}?if \(this\.dialog\?\.analyzeAbort\) this\.dialog\.loadWorkflowData\(\);/
+          .test(linkerSrc));
   check('opening Export reports a failure instead of throwing', /notifyError\("Could not open Export"/.test(linkerSrc));
   check('opening Export is async and awaits the dialog, so a rejection cannot escape unhandled',
         /async openExport\(\)[\s\S]{0,700}?await this\.dialog\.openExport\(\)/.test(linkerSrc));

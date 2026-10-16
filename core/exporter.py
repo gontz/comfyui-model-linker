@@ -13,8 +13,8 @@ import os
 import re
 import threading
 import uuid
-from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse, urlunparse
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ SECRET_PARAMS = {
     # AWS presigned URLs (S3-backed hosts hand these out for a time-limited GET)
     'x-amz-signature', 'x-amz-credential', 'x-amz-security-token',
     # Google Cloud Storage's own presigned-URL equivalent
-    'x-goog-signature',
+    'x-goog-signature', 'x-goog-credential',
 }
 
 _hash_jobs: Dict[str, Dict[str, Any]] = {}
@@ -54,6 +54,45 @@ def _strip_path_params(path: str) -> str:
     return '/'.join(segment.split(';', 1)[0] for segment in path.split('/'))
 
 
+def _strip_query(query: str) -> str:
+    """
+    Remove secret pieces from a raw query string, losslessly.
+
+    `parse_qsl` + `urlencode` rewrites the whole thing from scratch - every
+    piece gets a `=` even if it never had one (`?empty` becomes `?empty=`),
+    and a value that itself contains `;` (`?filter=x;y;z`, one piece) gets
+    re-split into several. Neither is a credential; both must come back
+    exactly as they went in.
+
+    So instead: split on `&` or `;` (both are seen as pair separators) while
+    keeping the separators, drop a piece only when its key - everything
+    before the first `=`, percent-decoded and lower-cased for the comparison
+    only - names a secret, and rejoin every surviving piece with its own
+    original separator.
+    """
+    if not query:
+        return query
+    parts = re.split(r'([&;])', query)
+    kept: List[Tuple[str, Optional[str]]] = []
+    for i in range(0, len(parts), 2):
+        piece = parts[i]
+        key = piece.split('=', 1)[0]
+        try:
+            key = unquote(key)
+        except Exception:
+            pass
+        if key.lower() in SECRET_PARAMS:
+            continue
+        sep = parts[i + 1] if i + 1 < len(parts) else None
+        kept.append((piece, sep))
+    result = []
+    for index, (piece, sep) in enumerate(kept):
+        result.append(piece)
+        if index != len(kept) - 1:
+            result.append(sep or '&')
+    return ''.join(result)
+
+
 def strip_secrets(url: str) -> str:
     """
     Remove every credential a URL can carry, not only `?token=...`:
@@ -65,6 +104,9 @@ def strip_secrets(url: str) -> str:
       only the final one
     - any fragment - nothing downstream needs one, and a token hidden there
       would otherwise survive untouched
+
+    Everything else about the URL - including a query piece that merely
+    happens to contain `;` or have no `=` at all - passes through unchanged.
     """
     if not url or not isinstance(url, str):
         return ''
@@ -75,13 +117,12 @@ def strip_secrets(url: str) -> str:
         return url
     if parsed.scheme not in ('http', 'https'):
         return url
-    query = [(k, v) for k, v in parse_qsl(parsed.query.replace(';', '&'), keep_blank_values=True)
-             if k.lower() not in SECRET_PARAMS]
     # netloc is "user:pass@host:port" (or "user:pass@[::1]:port"); everything
     # after the last '@' is the host and port, brackets and all - keep only that
     netloc = parsed.netloc.rsplit('@', 1)[-1]
     path = _strip_path_params(parsed.path)
-    return urlunparse(parsed._replace(netloc=netloc, path=path, params='', query=urlencode(query), fragment=''))
+    query = _strip_query(parsed.query)
+    return urlunparse(parsed._replace(netloc=netloc, path=path, params='', query=query, fragment=''))
 
 
 def _category_sort_key(category: str):

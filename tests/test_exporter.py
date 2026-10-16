@@ -46,8 +46,20 @@ class LinkTests(unittest.TestCase):
 
     def test_access_token_and_google_signature_are_stripped(self):
         self.assertEqual(
-            exporter.strip_secrets('https://host/path?access-token=abc&X-Goog-Signature=def&foo=bar'),
+            exporter.strip_secrets('https://host/path?access-token=abc&X-Goog-Signature=def'
+                                    '&X-Goog-Credential=ghi&foo=bar'),
             'https://host/path?foo=bar')
+
+    def test_a_query_value_containing_semicolons_survives_unchanged(self):
+        # Not a credential - a single piece whose own value has ';' in it
+        self.assertEqual(exporter.strip_secrets('https://host/path?filter=x;y;z'), 'https://host/path?filter=x;y;z')
+
+    def test_a_bare_query_flag_survives_unchanged(self):
+        # No '=' at all - parse_qsl/urlencode used to turn this into '?empty='
+        self.assertEqual(exporter.strip_secrets('https://host/path?empty'), 'https://host/path?empty')
+
+    def test_stripping_a_middle_piece_keeps_its_neighbours_joined_correctly(self):
+        self.assertEqual(exporter.strip_secrets('https://host/path?a=1&token=x&b=2'), 'https://host/path?a=1&b=2')
 
     def test_existing_link_wins_and_is_stripped(self):
         # No **kwargs: a leftover fetch_size=False raises TypeError here, which

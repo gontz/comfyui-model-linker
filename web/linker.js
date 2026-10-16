@@ -66,12 +66,18 @@ export class ModelLinker {
     // is announced once per session. A workflow the Export dialog was built
     // from is one of these, so it is closed immediately rather than left
     // open to write by node id into a tab that is no longer the one on screen.
-    // Aborting the dialog's in-flight analysis too covers openExport(): while
-    // it awaits loadWorkflowData(), a tab switch must not let that request
-    // land afterwards and open Export with the old tab's rows.
+    //
+    // A bare abort of the dialog's in-flight analysis would still cover
+    // openExport() correctly (loadWorkflowData() resolves that request's own
+    // promise to null), but strands the MAIN dialog on screen showing
+    // "Analyzing workflow..." forever if it happens to be open. Starting a
+    // fresh loadWorkflowData() instead aborts the old request itself (its
+    // own first line) before issuing a new one, so the pending openExport()
+    // still gets null from the one it was awaiting, while an open dialog
+    // re-renders for the workflow now on screen instead of hanging.
     onGraphLoaded() {
         this.dialog?.exportDialog?.close();
-        this.dialog?.analyzeAbort?.abort();
+        if (this.dialog?.analyzeAbort) this.dialog.loadWorkflowData();
         clearTimeout(this.loadTimer);
         this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
     }

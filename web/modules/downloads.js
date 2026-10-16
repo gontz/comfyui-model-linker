@@ -26,13 +26,28 @@ const basename = (path) => (path || "").split(/[\\/]/).pop();
 const categoryKey = (category) => (category || "unknown").toLowerCase();
 
 /**
+ * The category a missing model's download is actually filed under - the
+ * same choice start() makes when it posts to /model_linker/download. When
+ * the card's own category is "unknown" (a popular/model-list match named
+ * the folder, not the workflow), that is the download source's own
+ * directory, not "unknown": fileKey must mirror this exactly, or a card
+ * whose category was never known cannot find its own download on a fresh
+ * controller (e.g. after a page reload) - it only has the source to go on.
+ */
+const effectiveCategory = (m) => {
+    if (m.category && m.category !== "unknown") return m.canonical_category || m.category;
+    const source = m.download_source || {};
+    return source.canonical_category || source.directory;
+};
+
+/**
  * The identity a download is tracked and deduped by: canonical category plus
  * filename. Two categories that are really the same folder (`clip` and
  * `text_encoders`) must collapse to one key, or an alias sends a second
  * download of the same file - and the server's own "already downloading"
  * refusal would surface to the user as an error for doing nothing wrong.
  */
-const fileKey = (m) => `${categoryKey(m.canonical_category || m.category)}|${basename(m.original_path).toLowerCase()}`;
+const fileKey = (m) => `${categoryKey(effectiveCategory(m))}|${basename(m.original_path).toLowerCase()}`;
 
 /** The same identity, computed from a /progress record instead of a missing model. */
 const recordKey = (r) => `${categoryKey(r.canonical_category || r.category)}|${basename(r.filename).toLowerCase()}`;
@@ -306,10 +321,18 @@ export class DownloadController {
             return;
         }
         if (!this.live) return;
+        // Only a record whose file key matches something actually rendered
+        // right now - an unrelated download (another tab, an earlier
+        // workflow, someone else's model) must not be adopted just because
+        // it happens to still be running on the server: adopting it would
+        // keep polling alive for no card on screen, and a false "Downloaded"
+        // toast plus a full re-analysis once it finishes.
+        const onScreen = new Set([...this.missing.values()].map(fileKey));
         let any = false;
         for (const [id, record] of Object.entries(all)) {
             if (downloadState(null, record).kind !== "active") continue;
             const key = recordKey(record);
+            if (!onScreen.has(key)) continue;
             if (this.byFile.get(key) === id) continue; // already tracked
             this.track(key, id, record);
             any = true;

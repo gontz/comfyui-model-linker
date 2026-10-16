@@ -96,6 +96,25 @@ def _has_perfect_match(missing: Dict[str, Any]) -> bool:
                for m in missing.get('matches') or [])
 
 
+def _with_canonical_category(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    A download source names the folder it belongs in (`directory`), which is
+    all a card whose own category is "unknown" (a popular/model-list match
+    picked the folder, not the workflow) has to go on. The frontend matches a
+    running download to a card by canonical category + filename everywhere
+    else, so this source needs the same canonical name - computed here,
+    lazily, rather than stored, so entries already on disk from before this
+    field existed still get it, and aliases like `clip`/`text_encoders`
+    still agree with whatever `core.downloader` canonicalized the eventual
+    progress record's category to.
+
+    Returns a copy; the store's own cached dict is never mutated in place.
+    """
+    if not isinstance(result, dict):
+        return result
+    return {**result, 'canonical_category': canonical_category(result.get('directory'))}
+
+
 class LookupStore:
     """Answers by key, persisted as one JSON document."""
 
@@ -262,7 +281,7 @@ def attach_cached(missing_models: List[Dict[str, Any]]) -> int:
             continue
         entry = _store.get(key)
         if entry is not None:
-            missing['download_source'] = entry.get('result')
+            missing['download_source'] = _with_canonical_category(entry.get('result'))
             missing['lookup_state'] = 'found' if entry.get('result') else 'not_found'
         elif _worker.is_pending(key) or (auto and _worker.enqueue(key, _request_for(missing))):
             missing['lookup_state'] = 'pending'
@@ -283,7 +302,7 @@ def results_for(keys: List[str]) -> Dict[str, Dict[str, Any]]:
             results[key] = {'state': 'unknown', 'source': None}
         else:
             results[key] = {'state': 'found' if entry.get('result') else 'not_found',
-                            'source': entry.get('result')}
+                            'source': _with_canonical_category(entry.get('result'))}
     return results
 
 

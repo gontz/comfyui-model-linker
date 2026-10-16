@@ -94,6 +94,28 @@ class AttachTests(LookupTestCase):
         self.assertEqual(result['state'], 'found')
         self.assertEqual(result['source']['source'], 'huggingface')
 
+    def test_source_carries_the_canonical_category_of_its_own_folder(self):
+        # A card whose own category is "unknown" (a popular/model-list match
+        # picked the folder, not the workflow) has only the source's
+        # `directory` to go on. The frontend matches a running download to a
+        # card by canonical category + filename everywhere else, so the
+        # source needs the same canonical name - and aliases (clip/clips)
+        # must still collapse to the one name core.downloader canonicalizes
+        # the eventual progress record to.
+        self.found['flux1-dev-fp8.safetensors'] = {
+            'url': 'https://huggingface.co/a/b/resolve/main/x', 'source': 'huggingface', 'directory': 'clips',
+        }
+        lookups.attach_cached([missing(category='unknown')])
+        lookups._worker.wait_idle(5)
+
+        from core.categories import canonical_category
+        models = [missing(category='unknown')]
+        lookups.attach_cached(models)  # now answered from the store
+        self.assertEqual(models[0]['download_source']['canonical_category'], canonical_category('clips'))
+
+        result = lookups.results_for([models[0]['lookup_key']])[models[0]['lookup_key']]
+        self.assertEqual(result['source']['canonical_category'], canonical_category('clips'))
+
     def test_cached_answer_is_attached_without_asking_again(self):
         lookups.attach_cached([missing()])
         lookups._worker.wait_idle(5)

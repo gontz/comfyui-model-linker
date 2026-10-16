@@ -83,6 +83,10 @@ export default async function run() {
         /this\.byFile/.test(src) && !/this\.byRef/.test(src));
   check('per-analysis state has its own reset, separate from stop()',
         /reset\(\)\s*\{/.test(src));
+  check('fileKey falls back to the download source\'s own folder when the card\'s category is unknown',
+        /effectiveCategory/.test(src) && /source\.canonical_category \|\| source\.directory/.test(src));
+  check('reconnect only adopts records matching something on screen',
+        /onScreen/.test(src.slice(src.indexOf('async reconnect'))));
 
   const dialog = readSource('modules/linker-dialog.js');
   check('closing the dialog stops polling', /close\(\)\s*\{[\s\S]{0,600}downloads\.stop\(\)/.test(dialog));
@@ -253,6 +257,8 @@ export default async function run() {
   }
 
   // 7. Closing mid-request must not leave a leaked polling chain (0552199).
+  // The poll interval is 1000ms, so this has to wait past at least one more
+  // tick - anything shorter can't actually catch a re-armed timer.
   {
     let calls = 0;
     const progress = { dY: { status: 'downloading', progress: 30, filename: 'y.safetensors', category: 'loras' } };
@@ -269,9 +275,48 @@ export default async function run() {
     await sleep(30);
     c.stop(); // closed while that request is still in flight
     const callsAtClose = calls;
-    await sleep(400);
+    await sleep(1300);
     check('no further /progress calls after closing mid-request',
           calls === callsAtClose, `${callsAtClose} -> ${calls}`);
+    check('no timer is left armed after close',
+          c.progressTimer === null && c.lookupTimer === null,
+          `progressTimer=${c.progressTimer}, lookupTimer=${c.lookupTimer}`);
+  }
+
+  // 8. A card whose own category is "unknown" (a popular/model-list match
+  // named the folder, not the workflow) must still reconnect to its running
+  // download on a fresh controller - it only has the source's directory to
+  // go on, and that must mirror what start() itself would have posted.
+  {
+    const progress = {
+      dZ: { status: 'downloading', progress: 40, filename: 'u.safetensors', category: 'loras', canonical_category: 'loras' },
+    };
+    api.fetchApi = async (path) => reply(path === '/model_linker/progress' ? progress : {});
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'u.safetensors', 'unknown', {
+      download_source: { url: 'https://huggingface.co/a/b/resolve/main/u.safetensors', source: 'popular',
+                          directory: 'loras', canonical_category: 'loras' },
+    });
+    c.afterRender(cont, { missing_models: [m] });
+    await sleep(30);
+    const html = cont.els.get(c.blockId(m))?.innerHTML || '';
+    check('an unknown-category card reconnects to its record', /progress/.test(html), html.slice(0, 160));
+    c.stop();
+  }
+
+  // 9. reconnect() must not adopt a download with no matching card on
+  // screen - an earlier workflow's download, or another tab's, must not
+  // keep this controller polling or later fire a false "Downloaded" toast.
+  {
+    const progress = { dW: { status: 'downloading', progress: 10, filename: 'unrelated.safetensors', category: 'loras' } };
+    api.fetchApi = async (path) => reply(path === '/model_linker/progress' ? progress : {});
+    const c = new DownloadController(fakeDialog());
+    c.afterRender(fakeContainer(), { missing_models: [mk(1, 'z.safetensors', 'loras')] });
+    await sleep(30);
+    check('an unrelated running download is not adopted', c.byFile.size === 0, `byFile=${[...c.byFile.keys()]}`);
+    check('and nothing keeps polling for it', c.progressTimer === null, `progressTimer=${c.progressTimer}`);
+    c.stop();
   }
 
   return check.failures;

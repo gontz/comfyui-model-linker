@@ -1,12 +1,51 @@
 // What the download block shows, and the rules that keep it cheap and safe:
-// results patch cards in place, one download per file, nothing unescaped.
+// results patch cards in place, one download per *file* (not per card), and
+// nothing unescaped. The behavioural half of this suite runs the real
+// DownloadController against a fake server and a fake DOM container - the
+// same shape as the probe used to find the download-to-card identity bugs
+// this suite pins down (I-1 through I-4, M-2 through M-4).
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createChecker, loadModule, readSource } from './harness.mjs';
 
 export const name = 'downloads';
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Node has no CSS global; refresh() only needs .escape() to be the identity
+// for ids built from refSlot(), which already restricts itself to
+// [A-Za-z0-9_-] and therefore needs no real escaping in these tests.
+globalThis.CSS = globalThis.CSS || { escape: (s) => s };
+
+function fakeContainer() {
+  const els = new Map();
+  return {
+    els,
+    querySelector(sel) {
+      const id = sel.slice(1);
+      if (!els.has(id)) els.set(id, { id, innerHTML: '' });
+      return els.get(id);
+    },
+    contains: () => true,
+    addEventListener() {},
+  };
+}
+
+const HTTPS_SOURCE = { url: 'https://huggingface.co/a/b/resolve/main/m.safetensors', source: 'huggingface' };
+
+const mk = (node, name, category, extra = {}) => ({
+  node_id: node, widget_index: 0, original_path: name, category,
+  lookup_state: 'found', download_source: HTTPS_SOURCE, matches: [], ...extra,
+});
+
+const fakeDialog = () => ({ loadWorkflowData: async () => {}, openSettings() {} });
+
+const reply = (data, ok = true, status = 200) => ({ ok, status, json: async () => data });
+
 export default async function run() {
   const check = createChecker(name);
-  const { downloadState, isFinished } = await loadModule('modules/downloads.js');
+  const { downloadState, isFinished, DownloadController } = await loadModule('modules/downloads.js');
 
   const https = { url: 'https://huggingface.co/a/b/resolve/main/x.safetensors', source: 'huggingface' };
   check('a found https source is downloadable',
@@ -24,6 +63,10 @@ export default async function run() {
   check('HF "completed" before verification is still active',
         downloadState({}, { status: 'completed' }).kind === 'active' && !isFinished({ status: 'completed' }));
   check('completed with a hash is finished', isFinished({ status: 'completed', sha256: 'ab' }));
+  check('lookup_state undefined (lookups never ran) renders nothing, not a dead button',
+        downloadState({}).kind === 'none');
+  check('lookup_state "idle" (auto-lookup off) still offers a manual search',
+        downloadState({ lookup_state: 'idle' }).kind === 'idle');
 
   const src = readSource('modules/downloads.js');
   const poll = src.slice(src.indexOf('async pollLookups'), src.indexOf('async searchAgain'));
@@ -36,9 +79,200 @@ export default async function run() {
   check('workflow-derived slots are escaped in attributes',
         !/data-ml-slot="\$\{slot\}"/.test(src) && /data-ml-slot="\$\{escapeHtml\(slot\)\}"/.test(src)
         && /id="\$\{escapeHtml\(this\.blockId\(missing\)\)\}"/.test(src) && /CSS\.escape\(/.test(src));
+  check('downloads are tracked by file identity, not by card',
+        /this\.byFile/.test(src) && !/this\.byRef/.test(src));
+  check('per-analysis state has its own reset, separate from stop()',
+        /reset\(\)\s*\{/.test(src));
 
   const dialog = readSource('modules/linker-dialog.js');
   check('closing the dialog stops polling', /close\(\)\s*\{[\s\S]{0,600}downloads\.stop\(\)/.test(dialog));
   check('the footer offers download all', /downloadAll\(\)/.test(dialog));
+  {
+    const lwdStart = dialog.indexOf('async loadWorkflowData');
+    const lwdEnd = dialog.indexOf('Get current workflow from ComfyUI', lwdStart);
+    const body = dialog.slice(lwdStart, lwdEnd);
+    check('loadWorkflowData resets per-analysis download state at the top',
+          /this\.downloads\.reset\(\)/.test(body.slice(0, 700)));
+  }
+
+  // ---- Behavioural: file identity, dedupe, reset, reconnect, timers ----
+  // Imported directly rather than through loadModule() so mutating
+  // api.fetchApi here is visible to downloads.js's own import of it: both
+  // resolve to the same on-disk stub (tests/js/stubs/scripts/api.js), which
+  // Node caches by URL regardless of which module asked for it first.
+  const { api } = await import('file://' + join(HERE, 'stubs', 'scripts', 'api.js').replace(/\\/g, '/'));
+
+  // 1. Five nodes referencing one model: one POST, every card shows progress.
+  {
+    const posts = [];
+    const progress = {};
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/download') {
+        posts.push(body);
+        progress.d1 = { status: 'downloading', progress: 10, filename: body.filename, category: body.category };
+        return reply({ download_id: 'd1' });
+      }
+      if (path === '/model_linker/progress') return reply(progress);
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const ms = [1, 2, 3, 4, 5].map((n) => mk(n, 'flux.safetensors', 'diffusion_models'));
+    c.afterRender(cont, { missing_models: ms });
+    await sleep(20);
+    await c.downloadAll();
+    const shown = [...cont.els.values()].filter((e) => /progress/.test(e.innerHTML)).length;
+    check('five nodes referencing one model send one POST', posts.length === 1, `posts=${posts.length}`);
+    check('all five cards show the shared download', shown === 5, `shown=${shown}`);
+    c.stop();
+  }
+
+  // 2. Two alias categories (clip / text_encoders) for the same filename:
+  // one POST, both cards show it, no spurious "already downloading" toast.
+  {
+    const posts = [];
+    const progress = {};
+    let nextId = 1;
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/download') {
+        posts.push(body);
+        const id = 'd' + nextId++;
+        progress[id] = { status: 'downloading', progress: 5, filename: body.filename, category: body.category };
+        return reply({ download_id: id });
+      }
+      if (path === '/model_linker/progress') return reply(progress);
+      return reply({});
+    };
+    globalThis.__toasts = [];
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const ms = [
+      mk(1, 'te.safetensors', 'clip', { canonical_category: 'text_encoders' }),
+      mk(2, 'te.safetensors', 'text_encoders', { canonical_category: 'text_encoders' }),
+    ];
+    c.afterRender(cont, { missing_models: ms });
+    await sleep(20);
+    await c.downloadAll();
+    const shown = [...cont.els.values()].filter((e) => /progress/.test(e.innerHTML)).length;
+    check('clip and text_encoders collapse to one POST', posts.length === 1, `posts=${posts.length}`);
+    check('both alias cards show the one download', shown === 2, `shown=${shown}`);
+    check('no "already downloading" error toast for the alias card',
+          !globalThis.__toasts.some((t) => /already downloading/i.test(t.detail || '')),
+          JSON.stringify(globalThis.__toasts.map((t) => t.detail)));
+    c.stop();
+  }
+
+  // 3. reset() - the dialog's loadWorkflowData() chokepoint - drops a fully
+  // resolved workflow's stale state, so "Download all" starts nothing.
+  {
+    const posts = [];
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/download') { posts.push(body); return reply({ download_id: 'x' }); }
+      if (path === '/model_linker/progress') return reply({});
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    c.afterRender(fakeContainer(), { missing_models: [mk(1, 'old.safetensors', 'loras')] });
+    await sleep(20);
+    c.stop();   // dialog closed
+    c.reset();  // the next loadWorkflowData() finds nothing missing
+    await c.downloadAll();
+    check('download all on a fully-resolved workflow starts nothing', posts.length === 0, `posts=${JSON.stringify(posts)}`);
+  }
+
+  // 4. A new card landing on the same node/widget slot as a previous
+  // analysis's card must not inherit that card's download.
+  {
+    const progress = {};
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/download') {
+        progress.d1 = { status: 'downloading', progress: 50, filename: body.filename, category: body.category };
+        return reply({ download_id: 'd1' });
+      }
+      if (path === '/model_linker/progress') return reply(progress);
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    c.afterRender(fakeContainer(), { missing_models: [mk(7, 'a.safetensors', 'loras')] });
+    await sleep(20);
+    await c.downloadAll();
+    c.stop();
+    c.reset();
+    const other = mk(7, 'b.safetensors', 'vae'); // same node_id/widget_index, different file
+    const html = c.renderBlock(other);
+    check('a different model on the same slot shows no inherited progress or cancel',
+          !/progress|Cancel/.test(html), html.slice(0, 160));
+  }
+
+  // 5. reconnect() attaches a running download only to the card whose
+  // canonical file key matches - not to every card sharing a basename.
+  {
+    const progress = {
+      dX: { status: 'downloading', progress: 30, filename: 'model.safetensors', category: 'vae', canonical_category: 'vae' },
+    };
+    api.fetchApi = async (path) => reply(path === '/model_linker/progress' ? progress : {});
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const ms = [mk(1, 'model.safetensors', 'vae'), mk(2, 'model.safetensors', 'text_encoders')];
+    c.afterRender(cont, { missing_models: ms });
+    await sleep(30);
+    const shown = [...cont.els.values()].filter((e) => /progress/.test(e.innerHTML)).map((e) => e.id);
+    check('reconnect attaches only the matching-category card',
+          shown.length === 1 && shown[0] === c.blockId(ms[0]), `cards=${shown}`);
+    c.stop();
+  }
+
+  // 6. A second "Download all found" click, with the first click's downloads
+  // now active, must not repeat the "nothing to download" toast.
+  {
+    const progress = {};
+    let nextId = 1;
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/download') {
+        const id = 'd' + nextId++;
+        progress[id] = { status: 'downloading', progress: 1, filename: body.filename, category: body.category };
+        return reply({ download_id: id });
+      }
+      if (path === '/model_linker/progress') return reply(progress);
+      return reply({});
+    };
+    globalThis.__toasts = [];
+    const c = new DownloadController(fakeDialog());
+    c.afterRender(fakeContainer(), { missing_models: [mk(1, 'z.safetensors', 'loras')] });
+    await sleep(20);
+    await c.downloadAll();
+    await c.downloadAll();
+    check('the second click adds no false "nothing to download" toast',
+          globalThis.__toasts.length === 0, JSON.stringify(globalThis.__toasts.map((t) => t.detail)));
+    c.stop();
+  }
+
+  // 7. Closing mid-request must not leave a leaked polling chain (0552199).
+  {
+    let calls = 0;
+    const progress = { dY: { status: 'downloading', progress: 30, filename: 'y.safetensors', category: 'loras' } };
+    api.fetchApi = async (path) => {
+      if (path === '/model_linker/progress') {
+        calls++;
+        await sleep(150);
+        return reply(progress);
+      }
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    c.afterRender(fakeContainer(), { missing_models: [mk(1, 'y.safetensors', 'loras')] }); // reconnect() in flight
+    await sleep(30);
+    c.stop(); // closed while that request is still in flight
+    const callsAtClose = calls;
+    await sleep(400);
+    check('no further /progress calls after closing mid-request',
+          calls === callsAtClose, `${callsAtClose} -> ${calls}`);
+  }
+
   return check.failures;
 }

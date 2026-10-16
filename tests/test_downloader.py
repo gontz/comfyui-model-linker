@@ -16,7 +16,7 @@ try:
 except ImportError:
     raise unittest.SkipTest('requests is not installed')
 
-from core import downloader, overrides, settings
+from core import categories, downloader, overrides, settings
 from support import LibraryTestCase
 
 BODY = b'model weights' * 1000
@@ -123,6 +123,14 @@ class DestinationTests(DownloaderTestCase):
         record = self.run_download(filename='..\\..\\escape.safetensors')
         self.assertEqual(record['status'], 'completed')
         self.assertTrue(os.path.isfile(os.path.join(self.loras, 'escape.safetensors')))
+
+    def test_record_carries_canonical_category(self):
+        # The frontend matches a running download to a card by canonical
+        # category + filename, the same identity it dedupes downloads with -
+        # the record must carry that canonical name, not just the raw one.
+        download_id = downloader.start_download('https://civitai.com/x', 'loras', 'a.safetensors')
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['canonical_category'], categories.canonical_category('loras'))
 
     def test_rejects_drive_relative_and_hidden_names(self):
         # On Windows basename('C:evil.safetensors') is 'evil.safetensors', so

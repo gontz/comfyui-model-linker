@@ -1049,6 +1049,13 @@ export class LinkerManagerDialog {
     async loadWorkflowData(workflow = null) {
         if (!this.contentElement) return;
 
+        // Drop download/lookup state derived from the last render, before
+        // deciding anything about this one: the zero-missing, no-workflow
+        // and error branches below never call displayMissingModels (so
+        // never afterRender()), and would otherwise leave a stale card from
+        // the previous workflow sitting in the download controller forever.
+        this.downloads.reset();
+
         // Reopening the dialog or hitting Refresh while an analysis is in
         // flight starts a second one. Without this, both complete and whichever
         // *arrives* last wins - which is not necessarily the one describing the

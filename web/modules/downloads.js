@@ -23,7 +23,19 @@ const SOURCE_LABELS = {
 };
 
 const basename = (path) => (path || "").split(/[\\/]/).pop();
-const fileKey = (m) => `${m.category}|${basename(m.original_path).toLowerCase()}`;
+const categoryKey = (category) => (category || "unknown").toLowerCase();
+
+/**
+ * The identity a download is tracked and deduped by: canonical category plus
+ * filename. Two categories that are really the same folder (`clip` and
+ * `text_encoders`) must collapse to one key, or an alias sends a second
+ * download of the same file - and the server's own "already downloading"
+ * refusal would surface to the user as an error for doing nothing wrong.
+ */
+const fileKey = (m) => `${categoryKey(m.canonical_category || m.category)}|${basename(m.original_path).toLowerCase()}`;
+
+/** The same identity, computed from a /progress record instead of a missing model. */
+const recordKey = (r) => `${categoryKey(r.canonical_category || r.category)}|${basename(r.filename).toLowerCase()}`;
 
 export function formatBytes(n) {
     if (typeof n !== "number" || !isFinite(n) || n <= 0) return "";
@@ -50,15 +62,26 @@ export function downloadState(missing, record) {
     if (url && url.startsWith("https://")) return { kind: "available", url, source: missing.download_source };
     if (missing?.lookup_state === "pending") return { kind: "searching" };
     if (missing?.lookup_state === "not_found") return { kind: "not_found" };
-    return { kind: "idle" };
+    if (missing?.lookup_state === "idle") return { kind: "idle" };
+    // lookup_state is undefined: the lookups subsystem never ran for this card
+    // (e.g. `requests` is not installed, so routes_downloads never registered).
+    // A manual "Find a download" button would just 404 - show nothing instead.
+    return { kind: "none" };
 }
 
 export class DownloadController {
     constructor(dialog) {
         this.dialog = dialog;
         this.container = null;
+        // Rebuilt by afterRender() on every render that has missing models,
+        // and wiped by reset() on the branches that don't (zero missing, no
+        // workflow, an analysis error) - see reset()'s own comment.
         this.missing = new Map();   // refSlot -> missing model
-        this.byRef = new Map();     // refSlot -> download id
+        // Keyed by file identity (fileKey), not by card: a download belongs
+        // to a file, not to whichever card happened to start it, and several
+        // cards can reference the same file. Server state, so it survives
+        // both reset() and a fresh afterRender().
+        this.byFile = new Map();    // fileKey -> download id
         this.records = {};          // download id -> progress record
         this.progressTimer = null;
         this.lookupTimer = null;
@@ -79,9 +102,12 @@ export class DownloadController {
 
     blockHtml(missing) {
         const slot = refSlot(missing);
-        const record = this.records[this.byRef.get(slot)];
+        const record = this.records[this.byFile.get(fileKey(missing))];
         const state = downloadState(missing, record);
-        // dataset.mlSlot hands back the unescaped slot, which is the map key
+        // dataset.mlSlot hands back the unescaped slot, which is the map key.
+        // It identifies which card was clicked - not which file: cancel()
+        // and start() both resolve the file (and its shared download) from
+        // the card via fileKey().
         const button = (action, text) =>
             `<button data-ml-action="${action}" data-ml-slot="${escapeHtml(slot)}" class="model-linker-resolve-btn" style="padding:2px 8px;">${text}</button>`;
         switch (state.kind) {
@@ -125,6 +151,30 @@ export class DownloadController {
         if (element) element.innerHTML = this.blockHtml(missing);
     }
 
+    /** Re-render every currently-rendered card referencing the same file. */
+    refreshAllFor(key) {
+        for (const missing of this.missing.values()) {
+            if (fileKey(missing) === key) this.refresh(missing);
+        }
+    }
+
+    /**
+     * Drop everything derived from the last render. Called once, at the top
+     * of the dialog's loadWorkflowData() - before analysis even runs - so it
+     * covers every branch that does not end in afterRender(): zero missing
+     * models, no workflow loaded, and an analysis error. Without this, a
+     * card from a previous workflow stays in `missing` forever, and a new
+     * card that happens to land on the same node/widget slot would be
+     * confused for the old one by anything still keyed on refSlot.
+     *
+     * Download records in `byFile`/`records` are not reset - those describe
+     * downloads actually running on the server, which outlive any one
+     * analysis and must keep being polled/shown when their file reappears.
+     */
+    reset() {
+        this.missing = new Map();
+    }
+
     afterRender(container, data) {
         this.live = true;
         this.container = container;
@@ -166,6 +216,7 @@ export class DownloadController {
     }
 
     async start(missing) {
+        const key = fileKey(missing);
         const source = missing.download_source || {};
         const category = missing.category && missing.category !== "unknown" ? missing.category : source.directory;
         try {
@@ -176,27 +227,28 @@ export class DownloadController {
                 sha256: this.expectedSha256(missing),
                 size: typeof source.size === "number" ? Math.round(source.size) : null,
             });
-            // Every card referencing the same file follows this one download
-            for (const other of this.missing.values()) {
-                if (fileKey(other) === fileKey(missing)) this.track(other, data.download_id);
-            }
+            // Every card whose fileKey matches picks this up on its own the
+            // next time it renders (blockHtml looks the download up by file,
+            // not by card) - track() just makes that visible right away.
+            this.track(key, data.download_id);
             this.scheduleProgressPoll();
         } catch (error) {
             notifyError("Download did not start", error);
         }
     }
 
-    track(missing, downloadId, record = { status: "queued", progress: 0 }) {
-        this.byRef.set(refSlot(missing), downloadId);
+    track(key, downloadId, record = { status: "queued", progress: 0 }) {
+        this.byFile.set(key, downloadId);
         this.records[downloadId] = this.records[downloadId] || record;
-        this.refresh(missing);
+        this.refreshAllFor(key);
     }
 
     async cancel(missing) {
-        const id = this.byRef.get(refSlot(missing));
+        const id = this.byFile.get(fileKey(missing));
         if (!id) return;
         try {
-            await this.request(`/model_linker/cancel/${encodeURIComponent(id)}`, {});
+            const data = await this.request(`/model_linker/cancel/${encodeURIComponent(id)}`, {});
+            if (!data?.success) notifyError("Could not cancel the download", new Error("The server could not cancel it"));
         } catch (error) {
             notifyError("Could not cancel the download", error);
         }
@@ -218,14 +270,21 @@ export class DownloadController {
         if (!this.live) return;
         let active = false;
         const finished = [];
-        for (const [slot, id] of this.byRef) {
+        for (const [key, id] of [...this.byFile]) {
             const record = all[id];
-            if (!record) continue;
+            if (!record) {
+                // Gone from the server - e.g. a restart lost its progress
+                // state. Stop treating it as running rather than leaving the
+                // card frozen mid-progress and polling forever.
+                this.byFile.delete(key);
+                delete this.records[id];
+                this.refreshAllFor(key);
+                continue;
+            }
             const before = this.records[id];
             this.records[id] = record;
-            const missing = this.missing.get(slot);
-            if (missing) this.refresh(missing);
-            if (downloadState(missing, record).kind === "active") active = true;
+            this.refreshAllFor(key);
+            if (downloadState(null, record).kind === "active") active = true;
             if (isFinished(record) && !isFinished(before) && !finished.includes(record)) finished.push(record);
         }
         if (active) this.scheduleProgressPoll();
@@ -250,13 +309,10 @@ export class DownloadController {
         let any = false;
         for (const [id, record] of Object.entries(all)) {
             if (downloadState(null, record).kind !== "active") continue;
-            for (const missing of this.missing.values()) {
-                if (basename(missing.original_path).toLowerCase() === (record.filename || "").toLowerCase()) {
-                    this.records[id] = record;
-                    this.track(missing, id, record);
-                    any = true;
-                }
-            }
+            const key = recordKey(record);
+            if (this.byFile.get(key) === id) continue; // already tracked
+            this.track(key, id, record);
+            any = true;
         }
         if (any) this.scheduleProgressPoll();
     }
@@ -309,15 +365,20 @@ export class DownloadController {
     async downloadAll() {
         const seen = new Set();
         let started = 0;
+        let alreadyActive = false;
         for (const missing of this.missing.values()) {
-            const record = this.records[this.byRef.get(refSlot(missing))];
-            if (downloadState(missing, record).kind !== "available") continue;
-            if (seen.has(fileKey(missing))) continue;
-            seen.add(fileKey(missing));
+            const key = fileKey(missing);
+            const record = this.records[this.byFile.get(key)];
+            const kind = downloadState(missing, record).kind;
+            if (kind === "active") { alreadyActive = true; continue; }
+            if (kind !== "available" || seen.has(key)) continue;
+            seen.add(key);
             await this.start(missing);
             started++;
         }
-        if (!started) {
+        // Only "nothing to download" when there is genuinely nothing - not
+        // when everything found is already downloading from the last click.
+        if (!started && !alreadyActive) {
             app.extensionManager?.toast?.add({ severity: "info", summary: "Model Linker",
                 detail: "Nothing to download yet - lookups may still be running.", life: 4000 });
         }

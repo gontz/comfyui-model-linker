@@ -226,6 +226,10 @@ def start_download(url: str, category: str, filename: str,
             'downloaded': 0, 'speed': 0, 'filename': os.path.basename(dest), 'url': url,
             'error': None, 'start_time': None, 'category': category, 'path': dest,
             'identity': identity,
+            # So the frontend can match a progress record to a card by the
+            # same canonical file identity it uses to dedupe downloads -
+            # 'clip' and 'text_encoders' are the same folder to it.
+            'canonical_category': canonical_category(category),
         }
         _jobs[download_id] = {
             'url': url, 'category': category, 'dest': dest,

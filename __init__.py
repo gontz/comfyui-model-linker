@@ -69,7 +69,25 @@ class ModelLinkerExtension:
             except ImportError as e:
                 self.logger.error(f"Model Linker: Could not import core modules: {e}")
                 return False
-            
+
+            # Downloads and online lookups need `requests`; without it the
+            # extension still relinks models from disk. Any other failure in
+            # the download stack is a bug - logged in full, but it must never
+            # take relinking (/analyze, /resolve) down with it.
+            try:
+                import requests  # noqa: F401
+                from .core import lookups, routes_downloads
+                routes_downloads.register(routes, web)
+                lookups_available = True
+            except Exception as e:
+                lookups = None
+                lookups_available = False
+                if isinstance(e, ImportError):
+                    self.logger.warning(f"Model Linker: downloads and online lookups are disabled ({e})")
+                else:
+                    self.logger.error(f"Model Linker: downloads and online lookups failed to load: {e}",
+                                      exc_info=True)
+
             @routes.post("/model_linker/analyze")
             async def analyze_workflow(request):
                 """Analyze workflow and return missing models with matches."""
@@ -85,7 +103,12 @@ class ModelLinkerExtension:
                     
                     # Analyze and find matches
                     result = await asyncio.to_thread(analyze_and_find_matches, workflow_json)
-                    
+
+                    if lookups_available:
+                        # Only reads the store and queues work; never waits on the network
+                        result['lookups_pending'] = await asyncio.to_thread(
+                            lookups.attach_cached, result['missing_models'])
+
                     return web.json_response(result)
                 except Exception as e:
                     self.logger.error(f"Model Linker analyze error: {e}", exc_info=True)

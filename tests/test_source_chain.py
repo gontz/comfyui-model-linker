@@ -53,3 +53,26 @@ class ChainTests(unittest.TestCase):
             result = source_chain.find_download_source('private_renamed.safetensors', category='loras', sha256=SHA)
         self.assertEqual(result['url'], 'https://civitai.com/api/download/models/42')
         self.assertEqual(result['match_type'], 'hash')
+
+
+class InProcessCacheTests(unittest.TestCase):
+    """A background lookup must really ask again, not replay an in-memory miss."""
+
+    def test_lookup_ignores_misses_cached_by_the_sources(self):
+        from core import lookups
+        from core.sources import civarchive, civitai, huggingface
+
+        huggingface._search_cache['hf_x.safetensors_exactTrue'] = None
+        civitai._search_cache['civit_x.safetensors_exactTrue'] = None
+        civarchive._cache[SHA] = None
+        seen = {}
+
+        def chain(filename, **kwargs):
+            seen['huggingface'] = 'hf_x.safetensors_exactTrue' in huggingface._search_cache
+            seen['civitai'] = 'civit_x.safetensors_exactTrue' in civitai._search_cache
+            seen['civarchive'] = SHA in civarchive._cache
+            return None
+
+        with mock.patch.object(source_chain, 'find_download_source', chain):
+            lookups._find({'filename': 'x.safetensors', 'category': 'loras', 'workflow_url': '', 'sha256': SHA})
+        self.assertEqual(seen, {'huggingface': False, 'civitai': False, 'civarchive': False})

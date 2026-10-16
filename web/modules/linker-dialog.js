@@ -7,6 +7,7 @@ import { $el } from "./dom.js";
 import { ManageOverridesDialog } from "./overrides-dialog.js";
 import {
     escapeHtml,
+    isPerfectMatch,
     isSelectableModel,
     refKey,
     refSlot,
@@ -1162,8 +1163,8 @@ export class LinkerManagerDialog {
             const bFiltered = bMatches.filter(m => m.confidence >= 70);
 
             // Check if they have 100% matches
-            const aHas100 = aFiltered.some(m => m.confidence === 100);
-            const bHas100 = bFiltered.some(m => m.confidence === 100);
+            const aHas100 = aFiltered.some(isPerfectMatch);
+            const bHas100 = bFiltered.some(isPerfectMatch);
 
             // If one has 100% and the other doesn't, prioritize the one with 100%
             if (aHas100 && !bHas100) return -1;
@@ -1194,8 +1195,8 @@ export class LinkerManagerDialog {
             const filteredMatches = allMatches.filter(m => m.confidence >= 70);
 
             // Filter to only 100% matches if available, otherwise use filtered matches (>=70%)
-            const perfectMatches = filteredMatches.filter(m => m.confidence === 100);
-            const otherMatches = filteredMatches.filter(m => m.confidence < 100 && m.confidence >= 70);
+            const perfectMatches = filteredMatches.filter(isPerfectMatch);
+            const otherMatches = filteredMatches.filter(m => !isPerfectMatch(m));
 
             // Match the same logic as renderMissingModel
             const savedMatches = filteredMatches.filter(m => m.is_override);
@@ -1219,8 +1220,8 @@ export class LinkerManagerDialog {
 
             // Sort: 100% matches first, then by confidence descending (same as renderMissingModel)
             const sortedMatches = matchesToShow.sort((a, b) => {
-                if (a.confidence === 100 && b.confidence !== 100) return -1;
-                if (a.confidence !== 100 && b.confidence === 100) return 1;
+                if (isPerfectMatch(a) && !isPerfectMatch(b)) return -1;
+                if (!isPerfectMatch(a) && isPerfectMatch(b)) return 1;
                 return b.confidence - a.confidence;
             });
 
@@ -1334,8 +1335,8 @@ export class LinkerManagerDialog {
             const filteredMatches = allMatches.filter(m => m.confidence >= 70);
 
             // Separate 100% matches from others (from filtered list)
-            const perfectMatches = filteredMatches.filter(m => m.confidence === 100);
-            const otherMatches = filteredMatches.filter(m => m.confidence < 100 && m.confidence >= 70);
+            const perfectMatches = filteredMatches.filter(isPerfectMatch);
+            const otherMatches = filteredMatches.filter(m => !isPerfectMatch(m));
 
             // If we have 100% matches, show them AND always include saved matches as well.
             const savedMatches = filteredMatches.filter(m => m.is_override);
@@ -1360,8 +1361,8 @@ export class LinkerManagerDialog {
 
             // Sort: 100% matches first, then by confidence descending
             const sortedMatches = matchesToShow.sort((a, b) => {
-                if (a.confidence === 100 && b.confidence !== 100) return -1;
-                if (a.confidence !== 100 && b.confidence === 100) return 1;
+                if (isPerfectMatch(a) && !isPerfectMatch(b)) return -1;
+                if (!isPerfectMatch(a) && isPerfectMatch(b)) return 1;
                 return b.confidence - a.confidence;
             });
 
@@ -1376,7 +1377,13 @@ export class LinkerManagerDialog {
                 const isSaved = !!match.is_override;
                 // Name only - the containing folder is printed just below
                 html += `<code title="${match.model?.relative_path || label}">${label}</code> `;
-                html += `<span style="color: ${match.confidence === 100 ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
+                html += `<span style="color: ${isPerfectMatch(match) ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
+                if (match.category_mismatch) {
+                    const foundIn = escapeHtml(match.model?.category || 'another folder');
+                    const expected = escapeHtml(missing.category || 'its own folder');
+                    html += ` <span style="color:#e0a030; font-weight:600;" `
+                        + `title="Found in '${foundIn}', but this node loads from '${expected}'. Move the file there, or link it knowing the node may fail to load it.">⚠ wrong folder</span>`;
+                }
                 if (isSaved) {
                     html += ` <span style="color:#0aa96e; font-weight:600;">(saved)</span>`;
                 }
@@ -1706,7 +1713,7 @@ export class LinkerManagerDialog {
             const resolutions = [];
             for (const missing of missingModels) {
                 const matches = missing.matches || [];
-                const perfectMatch = matches.find((m) => m.confidence === 100);
+                const perfectMatch = matches.find(isPerfectMatch);
 
                 if (perfectMatch && perfectMatch.model) {
                     resolutions.push({

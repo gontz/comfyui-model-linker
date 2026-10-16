@@ -98,3 +98,12 @@ export function notifyError(summary, error) {
     }
     console.error(`Model Linker: ${summary}`, error);
 }
+
+/**
+ * A match that can be linked without a second look: exact by name and from a
+ * folder the node actually loads from. A 100% match in another category would
+ * leave the workflow failing at prompt time, so it is never auto-linked.
+ */
+export function isPerfectMatch(match) {
+    return match?.confidence === 100 && !match?.category_mismatch;
+}

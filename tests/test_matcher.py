@@ -186,5 +186,29 @@ class WordOrderTests(unittest.TestCase):
             STRONG_MATCH_CONFIDENCE)
 
 
+class CategoryMismatchTests(unittest.TestCase):
+    def test_match_from_another_folder_is_flagged(self):
+        pool = candidates('flux1_dev.safetensors', category='vae')
+        match = find_matches('flux1_dev.safetensors', pool, preferred_category='checkpoints')[0]
+        self.assertTrue(match['category_mismatch'])
+
+    def test_aliased_folder_is_not_flagged(self):
+        # models/clip and models/text_encoders are one folder on most installs
+        pool = candidates('t5xxl_fp16.safetensors', category='clip')
+        match = find_matches('t5xxl_fp16.safetensors', pool, preferred_category='text_encoders')[0]
+        self.assertFalse(match['category_mismatch'])
+
+    def test_unknown_expected_category_flags_nothing(self):
+        pool = candidates('a.safetensors', category='vae')
+        for expected in (None, 'unknown', ''):
+            match = find_matches('a.safetensors', pool, preferred_category=expected)[0]
+            self.assertFalse(match['category_mismatch'], expected)
+
+    def test_candidate_without_category_is_not_flagged(self):
+        pool = [{'filename': 'a.safetensors', 'path': '/m/a.safetensors'}]
+        match = find_matches('a.safetensors', pool, preferred_category='checkpoints')[0]
+        self.assertFalse(match['category_mismatch'])
+
+
 if __name__ == '__main__':
     unittest.main()

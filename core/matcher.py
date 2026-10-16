@@ -20,7 +20,7 @@ from functools import lru_cache
 from typing import List, Dict, Optional, Tuple
 from difflib import SequenceMatcher
 
-from .categories import categories_match
+from .categories import canonical_category, categories_match
 
 try:
     from rapidfuzz import fuzz as _rapidfuzz
@@ -333,6 +333,9 @@ def find_matches(
     heap: List[Tuple[Tuple[bool, float], int, Dict]] = []
     counter = 0
 
+    # Only a known expected category can make a match "wrong folder"
+    expected_known = canonical_category(preferred_category) is not None
+
     for candidate in candidate_models:
         # Get filename from candidate (prefer 'filename' key, fallback to extracting from 'path' or 'relative_path')
         candidate_filename = candidate.get('filename')
@@ -365,6 +368,7 @@ def find_matches(
         if similarity < threshold:
             continue
 
+        same_category = categories_match(preferred_category, candidate.get('category'))
         match = {
             'model': candidate,
             'filename': candidate_filename,
@@ -372,7 +376,10 @@ def find_matches(
             'confidence': confidence,
             # Compared canonically, so a node expecting `text_encoders` still
             # counts a model catalogued under `clip` as its own category.
-            'same_category': categories_match(preferred_category, candidate.get('category')),
+            'same_category': same_category,
+            # The node resolves paths against its own category's folders only,
+            # so linking this would still fail at prompt time.
+            'category_mismatch': expected_known and bool(candidate.get('category')) and not same_category,
         }
         # Plausible matches from the expected category outrank the rest; see the
         # preferred_category note above.

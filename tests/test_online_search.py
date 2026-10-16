@@ -169,3 +169,20 @@ class HuggingFaceQueryFailureTests(unittest.TestCase):
              mock.patch.object(online_search, 'build_search_queries', return_value=[]):
             found = online_search._huggingface_candidates('x.safetensors')
         self.assertEqual(found, [])
+
+    def test_every_query_failing_raises_rather_than_returning_silently_empty(self):
+        """
+        Per-query try/except (above) must not swallow a *total* outage: if
+        every query for this filename failed, online_search's own call site
+        has to see that as a real error - not as "HuggingFace found nothing".
+        """
+        with mock.patch.object(requests, 'get', side_effect=requests.ConnectionError('down')):
+            with self.assertRaises(requests.ConnectionError):
+                online_search._huggingface_candidates('foo_fp8.safetensors')
+
+    def test_a_total_outage_is_reported_by_search_candidates(self):
+        with mock.patch.object(requests, 'get', side_effect=requests.ConnectionError('down')), \
+             mock.patch.object(online_search, '_index_candidates', return_value=[]), \
+             mock.patch.object(online_search, '_model_list_candidates', return_value=[]):
+            result = online_search.search_candidates('foo_fp8.safetensors', 'checkpoints')
+        self.assertTrue(any('HuggingFace' in e for e in result['errors']), result['errors'])

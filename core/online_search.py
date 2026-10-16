@@ -53,20 +53,34 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
 def _huggingface_candidates(filename: str) -> List[Dict[str, Any]]:
     queries = build_search_queries(filename)
     repos: List[str] = []
+    last_error = None
+    any_succeeded = False
     for query in queries:
         try:
             models = _get(f'{HF_API_URL}/models', {'search': query, 'limit': MAX_REPOS}) or []
         except Exception as e:
             # One query failing (a timeout, a transient 5xx) must not drop
-            # whatever an earlier query in this same call already found.
+            # whatever a different, successful query in this same call
+            # already found - but if every query fails, that is a total
+            # outage, not a one-off blip, and the caller's own per-source
+            # try/except (in search_candidates) needs to see it as an error
+            # rather than this function returning a silently empty list, as
+            # if HuggingFace had simply found nothing. any_succeeded tracks
+            # the request itself, not whether it turned up a repo - a query
+            # that legitimately found nothing must not be mistaken for one
+            # that never ran.
             logger.debug(f"Model Linker: HuggingFace search for {query!r} failed: {e}")
+            last_error = e
             continue
+        any_succeeded = True
         for model in models:
             repo = model.get('id') or model.get('modelId')
             if repo and repo not in repos:
                 repos.append(repo)
         if len(repos) >= MAX_REPOS:
             break
+    if queries and not any_succeeded and last_error is not None:
+        raise last_error
     found = []
     for repo in repos[:MAX_REPOS]:
         try:

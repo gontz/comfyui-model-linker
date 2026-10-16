@@ -536,6 +536,98 @@ export default async function run() {
     c.stop();
   }
 
+  // 16. (Fix round 2, item 1) checkpoints/diffusers/diffusion_models can be
+  // junctions to one physical folder that categories.py does not alias -
+  // the collision check must compare by basename alone, never scoped to a
+  // category, or a candidate matching another card's name under a
+  // differently-named but physically shared folder slips through and lands
+  // in that shared folder wearing that card's exact name.
+  {
+    const posted = [];
+    api.fetchApi = async (path, opts = {}) => {
+      if (path === '/model_linker/download') { posted.push(opts.body); return reply({ download_id: 'x' }); }
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const cardA = mk(1, 'flux1-dev-fp8.safetensors', 'checkpoints', { lookup_state: 'not_found', download_source: null });
+    const cardB = mk(2, 'flux1-dev.safetensors', 'diffusion_models', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(cont, { missing_models: [cardA, cardB] });
+    cardA.similar = { candidates: [
+      { source: 'huggingface', filename: 'flux1-dev.safetensors', url: 'https://huggingface.co/a/b/resolve/main/flux1-dev.safetensors', confidence: 85, different_model: false },
+    ] };
+    await c.startSimilar(cardA, 0);
+    check('a candidate matching another card\'s name under an unaliased category starts no download',
+          posted.length === 0, JSON.stringify(posted));
+    const htmlA = c.blockHtml(cardA);
+    check('and that row is blocked too, across the category boundary',
+          /exact name/.test(htmlA) && !/data-ml-action="download-similar"/.test(htmlA), htmlA);
+    c.stop();
+  }
+
+  // 17. (Fix round 2, item 3) On reopen, a tracked download the server no
+  // longer reports at all - it finished and was swept server-side, or the
+  // server itself restarted and lost its progress state, while this page
+  // was closed - must be pruned from byFile/records, not left showing stale
+  // progress and a dead Cancel button forever.
+  {
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(cont, { missing_models: [m] });
+    // Let this first afterRender's own reconnect() (using whatever mock the
+    // previous block left behind) fully settle before anything else - a
+    // stale, still-in-flight reconnect() can otherwise survive the
+    // stop()/reopen below (it only checks `this.live`, which flips back to
+    // true the instant the second afterRender runs) and race the real one.
+    await sleep(20);
+    c.track('loras|missing.safetensors', 'gone', { status: 'downloading', progress: 40 });
+    check('sanity check: the card really was showing progress before the reopen',
+          /progress|Cancel/.test(c.blockHtml(m)), c.blockHtml(m));
+    c.stop();  // dialog closed
+
+    // Reopened: the server no longer knows about "gone" at all.
+    api.fetchApi = async (path) => reply(path === '/model_linker/progress' ? {} : {});
+    const freshMissing = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(fakeContainer(), { missing_models: [freshMissing] });
+    await sleep(30);
+    check('a download the server no longer reports is pruned from byFile',
+          c.byFile.size === 0, `byFile=${[...c.byFile.keys()]}`);
+    const html = c.blockHtml(freshMissing);
+    check('the card shows no stale progress or Cancel for a pruned download',
+          !/progress|Cancel/.test(html), html);
+    c.stop();
+  }
+
+  // 18. (Fix round 2, item 3, sibling) A tracked download the server still
+  // reports, but now as errored or cancelled rather than active, must have
+  // its record refreshed from that - not left showing the stale active
+  // progress/Cancel it had when this page closed.
+  {
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(cont, { missing_models: [m] });
+    await sleep(20);  // let this afterRender's own reconnect() settle first - see test 17
+    c.track('loras|missing.safetensors', 'went-bad', { status: 'downloading', progress: 40 });
+    check('sanity check: the card really was showing progress before the reopen',
+          /progress|Cancel/.test(c.blockHtml(m)), c.blockHtml(m));
+    c.stop();  // dialog closed
+
+    // Reopened: the server now reports it as errored, not active.
+    const progress = { 'went-bad': { status: 'error', error: 'The connection closed before the file was complete' } };
+    api.fetchApi = async (path) => reply(path === '/model_linker/progress' ? progress : {});
+    const freshMissing = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(fakeContainer(), { missing_models: [freshMissing] });
+    await sleep(30);
+    const html = c.blockHtml(freshMissing);
+    check('the stale record is refreshed to its real (errored) status',
+          /connection closed/.test(html) && !/progress|Cancel/.test(html), html);
+    check('the stale id stays tracked (refreshed, not pruned) since the server still reports it',
+          c.byFile.get('loras|missing.safetensors') === 'went-bad');
+    c.stop();
+  }
+
   const similar = src.slice(src.indexOf('similarHtml(missing) {'), src.indexOf('async downloadAll'));
   check('similar results are escaped', /escapeHtml\(candidate\.filename\)/.test(similar));
   check('different models are labelled', /different model/.test(similar));

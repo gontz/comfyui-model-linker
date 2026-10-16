@@ -363,15 +363,28 @@ export class DownloadController {
             this.track(key, id, record);
             any = true;
         }
-        // A download this page itself already started (a candidateKey from
-        // a similar-model search is in byFile, but its card's .similar list
-        // did not survive the re-analysis that follows a reopen) must still
-        // get its polling re-armed while it runs, so a toast and the
-        // eventual re-analysis still fire when it finishes - even though no
-        // on-screen card can show its progress any more. This never adopts
-        // anything new; it only continues watching ids this page put there.
-        for (const id of this.byFile.values()) {
-            if (downloadState(null, all[id]).kind === "active") any = true;
+        // A download this page itself already started (its id is already in
+        // byFile) may have finished, errored, been cancelled, or vanished
+        // (e.g. a server restart lost its progress state) while this page
+        // was closed - or it may simply still be running, including a
+        // similar-model download whose card's .similar list did not survive
+        // the re-analysis that follows a reopen. Either way its record is
+        // refreshed from the server here, or pruned if the server no longer
+        // reports it at all, and the cards referencing it are re-rendered -
+        // a stale "Queued"/progress/Cancel for a download that is long gone
+        // is worse than falling back to whatever state the card is really
+        // in. This never adopts anything new; it only reconciles ids this
+        // page put there itself.
+        for (const [key, id] of [...this.byFile]) {
+            const record = all[id];
+            if (record) {
+                this.records[id] = record;
+                if (downloadState(null, record).kind === "active") any = true;
+            } else {
+                this.byFile.delete(key);
+                delete this.records[id];
+            }
+            this.refreshAllFor(key);
         }
         if (any) this.scheduleProgressPoll();
     }
@@ -423,16 +436,22 @@ export class DownloadController {
 
     /**
      * True when a candidate's own filename collides with an on-screen card's
-     * own exact-file name - this card's or another one's. Downloading it
-     * would save the candidate's bytes under a name the workflow itself
-     * claims (and candidateKey() would then equal that card's fileKey(), so
-     * its progress would drive that card's own Queued/Downloaded block
-     * instead of a row of its own) - exactly what "saved under its own
-     * name" exists to prevent. Never offered for download, by any card.
+     * own exact-file name - this card's or another one's, in any category.
+     *
+     * Compared by basename alone, never scoped to a category: categories
+     * that are really one physical folder (checkpoints/diffusers/
+     * diffusion_models can all be junctions to the same directory) are not
+     * all aliased in categories.py, so a candidateKey()-vs-fileKey()
+     * comparison - which is category-scoped - missed a candidate that
+     * matches another card's name under a differently-named but physically
+     * shared folder. Downloading such a candidate would still land in that
+     * one shared folder wearing that card's exact name - exactly what
+     * "saved under its own name" exists to prevent, regardless of which
+     * category either card claims. Never offered for download, by any card.
      */
-    collidesWithWorkflowName(missing, filename) {
-        const key = candidateKey(missing, filename);
-        return [...this.missing.values()].some((m) => fileKey(m) === key);
+    collidesWithWorkflowName(filename) {
+        const name = (filename || "").toLowerCase();
+        return [...this.missing.values()].some((m) => basename(m.original_path).toLowerCase() === name);
     }
 
     /**
@@ -472,7 +491,7 @@ export class DownloadController {
                 + (httpsPage ? `<a href="${escapeHtml(httpsPage)}" target="_blank" rel="noopener noreferrer">↗</a>` : "")
                 + hint;
             let action;
-            if (this.collidesWithWorkflowName(missing, candidate.filename)) {
+            if (this.collidesWithWorkflowName(candidate.filename)) {
                 action = `<span style="opacity:.6; font-size:12px;">exact name - use "Find a download" on that card</span>`;
             } else if (dlState.kind === "active") {
                 action = `<progress max="100" value="${Number(record.progress) || 0}" style="width:80px;"></progress>`
@@ -524,7 +543,7 @@ export class DownloadController {
             notifyError("Download did not start", new Error("The node's model folder is unknown"));
             return;
         }
-        if (this.collidesWithWorkflowName(missing, candidate.filename)) {
+        if (this.collidesWithWorkflowName(candidate.filename)) {
             notifyError("Download did not start", new Error(
                 'This workflow already uses that file name - use "Find a download" on that card instead'));
             return;

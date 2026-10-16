@@ -1266,6 +1266,13 @@ export class LinkerManagerDialog {
      * Render a single missing model entry
      */
     renderMissingModel(missing) {
+        // Everything below except our own markup comes from the workflow file
+        const subgraphName = escapeHtml(missing.subgraph_name);
+        const nodeType = escapeHtml(missing.node_type);
+        const originalPath = escapeHtml(missing.original_path);
+        const categoryText = escapeHtml(missing.category || 'unknown');
+        const nodeId = escapeHtml(missing.node_id);
+
         const allMatches = missing.matches || [];
 
         // Filter out matches below 70% confidence threshold
@@ -1282,7 +1289,7 @@ export class LinkerManagerDialog {
         if (missing.subgraph_name) {
             // Show subgraph name as primary identifier
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
-            html += `<span><strong>Subgraph:</strong> ${missing.subgraph_name} (ID: ${missing.node_id})</span>`;
+            html += `<span><strong>Subgraph:</strong> ${subgraphName} (ID: ${nodeId})</span>`;
             if (missing.is_top_level === false) {
                 html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
             } else {
@@ -1292,7 +1299,7 @@ export class LinkerManagerDialog {
         } else if (isSubgraphNode) {
             // Node type is a UUID (subgraph) but we don't have the name (shouldn't happen, but handle gracefully)
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
-            html += `<span><strong>Node:</strong> <em>Subgraph</em> (ID: ${missing.node_id})</span>`;
+            html += `<span><strong>Node:</strong> <em>Subgraph</em> (ID: ${nodeId})</span>`;
             if (missing.is_top_level === false) {
                 html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
             } else {
@@ -1302,7 +1309,7 @@ export class LinkerManagerDialog {
         } else {
             // Regular node
             html += `<div style="margin-bottom: 8px; display:flex; align-items:center; justify-content:space-between; gap:8px;">`;
-            html += `<span><strong>Node:</strong> ${missing.node_type} (ID: ${missing.node_id})</span>`;
+            html += `<span><strong>Node:</strong> ${nodeType} (ID: ${nodeId})</span>`;
             if (missing.is_top_level === false) {
                 html += `<button title="This node is inside a subgraph definition and can't be located in the main canvas" disabled class="model-linker-resolve-btn" style="opacity:.6; padding:2px 8px;">Located in subgraph</button>`;
             } else {
@@ -1310,8 +1317,8 @@ export class LinkerManagerDialog {
             }
             html += `</div>`;
         }
-        html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${missing.original_path}</code></div>`;
-        html += `<div style="margin-bottom: 8px;"><strong>Category:</strong> ${missing.category || 'unknown'}</div>`;
+        html += `<div style="margin-bottom: 8px;"><strong>Missing Model:</strong> <code>${originalPath}</code></div>`;
+        html += `<div style="margin-bottom: 8px;"><strong>Category:</strong> ${categoryText}</div>`;
 
         // Where the workflow says this model came from. Worth showing whatever
         // the matches look like: when nothing on disk resembles the model, the
@@ -1376,7 +1383,7 @@ export class LinkerManagerDialog {
                 const label = match.filename || match.model?.relative_path || '';
                 const isSaved = !!match.is_override;
                 // Name only - the containing folder is printed just below
-                html += `<code title="${match.model?.relative_path || label}">${label}</code> `;
+                html += `<code title="${escapeHtml(match.model?.relative_path || label)}">${escapeHtml(label)}</code> `;
                 html += `<span style="color: ${isPerfectMatch(match) ? 'green' : 'orange'};">\n                    (${match.confidence}% confidence)\n                </span>`;
                 if (match.category_mismatch) {
                     const foundIn = escapeHtml(match.model?.category || 'another folder');
@@ -1395,7 +1402,7 @@ export class LinkerManagerDialog {
                 // Show folder location (UI-only, not sent to nodes)
                 const folderPath = this._getModelFolder(match.model);
                 if (folderPath) {
-                    html += `<div style="font-size:11px; color:#888; opacity:0.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${folderPath}">📁 ${folderPath}</div>`;
+                    html += `<div style="font-size:11px; color:#888; opacity:0.8; margin-top:1px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(folderPath)}">📁 ${escapeHtml(folderPath)}</div>`;
                 }
                 html += `</li>`;
             }

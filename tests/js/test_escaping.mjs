@@ -1,7 +1,7 @@
 // Values interpolated into the dialog's HTML come from workflow files, which
 // are untrusted: a workflow can be downloaded from anywhere and its model
 // names and URLs are attacker-controlled text.
-import { createChecker, loadModule } from './harness.mjs';
+import { createChecker, loadModule, readSource } from './harness.mjs';
 
 export const name = 'escaping untrusted workflow values';
 
@@ -32,6 +32,38 @@ export default async function run() {
         && safeHttpUrl(null) === null);
   check('a non-string that stringifies to a URL is refused',
         safeHttpUrl({ toString: () => 'https://evil.example' }) === null);
+
+  // The missing-model card prints names taken from the workflow file
+  {
+    const src = readSource('modules/linker-dialog.js');
+    const start = src.indexOf('renderMissingModel(missing) {');
+    const end = src.indexOf('showNotification(message', start);
+    const body = src.slice(start, end);
+    const raw = [
+      /\$\{missing\.subgraph_name\}/,
+      /\$\{missing\.node_type\}/,
+      /\$\{missing\.node_id\}/,
+      /\$\{missing\.original_path\}/,
+      /\$\{missing\.category \|\| 'unknown'\}/,
+      /title="\$\{match\.model\?\.relative_path/,
+      />\$\{label\}</,
+      /\$\{folderPath\}/,
+    ];
+    check('renderMissingModel was located', start !== -1 && end > start);
+    for (const pattern of raw) {
+      check(`renderMissingModel escapes ${pattern}`, !pattern.test(body));
+    }
+  }
+
+  // Element ids are built from workflow-supplied node and subgraph ids
+  {
+    const { refSlot } = await loadModule('modules/util.js');
+    const slot = refSlot({ node_id: '1" onmouseover="x', widget_index: 0,
+                           subgraph_id: '#a b:c<d>' });
+    check('refSlot output is attribute- and selector-safe', /^[A-Za-z0-9_-]+$/.test(slot));
+    check('refSlot keeps plain ids readable',
+          refSlot({ node_id: 12, widget_index: 0 }) === '12-0-n-top');
+  }
 
   return check.failures;
 }

@@ -39,7 +39,9 @@ export function isSelectableModel(model) {
  */
 export function refSlot(ref) {
     const list = (ref.list_index === undefined || ref.list_index === null) ? 'n' : ref.list_index;
-    return `${ref.node_id}-${ref.widget_index}-${list}-${ref.subgraph_id || 'top'}`;
+    // Used in id="…" attributes and #… selectors, from workflow-supplied ids
+    return `${ref.node_id}-${ref.widget_index}-${list}-${ref.subgraph_id || 'top'}`
+        .replace(/[^A-Za-z0-9_-]/g, '_');
 }
 
 /** Stable key for a reference, used to deduplicate queued selections. */

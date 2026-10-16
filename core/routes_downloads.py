@@ -57,7 +57,11 @@ def register(routes, web) -> None:
         if not all(isinstance(v, str) and v for v in (url, category, filename)):
             return _bad(web, 'url, category and filename are required')
         sha256 = data.get('sha256') if isinstance(data.get('sha256'), str) else None
-        size = data.get('size') if isinstance(data.get('size'), int) and data.get('size') > 0 else None
+        raw_size = data.get('size')
+        # bool is an int subclass - isinstance(True, int) is True - so it is
+        # excluded explicitly rather than let `true` become a 1-byte request
+        size = raw_size if (isinstance(raw_size, int) and not isinstance(raw_size, bool)
+                            and raw_size > 0) else None
         try:
             download_id = await asyncio.to_thread(downloader.start_download, url, category, filename, sha256, size)
         except downloader.DownloadError as e:

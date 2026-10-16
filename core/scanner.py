@@ -20,6 +20,12 @@ except ImportError:
 # This matches folder_paths.supported_pt_extensions
 MODEL_EXTENSIONS = {'.ckpt', '.pt', '.pt2', '.bin', '.pth', '.safetensors', '.pkl', '.sft', '.onnx', '.gguf'}
 
+# Categories folder_paths may register that are not model folders. The
+# scanner never catalogues their contents as models, and the downloader
+# (core/downloader.py) refuses to write into them - kept as one constant so
+# the two can't drift apart.
+NON_MODEL_CATEGORIES = {'custom_nodes', 'configs', 'datasets'}
+
 
 def get_model_directories() -> Dict[str, Tuple[List[str], set]]:
     """
@@ -192,7 +198,7 @@ def scan_all_directories(visited_dirs: Optional[List[str]] = None) -> List[Dict[
 
     for category, value in directories.items():
         # Skip categories that aren't typically model directories
-        if category in ['custom_nodes', 'configs']:
+        if category in NON_MODEL_CATEGORIES:
             continue
 
         # Unpack folder_paths value flexibly: (paths, extensions) or (paths, extensions, recursive)

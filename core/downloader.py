@@ -16,7 +16,9 @@ import importlib
 import logging
 import os
 import queue
+import re
 import shutil
+import sys
 import threading
 import time
 import uuid
@@ -26,7 +28,7 @@ from urllib.parse import urlparse
 from . import settings
 from .categories import canonical_category
 from .reveal import _is_within
-from .scanner import MODEL_EXTENSIONS
+from .scanner import MODEL_EXTENSIONS, NON_MODEL_CATEGORIES
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,13 @@ MAX_WORKERS = 2
 # Left free beyond the file itself, so a download never fills the disk
 DISK_HEADROOM = 512 * 1024 * 1024
 ACTIVE_STATES = ('queued', 'starting', 'downloading', 'verifying')
+
+# NUL and the Windows-reserved characters. Checked on the raw name the caller
+# sent, before it is reduced to a basename, same reasoning as the ':' check
+# below: a character that would be stripped or reinterpreted by a later step
+# must be refused before that step ever runs.
+_FORBIDDEN_FILENAME_CHARS = re.compile(r'[\x00-\x1f<>"|?*]')
+_SHA256_RE = re.compile(r'^[0-9a-f]{64}$')
 
 download_progress: Dict[str, Dict[str, Any]] = {}
 download_lock = threading.Lock()
@@ -72,6 +81,30 @@ def generate_download_id() -> str:
     return uuid.uuid4().hex[:8]
 
 
+def _identity(path: str) -> str:
+    """
+    Physical identity of a destination, independent of case and of which
+    category alias (symlink/junction) reached it.
+
+    `os.path.realpath` resolves the existing parent directories even when the
+    leaf file itself does not exist yet - which is the normal case here, a
+    download in progress - and `os.path.normcase` folds case on
+    case-insensitive filesystems. Comparing on this, not on the literal
+    destination string, is what catches two downloads landing on the same
+    physical file through `checkpoints/X` and `unet/X`, or `Model.safetensors`
+    and `model.safetensors`.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _is_non_model_category(category: Optional[str]) -> bool:
+    name = (category or '').strip().lower()
+    if name in NON_MODEL_CATEGORIES:
+        return True
+    canonical = canonical_category(category)
+    return bool(canonical and canonical in NON_MODEL_CATEGORIES)
+
+
 def category_directory(category: str) -> Optional[str]:
     """First directory registered for a category, trying its canonical name too."""
     import folder_paths
@@ -91,15 +124,19 @@ def category_directory(category: str) -> Optional[str]:
 
 def resolve_destination(category: str, filename: str) -> str:
     """Where a download may be written, or DownloadError."""
+    raw = filename or ''
     # Checked on the name as given: on Windows basename('C:evil.x') is 'evil.x',
-    # so a colon would be gone before a check on the basename could see it
-    if ':' in (filename or ''):
+    # so a colon would be gone before a check on the basename could see it.
+    # Same reasoning for NUL/control characters and the Windows-reserved set.
+    if ':' in raw or _FORBIDDEN_FILENAME_CHARS.search(raw):
         raise DownloadError(f'Invalid filename: {filename!r}')
-    name = (filename or '').replace('\\', '/').rsplit('/', 1)[-1]
+    name = raw.replace('\\', '/').rsplit('/', 1)[-1]
     if not name or name.startswith('.'):
         raise DownloadError(f'Invalid filename: {filename!r}')
     if os.path.splitext(name)[1].lower() not in MODEL_EXTENSIONS:
         raise DownloadError(f'Not a model file: {name}')
+    if _is_non_model_category(category):
+        raise DownloadError(f'"{category}" is not a model folder')
     base = category_directory(category)
     if not base:
         raise DownloadError(f'No model folder is registered for "{category}"')
@@ -146,27 +183,44 @@ def add_completion_hook(hook: Callable[[Dict[str, Any]], Optional[str]]) -> None
 def start_download(url: str, category: str, filename: str,
                    expected_sha256: Optional[str] = None,
                    expected_size: Optional[int] = None) -> str:
-    parsed = urlparse(url or '')
-    if parsed.scheme != 'https' or not parsed.hostname:
+    try:
+        parsed = urlparse(url or '')
+        scheme_ok = parsed.scheme == 'https' and bool(parsed.hostname)
+    except ValueError:
+        # A malformed authority (e.g. an unbalanced IPv6 literal) can make
+        # urlparse, or the lazy `.hostname` property, raise rather than just
+        # answering "not https" - either way it is not an https link.
+        scheme_ok = False
+    if not scheme_ok:
         raise DownloadError('Only https:// download links are accepted')
+
+    sha256_norm = (expected_sha256 or '').strip().lower() or None
+    if sha256_norm and not _SHA256_RE.match(sha256_norm):
+        raise DownloadError('expected_sha256 must be 64 hex characters')
+    if isinstance(expected_size, bool):
+        raise DownloadError('size must be a number of bytes, not a boolean')
+    size_norm = int(expected_size) if expected_size else None
+
     dest = resolve_destination(category, filename)
     if os.path.exists(dest):
         raise DownloadError(f'{os.path.basename(dest)} already exists in {os.path.dirname(dest)}')
+    identity = _identity(dest)
 
     with download_lock:
         for record in download_progress.values():
-            if record.get('path') == dest and record.get('status') in ACTIVE_STATES:
+            if record.get('identity') == identity and record.get('status') in ACTIVE_STATES:
                 raise DownloadError(f'{os.path.basename(dest)} is already downloading')
         download_id = generate_download_id()
         download_progress[download_id] = {
-            'status': 'queued', 'progress': 0, 'total_size': int(expected_size or 0),
+            'status': 'queued', 'progress': 0, 'total_size': size_norm or 0,
             'downloaded': 0, 'speed': 0, 'filename': os.path.basename(dest), 'url': url,
             'error': None, 'start_time': None, 'category': category, 'path': dest,
+            'identity': identity,
         }
         _jobs[download_id] = {
             'url': url, 'category': category, 'dest': dest,
-            'expected_sha256': (expected_sha256 or '').lower() or None,
-            'expected_size': int(expected_size or 0) or None,
+            'expected_sha256': sha256_norm,
+            'expected_size': size_norm,
         }
     _ensure_workers()
     _queue.put(download_id)
@@ -193,22 +247,54 @@ def _worker_loop() -> None:
             _set(download_id, status='error', error='Unexpected error - see the ComfyUI log', speed=0)
 
 
-def _remove(path: str) -> None:
+def _remove(path: str) -> bool:
+    """Best-effort delete. Returns whether `path` is gone when it returns."""
     # Windows can hold a just-closed file for a moment
     for _ in range(10):
         try:
             os.remove(path)
-            return
+            return True
         except FileNotFoundError:
-            return
+            return True
         except OSError:
             time.sleep(0.2)
+    return not os.path.exists(path)
+
+
+def _deleted_or_not(removed: bool, what: str) -> str:
+    if removed:
+        return f'{what} and was deleted'
+    return f'{what} but could not be removed - delete it by hand'
+
+
+def _rename_no_clobber(src: str, dst: str) -> None:
+    """
+    Rename `src` to `dst`, refusing to clobber a file that appeared at `dst`
+    in the gap between the last existence check and now.
+
+    `os.replace` overwrites unconditionally on every platform, which is
+    exactly what must never happen here, so it is never used for this last
+    step. `os.rename` raises `FileExistsError` on Windows when the
+    destination exists; POSIX `rename` would silently replace it instead, so
+    POSIX takes a hardlink-then-unlink, which raises the same error from
+    `os.link` when the destination exists and never touches it otherwise.
+    """
+    try:
+        if sys.platform == 'win32':
+            os.rename(src, dst)
+        else:
+            os.link(src, dst)
+            os.unlink(src)
+    except FileExistsError:
+        raise DownloadError(f'{os.path.basename(dst)} appeared during the download; not overwritten')
 
 
 def _check_disk(directory: str, size: Optional[int]) -> None:
+    # The category directory must exist before anything is written into it,
+    # whether or not a size is known to check against.
+    os.makedirs(directory, exist_ok=True)
     if not size:
         return
-    os.makedirs(directory, exist_ok=True)
     free = shutil.disk_usage(directory).free
     if free < size + DISK_HEADROOM:
         raise DownloadError(f'Not enough disk space: {format_bytes(size)} needed, '
@@ -250,6 +336,11 @@ def _stream(download_id: str, job: Dict[str, Any]) -> str:
     try:
         # requests drops Authorization when a redirect leaves the host
         with requests.get(url, headers=headers, stream=True, timeout=30, allow_redirects=True) as response:
+            # A redirect can leave https entirely (http, or something else);
+            # refused before a single byte is written.
+            final_url = getattr(response, 'url', None) or url
+            if urlparse(final_url).scheme != 'https':
+                raise DownloadError('The download redirected away from https')
             if response.status_code in (401, 403):
                 raise DownloadError(_auth_message(provider, bool(headers), response.status_code),
                                     auth_required=provider)
@@ -281,11 +372,14 @@ def _stream(download_id: str, job: Dict[str, Any]) -> str:
             _set(download_id, downloaded=done)
         if total and done != total:
             raise DownloadError('The connection closed before the file was complete')
-        if os.path.exists(dest):
-            # Someone else put a file there meanwhile; never overwrite it
-            raise DownloadError(f'{os.path.basename(dest)} appeared during the download; not overwritten')
-        os.replace(part, dest)
-        return digest.hexdigest()
+
+        sha256 = digest.hexdigest()
+        if job.get('expected_sha256') and sha256 != job['expected_sha256']:
+            removed = _remove(part)
+            raise DownloadError(_deleted_or_not(removed, 'The downloaded file does not match the expected hash'))
+
+        _rename_no_clobber(part, dest)
+        return sha256
     except requests.RequestException as e:
         raise DownloadError(f'Network error: {e}')
     finally:
@@ -331,23 +425,35 @@ def _run_hf(download_id: str, job: Dict[str, Any], engine) -> str:
 
 def _run(download_id: str) -> None:
     job = _jobs.pop(download_id, None)
-    if job is None or get_progress(download_id).get('status') == 'cancelled':
+    if job is None:
         return
+
+    # The transition out of 'queued' has to happen under the same lock
+    # cancel_download reads and writes under, or a cancel landing between the
+    # pop above and this point sets status to 'cancelled' only for this
+    # function to immediately overwrite it with 'starting'.
+    with download_lock:
+        record = download_progress.get(download_id)
+        if record is None:
+            return
+        if record.get('status') == 'cancelled':
+            cancelled_downloads.discard(download_id)
+            return
+        record['status'] = 'starting'
+        record['start_time'] = time.time()
+
     dest = job['dest']
     try:
         _check_disk(os.path.dirname(dest), job['expected_size'])
         if os.path.exists(dest):
             raise DownloadError(f'{os.path.basename(dest)} appeared while queued; not overwritten')
-        _set(download_id, status='starting', start_time=time.time())
         engine = _hf_engine_for(job['url'])
         sha256 = _run_hf(download_id, job, engine) if engine else _stream(download_id, job)
         if job['expected_sha256'] and sha256 != job['expected_sha256']:
-            _remove(dest)
-            raise DownloadError('The downloaded file does not match the expected hash and was deleted')
+            removed = _remove(dest)
+            raise DownloadError(_deleted_or_not(removed, 'The downloaded file does not match the expected hash'))
         _set(download_id, status='completed', progress=100, speed=0, sha256=sha256)
     except _Cancelled:
-        with download_lock:
-            cancelled_downloads.discard(download_id)
         _set(download_id, status='cancelled', speed=0)
         return
     except DownloadError as e:
@@ -356,6 +462,9 @@ def _run(download_id: str) -> None:
             fields['auth_required'] = e.auth_required
         _set(download_id, **fields)
         return
+    finally:
+        with download_lock:
+            cancelled_downloads.discard(download_id)
     _run_hooks(download_id)
 
 

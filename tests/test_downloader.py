@@ -5,6 +5,7 @@ model-named is left behind by a failure.
 
 import hashlib
 import os
+import queue
 import threading
 import unittest
 from unittest import mock
@@ -21,10 +22,14 @@ BODY = b'model weights' * 1000
 
 
 class FakeResponse:
-    def __init__(self, body=BODY, status_code=200, length=None):
+    def __init__(self, body=BODY, status_code=200, length=None, url=None):
         self.body = body
         self.status_code = status_code
         self.headers = {'content-length': str(len(body) if length is None else length)}
+        # The final URL after any redirect. Left None lets the test harness
+        # fill in the URL that was actually requested (the common case);
+        # a test exercising a redirect away from https sets this explicitly.
+        self.url = url
 
     def __enter__(self):
         return self
@@ -50,9 +55,42 @@ class DownloaderTestCase(LibraryTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        # No test here may reach the real network. A test that needs a
+        # response installs its own fake via self.respond(); anything else
+        # that still calls requests.get fails loudly - and is recorded
+        # first, so a test asserting `self.sent == []` gets a true negative
+        # rather than an empty list purely because nothing captured the call.
+        def fail_by_default(url, headers=None, **kwargs):
+            self.sent.append((url, dict(headers or {})))
+            raise AssertionError(f'test reached the real network: {url}')
+        patcher = mock.patch.object(requests, 'get', fail_by_default)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self._reset_module_state()
+
+    def tearDown(self):
+        self._reset_module_state()
+        super().tearDown()
+
+    def _reset_module_state(self):
+        # download_progress/_jobs/_queue/cancelled_downloads are module-level
+        # and shared by the whole process; a job left behind by one test
+        # (or test module) must never be visible to, or processed by, another.
+        downloader.download_progress.clear()
+        downloader._jobs.clear()
+        downloader.cancelled_downloads.clear()
+        while True:
+            try:
+                downloader._queue.get_nowait()
+            except queue.Empty:
+                break
+
     def respond(self, response):
         def fake_get(url, headers=None, **kwargs):
             self.sent.append((url, dict(headers or {})))
+            if response.url is None:
+                response.url = url
             return response
         patcher = mock.patch.object(requests, 'get', fake_get)
         patcher.start()
@@ -69,6 +107,12 @@ class DestinationTests(DownloaderTestCase):
         with self.assertRaises(downloader.DownloadError):
             downloader.start_download('http://civitai.com/x', 'loras', 'a.safetensors')
 
+    def test_malformed_url_is_rejected(self):
+        # An unbalanced IPv6 literal makes urlparse (or its lazy .hostname
+        # property) raise ValueError rather than just answer "not https".
+        with self.assertRaises(downloader.DownloadError):
+            downloader.start_download('https://[::1:bad/x', 'loras', 'a.safetensors')
+
     def test_folders_in_the_name_are_dropped(self):
         self.respond(FakeResponse())
         record = self.run_download(filename='..\\..\\escape.safetensors')
@@ -82,9 +126,24 @@ class DestinationTests(DownloaderTestCase):
             with self.assertRaises(downloader.DownloadError, msg=name):
                 downloader.start_download('https://civitai.com/x', 'loras', name)
 
+    def test_rejects_forbidden_characters_in_filename(self):
+        for name in ('a<b.safetensors', 'a>b.safetensors', 'a"b.safetensors', 'a|b.safetensors',
+                     'a?b.safetensors', 'a*b.safetensors', 'a\x00b.safetensors', 'a\nb.safetensors'):
+            with self.assertRaises(downloader.DownloadError, msg=name):
+                downloader.start_download('https://civitai.com/x', 'loras', name)
+
     def test_rejects_unknown_category(self):
         with self.assertRaises(downloader.DownloadError):
             downloader.start_download('https://civitai.com/x', 'no_such_category', 'a.safetensors')
+
+    def test_rejects_non_model_categories(self):
+        # Registered with folder_paths, but not a model folder - the scanner
+        # (core/scanner.py) skips cataloguing these too, from the same
+        # NON_MODEL_CATEGORIES constant.
+        for category, exts in (('custom_nodes', ['.py']), ('configs', ['.yaml']), ('datasets', [])):
+            self.add_models(category, [], exts)
+            with self.assertRaises(downloader.DownloadError, msg=category):
+                downloader.start_download('https://civitai.com/x', category, 'a.safetensors')
 
     def test_never_overwrites(self):
         with open(os.path.join(self.loras, 'have.safetensors'), 'wb') as handle:
@@ -96,6 +155,35 @@ class DestinationTests(DownloaderTestCase):
         downloader.start_download('https://civitai.com/x', 'loras', 'twice.safetensors')
         with self.assertRaises(downloader.DownloadError):
             downloader.start_download('https://civitai.com/y', 'loras', 'twice.safetensors')
+
+    def test_refuses_a_duplicate_that_only_differs_by_case(self):
+        # Windows paths are case-insensitive; comparing the destination as
+        # literal text (the old guard) missed this entirely.
+        downloader.start_download('https://civitai.com/x', 'loras', 'Same.safetensors')
+        with self.assertRaises(downloader.DownloadError):
+            downloader.start_download('https://civitai.com/y', 'loras', 'same.safetensors')
+
+    def test_refuses_a_duplicate_reached_through_a_linked_category(self):
+        # Category folders are frequently junctions/symlinks to one shared
+        # physical folder (checkpoints/unet/diffusion_models, etc). The
+        # duplicate guard has to compare physical identity, not path text,
+        # or two downloads to the same file through different category
+        # names run at once and interleave writes into one .part file.
+        self.link_category('loras_link', 'loras')
+        downloader.start_download('https://civitai.com/x', 'loras', 'shared.safetensors')
+        with self.assertRaises(downloader.DownloadError):
+            downloader.start_download('https://civitai.com/y', 'loras_link', 'shared.safetensors')
+
+    def test_rejects_boolean_size(self):
+        # bool is an int subclass - a JSON `true` must not become a 1-byte
+        # expected size.
+        with self.assertRaises(downloader.DownloadError):
+            downloader.start_download('https://civitai.com/x', 'loras', 'a.safetensors', expected_size=True)
+
+    def test_rejects_malformed_expected_hash(self):
+        for bad in ('not-a-hash', '00' * 31, '00' * 33, 'zz' * 32):
+            with self.assertRaises(downloader.DownloadError, msg=bad):
+                downloader.start_download('https://civitai.com/x', 'loras', 'a.safetensors', expected_sha256=bad)
 
 
 class TransferTests(DownloaderTestCase):
@@ -133,9 +221,27 @@ class TransferTests(DownloaderTestCase):
             self.assertEqual(handle.read(), b'theirs')
         self.assertFalse(os.path.exists(dest + '.part'))
 
+    def test_file_appearing_while_queued_is_refused_without_a_request(self):
+        download_id = downloader.start_download('https://civitai.com/x', 'loras', 'late.safetensors')
+        with open(os.path.join(self.loras, 'late.safetensors'), 'wb') as handle:
+            handle.write(b'theirs')
+        downloader._run(download_id)
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'error')
+        self.assertEqual(self.sent, [])
+
     def test_hash_mismatch_deletes_the_file(self):
         self.respond(FakeResponse())
         record = self.run_download(expected_sha256='00' * 32)
+        self.assertEqual(record['status'], 'error')
+        self.assertEqual(os.listdir(self.loras), [])
+        dest = os.path.join(self.loras, 'new.safetensors')
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(dest + '.part'))
+
+    def test_refuses_a_redirect_to_non_https(self):
+        self.respond(FakeResponse(url='http://evil.example/redirected'))
+        record = self.run_download()
         self.assertEqual(record['status'], 'error')
         self.assertEqual(os.listdir(self.loras), [])
 
@@ -168,6 +274,27 @@ class TransferTests(DownloaderTestCase):
         downloader._run(download_id)
         self.assertEqual(downloader.get_progress(download_id)['status'], 'cancelled')
         self.assertEqual(self.sent, [])
+
+    def test_cancel_during_transfer_removes_the_part(self):
+        dest = os.path.join(self.loras, 'cancelme.safetensors')
+        download_id_box = {}
+
+        class Cancelling(FakeResponse):
+            def iter_content(self, size):
+                for i, chunk in enumerate(super().iter_content(size)):
+                    if i == 1:
+                        downloader.cancelled_downloads.add(download_id_box['id'])
+                    yield chunk
+
+        self.respond(Cancelling())
+        download_id = downloader.start_download('https://civitai.com/x', 'loras', 'cancelme.safetensors')
+        download_id_box['id'] = download_id
+        downloader._run(download_id)
+        record = downloader.get_progress(download_id)
+        self.assertEqual(record['status'], 'cancelled')
+        self.assertFalse(os.path.exists(dest))
+        self.assertFalse(os.path.exists(dest + '.part'))
+        self.assertNotIn(download_id, downloader.cancelled_downloads)
 
     def test_completion_hook_receives_the_record(self):
         seen = threading.Event()

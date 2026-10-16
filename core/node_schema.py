@@ -182,7 +182,11 @@ def get_node_schema(node_type: str) -> Optional[Dict[str, Any]]:
     if node_type in _SCHEMA_CACHE:
         return _SCHEMA_CACHE[node_type]
     schema = _introspect(node_type)
-    _SCHEMA_CACHE[node_type] = schema
+    # A type that is not registered yet may be by the next analysis - custom
+    # nodes keep registering after startup. Only a real answer, or a failure
+    # for a class that exists, is worth remembering.
+    if schema is not None or _get_node_class(node_type) is not None:
+        _SCHEMA_CACHE[node_type] = schema
     return schema
 
 

@@ -60,7 +60,8 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
             try:
                 # HuggingFace may send an HTTP-date here instead of seconds;
                 # either way this is a wait, never worth failing the lookup over.
-                wait = int(response.headers.get('Retry-After') or 10)
+                # Clamped to 0 too: a negative value would make time.sleep raise.
+                wait = max(0, int(response.headers.get('Retry-After') or 10))
             except ValueError:
                 wait = 10
             time.sleep(min(30, wait))

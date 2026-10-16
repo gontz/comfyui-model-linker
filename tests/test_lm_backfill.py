@@ -84,12 +84,24 @@ class BackfillTestCase(LibraryTestCase):
             json.dump(current, handle)
 
     def _wait_until_done(self, timeout=5):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if lm_backfill.status().get('status') != 'running':
-                return
-            time.sleep(0.01)
-        self.fail('backfill did not finish in time')
+        """
+        Wait for the real background thread `start()` spawned to fully
+        terminate - not just for `status()` to stop saying 'running'.
+
+        `_run`'s own status flips to 'done'/'error'/'cancelled' *inside* its
+        `try` block, before the `finally` block's own `_save_report()` call
+        runs. Polling `status()` alone can return the instant that flip
+        happens, while the thread is still mid-flight toward that last save
+        - and if the caller's tearDown then restores the real
+        `overrides._data_dir` before that save lands, it would write to the
+        user's real `data/lm-backfill.json`. Joining the thread itself
+        waits for the whole function, finally block included, to finish.
+        """
+        for thread in threading.enumerate():
+            if thread.name == 'model-linker-lm-backfill':
+                thread.join(timeout)
+        if lm_backfill.status().get('status') == 'running':
+            self.fail('backfill did not finish in time')
 
 
 class SelectionTests(BackfillTestCase):
@@ -201,6 +213,41 @@ class RunTests(BackfillTestCase):
             lm_backfill._run(use_ai=True)
         self.assertNotIn('enrich_with_ai', self.names())
         self.assertEqual(lm_backfill.status()['counts'].get('ai_skipped'), 1)
+
+    def test_a_set_base_model_is_not_sent_to_ai(self):
+        """
+        Lora Manager's AI path can overwrite base_model for an
+        already-linked model too (e.g. an HF-linked empty LoRA with
+        base_model 'LTXV2'), so ai_eligible must check it exactly like
+        trigger words/notes/usage_tips - fix round 2, item 2.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r', base_model='LTXV2')
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=True)
+        self.assertNotIn('enrich_with_ai', self.names())
+        state = lm_backfill.status()
+        self.assertEqual(state['counts'].get('ai_skipped'), 1)
+        self.assertTrue(state['results'][0].get('ai_skipped'))
+
+    def test_the_fully_blank_case_is_ai_eligible(self):
+        """The positive case for fix round 2, item 2: no trigger words, a
+        blank notes/usage_tips, and an unset base model - every gate open."""
+        self.write_sidecar(source_url='https://huggingface.co/o/r', notes='', usage_tips='{}', base_model='Unknown')
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=True)
+        self.assertIn('enrich_with_ai', self.names())
+        self.assertIsNone(lm_backfill.status()['results'][0].get('ai_skipped'))
+
+    def test_a_no_card_model_never_reaches_the_ai_batch(self):
+        """Fix round 2, item 2: a model nothing was actually hydrated for
+        must never be handed to AI enrichment, use_ai=True or not."""
+        self.write_sidecar(source_url='https://huggingface.co/o/r')
+        lm_backfill.lm_api.hydrate_huggingface.side_effect = \
+            lambda *a, **k: self.calls.append(('hydrate_huggingface', a, k))  # writes nothing
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=True)
+        self.assertNotIn('enrich_with_ai', self.names())
+        self.assertEqual(lm_backfill.status()['counts']['no_card'], 1)
 
     def test_trigger_words_survive_hydration(self):
         self.write_sidecar(source_url='https://huggingface.co/o/r', civitai={'trainedWords': ['STORYBOARD8']})
@@ -317,13 +364,113 @@ class RunTests(BackfillTestCase):
         # already reflects the first model's own result.
         self.assertEqual(seen_after_first, [0, 1])
 
+    def test_status_shows_a_restored_running_report_as_interrupted(self):
+        """
+        A process restart loses the whole in-memory job; the persisted
+        report can be caught mid-run (status still 'running'), which must
+        not come back looking like a job that's still working - fix round
+        2, item 1.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r')
+        lm_backfill._update(status='running', started_at=time.time(), finished_at=None, total=3,
+                             candidates_total=3, limit=None, done=1, current='m.safetensors',
+                             counts={'hydrated': 1}, results=[{'file': 'm.safetensors', 'outcome': 'hydrated'}],
+                             use_ai=False, ai_error=None, error=None)
+        lm_backfill._save_report()
+        lm_backfill._state.clear()
+        lm_backfill._state['status'] = 'idle'
+        state = lm_backfill.status()
+        self.assertEqual(state['status'], 'interrupted')
+        self.assertTrue(state['from_report'])
+        self.assertEqual(state['done'], 1)
+        self.assertIsNone(state['finished_at'])
+
+    def test_a_report_save_failure_does_not_abort_the_run(self):
+        """
+        A transient OSError on the per-model save (a Windows antivirus or
+        indexer lock on os.replace) must not abort the run - fix round 2,
+        item 3. The final save (in `_run`'s `finally`) still runs.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r')
+        real_replace = lm_backfill.os.replace
+        calls = {'n': 0}
+
+        def flaky_replace(src, dst):
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise OSError('locked by antivirus')
+            return real_replace(src, dst)
+
+        with mock.patch.object(hf_identify, 'card', return_value=None), \
+             mock.patch.object(lm_backfill.os, 'replace', side_effect=flaky_replace):
+            lm_backfill._run(use_ai=False)
+        self.assertGreaterEqual(calls['n'], 2)  # the per-model save failed, the final save still ran
+        self.assertEqual(lm_backfill.status()['status'], 'done')
+
+    def test_trigger_words_before_are_recorded_when_the_merge_save_fails(self):
+        """
+        If hydration clears trainedWords and the merge-back save then
+        fails, the words would otherwise be lost entirely (the outcome is
+        just 'failed', with nothing to restore from) - fix round 2, item 5.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r', civitai={'trainedWords': ['STORYBOARD8']})
+
+        def hydrate(*args, **kwargs):
+            self.calls.append(('hydrate_huggingface', args, kwargs))
+            self.write_sidecar(source_url='https://huggingface.co/o/r', modelDescription='<p>x</p>',
+                               civitai={'trainedWords': []})  # the README named none
+
+        lm_backfill.lm_api.hydrate_huggingface.side_effect = hydrate
+        lm_backfill.lm_api.save_metadata.side_effect = lm_api.LoraManagerUnavailable('disk full')
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=False)
+        state = lm_backfill.status()
+        self.assertEqual(state['results'][0]['outcome'], 'failed')
+        self.assertEqual(state['results'][0]['trainedWords_before'], ['STORYBOARD8'])
+
+    def test_an_already_hf_sourced_but_still_undescribed_sidecar_is_not_falsely_hydrated(self):
+        """
+        is_empty() only looks at civitai.id/modelDescription, so a sidecar
+        can already carry metadata_source: 'source:huggingface' from an
+        earlier partial state and still be a candidate. If this run's
+        hydration genuinely writes nothing new, comparing only the
+        post-hydration value would wrongly call it 'hydrated' - fix round
+        2, item 6.
+        """
+        self.write_sidecar(source_url='https://huggingface.co/o/r', metadata_source='source:huggingface')
+        lm_backfill.lm_api.hydrate_huggingface.side_effect = \
+            lambda *a, **k: self.calls.append(('hydrate_huggingface', a, k))  # writes nothing new
+        with mock.patch.object(hf_identify, 'card', return_value=None):
+            lm_backfill._run(use_ai=False)
+        self.assertEqual(lm_backfill.status()['counts']['no_card'], 1)
+
 
 class StartStopTests(BackfillTestCase):
     def test_start_refuses_a_second_concurrent_run(self):
+        """
+        `_state['status']` is set to 'running' synchronously inside the
+        first `start()` call, before the worker thread is even spawned, so
+        the second call's refusal is never itself racy. What *is* racy
+        without care is the whole premise of the test: the worker (fully
+        mocked, PAUSE_BETWEEN_MODELS=0) can finish the entire job before
+        this thread's next line even runs, especially around the real
+        time.sleep(0) call, which is a known thread-switch point - and then
+        the "already running" being asserted wouldn't be testing anything.
+        An Event blocks the worker inside `_fill` (via `hf_identify.card`,
+        which this model's path reaches) so it is *guaranteed* to still be
+        running when the second `start()` call happens - fix round 2, item 4.
+        """
         self.write_sidecar(source_url='https://huggingface.co/o/r')
-        with mock.patch.object(hf_identify, 'card', return_value=None):
+        release = threading.Event()
+
+        def blocking_card(*args, **kwargs):
+            release.wait(5)
+            return None
+
+        with mock.patch.object(hf_identify, 'card', side_effect=blocking_card):
             self.assertTrue(lm_backfill.start(use_ai=False))
-            self.assertFalse(lm_backfill.start(use_ai=False))  # already running
+            self.assertFalse(lm_backfill.start(use_ai=False))  # already running, guaranteed by the block above
+            release.set()
             self._wait_until_done()
         self.assertEqual(lm_backfill.status()['status'], 'done')
         self.assertNotIn('model-linker-lm-backfill', [t.name for t in threading.enumerate()])

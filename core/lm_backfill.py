@@ -63,6 +63,15 @@ def is_empty(data: Dict[str, Any]) -> bool:
     return not civitai.get('id') and not (data.get('modelDescription') or '').strip()
 
 
+def _is_unset_base_model(value: Any) -> bool:
+    """
+    Shared by the AI-eligibility gate and the write-a-bonus-label check, so
+    the two can never drift apart: "this model has no base model yet" must
+    mean exactly the same thing in both places.
+    """
+    return (value or 'Unknown') in ('', 'Unknown')
+
+
 def candidates() -> List[Dict[str, Any]]:
     from .linker import group_models_by_physical_file
     from .scanner import get_model_files
@@ -97,13 +106,26 @@ def status() -> Dict[str, Any]:
     server restart: overwriting it with 'idle' here would hide a failure or
     a cancellation behind a status that claims nothing has ever run.
     'from_report' marks that this came from disk rather than a live run, so
-    a caller (and the Settings dialog) can tell the two apart.
+    a caller (and the Settings dialog) can tell the two apart - it is set
+    only when there is no live state in this process at all, i.e. right
+    after a restart; a report read while a run is actually in progress, or
+    right after one finished in this same process, carries no such flag.
+
+    A restart losing the whole Python process can catch a run between its
+    per-model save (status still 'running') and the next one - the
+    persisted report is then stuck saying 'running' forever, since nothing
+    is left alive to ever finish it. That status is relabelled
+    'interrupted' here, so the UI shows it as what it is instead of
+    "still working" with a disabled button and a poll loop that never ends.
     """
     with _lock:
         if _state.get('status') == 'idle':
             saved = _read(_report_path())
             if saved:
-                return {**saved, 'from_report': True}
+                result = {**saved, 'from_report': True}
+                if result.get('status') == 'running':
+                    result['status'] = 'interrupted'
+                return result
         return json.loads(json.dumps(_state))
 
 
@@ -168,13 +190,26 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
         lm_api.link_huggingface(path, repo)
 
     # Decided from the state *before* hydration: Lora Manager's AI enrichment
-    # (if used later) can replace trigger words, notes, usage_tips and base
-    # model wholesale, which would undo the merge-back below for any model
-    # that already had its own. Models with none of those are the only ones
-    # the AI batch may touch.
+    # (if used later) can replace trigger words, notes, usage_tips AND base
+    # model wholesale - even for an already-linked model - which would undo
+    # the merge-back below for any model that already had its own. Models
+    # with none of those are the only ones the AI batch may touch. The same
+    # "unset" predicate used to decide whether a bonus base_model may be
+    # written below is reused here, so the two can never say different things
+    # about the same sidecar.
     civitai_before = data.get('civitai') if isinstance(data.get('civitai'), dict) else {}
     words_before = list(civitai_before.get('trainedWords') or [])
-    ai_eligible = not words_before and _blank(data.get('notes')) and _blank(data.get('usage_tips'))
+    ai_eligible = (not words_before and _blank(data.get('notes')) and _blank(data.get('usage_tips'))
+                   and _is_unset_base_model(data.get('base_model')))
+
+    # Also decided from *before* hydration: is_empty() only looks at
+    # civitai.id/modelDescription, so a sidecar can already carry
+    # metadata_source: 'source:huggingface' from an earlier partial state
+    # and still be a candidate. Comparing only the post-hydration value
+    # would then call a hydration that genuinely wrote nothing new
+    # "hydrated" simply because that value was already there.
+    was_hf_sourced = data.get('metadata_source') == 'source:huggingface'
+    was_described = bool((data.get('modelDescription') or '').strip())
 
     lm_api.hydrate_huggingface(path, item['root'], repo)
     after = _read(sidecar_path(path)) or {}
@@ -185,6 +220,11 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     merged = words_before + [w for w in words_after if w not in words_before]
     if merged != words_after:
         extra['civitai'] = {'trainedWords': merged}
+        # If the save below fails, the words Lora Manager just cleared would
+        # otherwise be lost entirely - the outcome is just 'failed', with
+        # nothing to restore from. Recorded now, before the save is even
+        # attempted, so it survives whatever that save does.
+        item['trainedWords_before'] = words_before
 
     if info is None:
         try:
@@ -192,7 +232,7 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
         except Exception as e:  # hydration already succeeded; the extras are a bonus
             logger.debug(f"Model Linker: no model card for {repo}: {e}")
     label = hf_identify.base_model_label(info, allowed_bases)
-    if label and (after.get('base_model') or 'Unknown') in ('', 'Unknown'):
+    if label and _is_unset_base_model(after.get('base_model')):
         extra['base_model'] = label
     tags = hf_identify.card_tags(info)
     if tags and not after.get('tags'):
@@ -204,9 +244,9 @@ def _fill(item: Dict[str, Any], allowed_bases: List[str]) -> Optional[str]:
     # Lora Manager's own hydration route can answer success while writing
     # nothing - HuggingFace unreachable, no README, a gated card, a
     # repo/filename mismatch. Only count it as hydrated when it actually
-    # left something behind.
-    hydrated = (after.get('metadata_source') == 'source:huggingface'
-                or bool((after.get('modelDescription') or '').strip()))
+    # changed something that wasn't already there before this call.
+    hydrated = ((after.get('metadata_source') == 'source:huggingface' and not was_hf_sourced)
+                or (bool((after.get('modelDescription') or '').strip()) and not was_described))
     item['ai_eligible'] = hydrated and ai_eligible
     return 'hydrated' if hydrated else 'no_card'
 
@@ -251,11 +291,24 @@ def _run(use_ai: bool, limit: Optional[int] = None) -> None:
                 if outcome == 'hydrated' and item.get('ai_eligible'):
                     hydrated.append(item['path'])
             except Exception as e:
-                _record(item, 'failed', error=str(e))
+                extra = {'error': str(e)}
+                if item.get('trainedWords_before') is not None:
+                    # A merge-back save was pending when this failed - the
+                    # trigger words it was about to restore would otherwise
+                    # be gone with nothing to recover them from.
+                    extra['trainedWords_before'] = item['trainedWords_before']
+                _record(item, 'failed', **extra)
             # Persisted after every model, not only at the end, so an
             # interrupted run (a server restart, a crash) still leaves a
-            # report listing every sidecar actually touched so far.
-            _save_report()
+            # report listing every sidecar actually touched so far. A
+            # transient lock on the file (antivirus, an indexer, a sync
+            # client) must not abort the run over it - the final save in
+            # the outer `finally` below still has every result collected
+            # so far and is not guarded the same way.
+            try:
+                _save_report()
+            except OSError as e:
+                logger.warning(f"Model Linker: could not save the backfill report: {e}")
             time.sleep(PAUSE_BETWEEN_MODELS)
         if use_ai and hydrated and not _cancel.is_set():
             # One batch: Lora Manager runs each call as its own background task,

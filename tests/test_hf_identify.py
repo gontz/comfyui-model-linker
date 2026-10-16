@@ -125,6 +125,20 @@ class FindRepoTests(unittest.TestCase):
         sleep.assert_called_once_with(10)
         self.assertEqual(result['id'], 'owner/x')
 
+    def test_retry_after_negative_is_clamped_to_zero(self):
+        """Fix round 2, item 7: a negative Retry-After must not make
+        time.sleep raise (it rejects negative durations)."""
+        responses = [FakeResponse({}, 429, headers={'Retry-After': '-5'}), card_payload('owner/x', SHA)]
+
+        def get(url, params=None, headers=None, timeout=None):
+            value = responses.pop(0)
+            return value if isinstance(value, FakeResponse) else FakeResponse(value)
+
+        with mock.patch.object(requests, 'get', get), mock.patch.object(hf_identify.time, 'sleep') as sleep:
+            result = hf_identify._get('https://huggingface.co/api/models/owner/x')
+        sleep.assert_called_once_with(0)
+        self.assertEqual(result['id'], 'owner/x')
+
     def test_a_malformed_token_exception_does_not_chain_onto_the_raised_error(self):
         """Fix round 1, item 9: `from None` so a traceback never surfaces
         the original, token-bearing exception via exception chaining."""

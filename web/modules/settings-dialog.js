@@ -101,7 +101,10 @@ export class SettingsDialog {
     renderBackfill(state) {
         const c = state?.counts || {};
         const order = [["hydrated", "hydrated"], ["no_card", "no card"], ["linked_elsewhere", "linked elsewhere"],
-            ["not_found", "not found"], ["failed", "failed"]];
+            ["not_found", "not found"], ["skipped", "skipped"], ["failed", "failed"]];
+        // AI-skip count stays out of `order` and gets its own separator -
+        // it's not an outcome of the fill itself, just a note about which
+        // hydrated models the (opt-in) AI step was allowed to touch.
         const summary = order.filter(([key]) => c[key]).map(([key, label]) => `${label} ${c[key]}`).join(" · ")
             + (c.ai_skipped ? ` · AI skipped ${c.ai_skipped}` : "")
             + (state?.limit ? ` · sample of ${state.total || 0} from ${state.candidates_total || 0} empty models` : "")
@@ -109,6 +112,12 @@ export class SettingsDialog {
         if (state?.status === "running") {
             this.backfillStatus.textContent = `Working… ${state.done || 0} / ${state.total || "?"}`
                 + `${state.current ? ` — ${state.current}` : ""}\n${summary}`;
+        } else if (state?.status === "interrupted") {
+            // The server restarted mid-run: nothing is actually working any
+            // more, so the button must not stay disabled and polling must
+            // not continue - starting again is the only way forward.
+            this.backfillStatus.textContent = `Interrupted at ${state.done || 0} / ${state.total || "?"}`
+                + ` — run again to continue\n${summary}`;
         } else if (state?.finished_at) {
             const when = new Date(state.finished_at * 1000).toLocaleString();
             const label = state.status === "error" ? `failed: ${state.error}` : state.status;
@@ -132,8 +141,13 @@ export class SettingsDialog {
                 this.renderBackfill(await this.request("/model_linker/lm-backfill"));
             } catch (e) {
                 // A transient failure (the server restarting, a dropped
-                // connection) must not stop polling for good - try again.
-                this.schedulePoll();
+                // connection) must not stop polling for good - try again,
+                // but only while the dialog the user would see it in is
+                // still open; otherwise this would poll forever in the
+                // background for no one.
+                if (this.element.style.display !== "none") {
+                    this.schedulePoll();
+                }
             }
         }, 2000);
     }

@@ -18,6 +18,13 @@ export default async function run() {
   check('progress is shown as text, not markup', /backfillStatus\.textContent\s*=/.test(src));
   check('an AI enrichment failure is shown', /ai_error/.test(src));
   check('a failed poll reschedules rather than stopping for good',
-    /catch\s*\(e\)\s*\{\s*(?:\/\/[^\n]*\s*)*this\.schedulePoll\(\);/.test(src));
+    /catch\s*\(e\)\s*\{\s*(?:\/\/[^\n]*\s*)*(?:if\s*\([^)]*\)\s*\{\s*)?this\.schedulePoll\(\);/.test(src));
+  check('a failed poll stops once the dialog is closed, instead of rescheduling forever',
+    /if\s*\(this\.element\.style\.display !== "none"\)\s*\{\s*this\.schedulePoll\(\);/.test(src));
+  check('an interrupted run (restored after a restart mid-run) is shown distinctly',
+    /state\?\.status === "interrupted"/.test(src));
+  check('an interrupted run says to run again, and leaves the button usable',
+    /run again to continue/.test(src));
+  check('the outcome summary includes skipped', /\["skipped", "skipped"\]/.test(src));
   return check.failures;
 }

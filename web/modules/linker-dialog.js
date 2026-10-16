@@ -4,6 +4,7 @@ import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
 import { $el } from "./dom.js";
+import { DownloadController } from "./downloads.js";
 import { ManageOverridesDialog } from "./overrides-dialog.js";
 import { SettingsDialog } from "./settings-dialog.js";
 import {
@@ -43,6 +44,7 @@ export class LinkerManagerDialog {
         this.fullscreen = false;
         this._dragging = false;
         this._dragStart = null;
+        this.downloads = new DownloadController(this);
 
         // Create dialog element using $el
         this.element = $el("div.comfy-modal", {
@@ -282,7 +284,7 @@ export class LinkerManagerDialog {
                     id: "model-linker-settings-btn",
                     title: "Tokens and background lookups",
                     textContent: "⚙ Settings",
-                    onclick: () => { if (!this.settingsDialog) this.settingsDialog = new SettingsDialog(); this.settingsDialog.show(); },
+                    onclick: () => this.openSettings(),
                     style: {
                         background: "none",
                         border: "1px solid var(--border-color)",
@@ -491,6 +493,11 @@ export class LinkerManagerDialog {
         }
     }
 
+    openSettings() {
+        if (!this.settingsDialog) this.settingsDialog = new SettingsDialog();
+        this.settingsDialog.show();
+    }
+
     createQueuePanel() {
         // Header row with title and clear button
         this.queueHeader = $el("div", {
@@ -673,7 +680,15 @@ export class LinkerManagerDialog {
             }
         });
 
+        const downloadAllBtn = $el("button", {
+            textContent: "☁ Download all found",
+            title: "Download every missing model a source was found for (two at a time)",
+            onclick: () => this.downloads.downloadAll(),
+            className: "model-linker-resolve-btn",
+        });
+
         footer.appendChild(this.applyPendingBtn);
+        footer.appendChild(downloadAllBtn);
         footer.appendChild(autoBtn);
         return footer;
     }
@@ -700,6 +715,8 @@ export class LinkerManagerDialog {
             this.analyzeAbort.abort();
             this.analyzeAbort = null;
         }
+        // Downloads and lookups continue on the server; only our polling stops
+        this.downloads.stop();
         this.element.style.display = "none";
     }
 
@@ -1280,6 +1297,8 @@ export class LinkerManagerDialog {
 
             // Model combo is already attached above
         });
+
+        this.downloads.afterRender(container, data);
     }
 
     /**
@@ -1353,6 +1372,10 @@ export class LinkerManagerDialog {
                 + `style="color: var(--primary-color, #4aa3ff);">Download ↗</a>`
                 + `<span style="opacity:.7; font-size: 12px;"> — save to <code>${escapeHtml(target)}</code></span></div>`;
         }
+
+        // Background lookups and downloads (web/modules/downloads.js)
+        html += this.downloads.renderBlock(missing);
+
         // Selected state placeholder (filled dynamically when user queues a selection)
         const selectedId = `selected-${refSlot(missing)}`;
         html += `<div id="${selectedId}" class="model-linker-selected" style="display:none; margin: 8px 0; padding: 8px; border: 1px solid var(--border-color, #444); border-radius: 4px; background: rgba(10,169,110,0.08);"></div>`;

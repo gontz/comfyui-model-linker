@@ -223,6 +223,39 @@ export default async function run() {
   // subfolders - with an EXACT properties.models entry for only one of
   // them. The basename fallback must never land the other's change on the
   // entry a DIFFERENT ref on the same node already claims by its exact name.
+  //
+  // First with the rows exactly as the analyzer supplies them: since round 4
+  // it gives the sd3 ref no source_url (core/workflow_analyzer.py skips an
+  // entry another widget names exactly - test_analyzer.py pins that). Before,
+  // it handed sd3 flux's link, and Export pushed a NEW sd3 entry carrying it.
+  await withFakeCanvas(async () => {
+    const refFlux = { node_id: 60, widget_index: 0, original_path: 'flux/t5.safetensors', category: 'text_encoders',
+      source_url: 'https://workflow/flux-link' };
+    const refSd3 = { node_id: 60, widget_index: 1, original_path: 'sd3/t5.safetensors', category: 'text_encoders',
+      source_url: null };
+    const nodeDual = { properties: { models: [{ name: 'flux/t5.safetensors', url: 'https://workflow/flux-link', directory: 'text_encoders' }] } };
+    const linker = { liveNodesFor: (ref) => ((ref === refFlux || ref === refSd3) ? [nodeDual] : []) };
+    const analyzed = exportRows({ present_models: [refFlux, refSd3] });
+    check('the analyzer-supplied sd3 row has no link of flux\'s',
+          analyzed.find((r) => r.original_path === 'sd3/t5.safetensors')?.url === '');
+    const dialog = Object.create(ExportDialog.prototype);
+    dialog.rows = analyzed;
+    dialog.linker = linker;
+    dialog.option = (id) => id === 'properties';
+    dialog.close = () => {};
+    dialog.request = async (path, body) => {
+      if (path !== '/model_linker/export/lookup') throw new Error('unexpected request: ' + path);
+      return { links: body.models.map((m) => ({ url: m.existing_url })) };
+    };
+    await dialog.apply();
+    const dualModels = nodeDual.properties.models;
+    check('analyzer rows: flux keeps its own link',
+          dualModels.find((m) => m.name === 'flux/t5.safetensors')?.url === 'https://workflow/flux-link');
+    check('analyzer rows: no sd3 entry is written with flux\'s link',
+          dualModels.length === 1 && !dualModels.some((m) => m.name === 'sd3/t5.safetensors'));
+  });
+
+  // Then with a link the user pasted for sd3: added as its own entry
   await withFakeCanvas(async () => {
     const refFlux = { node_id: 60, widget_index: 0, original_path: 'flux/t5.safetensors', category: 'text_encoders' };
     const refSd3 = { node_id: 60, widget_index: 1, original_path: 'sd3/t5.safetensors', category: 'text_encoders' };
@@ -449,6 +482,169 @@ export default async function run() {
     await dialogRisky.apply();
     check('a matched entry with a risky non-http link is dropped with "write links" off',
           !('url' in nodeRisky.properties.models[0]));
+  });
+
+  // --- Fix round 4 ---------------------------------------------------------
+  //
+  // A stand-in for the server's strip_secrets, faithful where it matters:
+  // like Python's urlparse, it finds userinfo only after a literal "//", so a
+  // backslash-form link sent raw keeps its userinfo (and the browser then
+  // reads it as https://user:pw@host/...).
+  const fakeStrip = (u) => {
+    if (typeof u !== 'string') return null;
+    const m = /^(https?:)\/\/(?:[^@/?#]*@)?([^?#;]*)/i.exec(u);
+    return m ? m[1] + '//' + m[2] : u.replace(/[?#].*$/, '');
+  };
+  const makeDialog = ({ rows: dRows = [], linker = { liveNodesFor: () => [] }, option = () => false, request }) => {
+    const d = Object.create(ExportDialog.prototype);
+    d.rows = dRows;
+    d.linker = linker;
+    d.option = option;
+    d.close = () => {};
+    d.request = request;
+    return d;
+  };
+  const stripRequest = (calls = []) => async (path, body) => {
+    if (path !== '/model_linker/export/lookup') throw new Error('unexpected request: ' + path);
+    calls.push(body.models);
+    if (body.models.length > 500) throw new Error('models must be a list of at most 500');
+    return { links: body.models.map((m) => (m.existing_url ? { url: fakeStrip(m.existing_url) } : null)) };
+  };
+  const leaks = (url) => typeof url === 'string' && (/token|SECRET|pw@/i.test(url));
+
+  // D1: nodes no ref resolves to - an unrecognised widget's node, a node
+  // inside a subgraph instance's inner graph, and a node inside a subgraph
+  // definition with no instance at all - still ship properties.models.
+  // Every one is scrubbed, inside the same undo step and the same batch.
+  // A node no row touched is never added to or replaced, even when its
+  // entry shares a name with a row that has a new link.
+  await withFakeCanvas(async ({ graph, canvasCalls }) => {
+    const loose = { properties: { models: [{ name: 'u.safetensors', url: 'https://h/u?token=T', directory: 'loras', hash: 'ab' }] } };
+    const sameName = { properties: { models: [{ name: 'shared.safetensors', url: 'https://h/old?token=X', directory: 'loras' }] } };
+    const innerNode = { properties: { models: [{ name: 'i.safetensors', url: 'https://user:pw@h/i', directory: 'vae' }] } };
+    const instance = { type: 'some-subgraph-uuid', properties: {}, subgraph: { _nodes: [innerNode] } };
+    const defNode = { properties: { models: [{ name: 'd.safetensors', url: 'https://h/d?token=D', directory: 'vae' }] } };
+    graph.add(loose); graph.add(sameName); graph.add(instance);
+    graph.subgraphs = new Map([['unused-def', { nodes: [defNode] }]]);
+    const refS = { node_id: 99, widget_index: 0, original_path: 'shared.safetensors', category: 'loras' };
+    const nodeS = { properties: {} };
+    const rowS = { key: 'loras|shared.safetensors', name: 'shared.safetensors', category: 'loras', original_path: 'shared.safetensors',
+      url: 'https://h/new', sha256: '', present: true, refs: [refS] };
+    const calls = [];
+    const dialog = makeDialog({ rows: [rowS], linker: { liveNodesFor: (r) => (r === refS ? [nodeS] : []) },
+      option: (id) => id === 'properties', request: stripRequest(calls) });
+    await dialog.apply();
+    check('D1: a node no ref resolves to is scrubbed', loose.properties.models[0].url === 'https://h/u');
+    check('D1: only url is touched on it', loose.properties.models[0].hash === 'ab');
+    check('D1: a node inside a subgraph instance is scrubbed', innerNode.properties.models[0].url === 'https://h/i');
+    check('D1: a node in a subgraph definition with no instance is scrubbed', defNode.properties.models[0].url === 'https://h/d');
+    check('D1: an untouched node\'s entry is scrubbed, never replaced by a row\'s link',
+          sameName.properties.models.length === 1 && sameName.properties.models[0].url === 'https://h/old');
+    check('D1: the row\'s own node still gets its new link', nodeS.properties.models?.[0]?.url === 'https://h/new');
+    check('D1: still one undo step and one lookup request', canvasCalls.join(',') === 'before,after' && calls.length === 1);
+  });
+
+  // D2 / D3: a url that is not a string, a `;` path parameter on a non-http
+  // URL, and backslash-form https (which a browser reads as
+  // https://user:pw@host/...) - on an orphan and on a pasted row.
+  await withFakeCanvas(async ({ graph }) => {
+    const node = { properties: { models: [
+      { name: 'arr.safetensors', url: ['https://h/a?token=T'] },
+      { name: 'obj.safetensors', url: { href: 'https://h/o?token=T' } },
+      { name: 's3.safetensors', url: 's3://bucket/a;token=SECRET/b' },
+      { name: 'bs.safetensors', url: 'https:\\\\user:pw@h\\bs?token=T' },
+    ] } };
+    graph.add(node);   // reached by the graph walk only - every entry an orphan
+    const refR = { node_id: 7, widget_index: 0, original_path: 'r.safetensors', category: 'loras' };
+    const nodeR = { properties: {} };
+    const rowR = { key: 'loras|r.safetensors', name: 'r.safetensors', category: 'loras', original_path: 'r.safetensors',
+      url: 'https:\\\\user:pw@host\\r?token=T', sha256: '', present: true, refs: [refR] };
+    const calls = [];
+    const dialog = makeDialog({ rows: [rowR], linker: { liveNodesFor: (r) => (r === refR ? [nodeR] : []) },
+      option: (id) => id === 'properties', request: stripRequest(calls) });
+    await dialog.apply();
+    const by = (n) => node.properties.models.find((m) => m.name === n);
+    check('D2: an array url is deleted', !('url' in by('arr.safetensors')));
+    check('D2: an object url is deleted', !('url' in by('obj.safetensors')));
+    check('D2: nothing is sent to the server without a link to strip',
+          calls.flat().every((m) => typeof m.existing_url === 'string'));
+    check('D3: a non-http url with a ; path parameter is deleted', !('url' in by('s3.safetensors')));
+    check('D3: a backslash-form orphan is stripped, not kept raw', by('bs.safetensors').url === 'https://h/bs');
+    check('D3: a pasted backslash-form link is written without its userinfo',
+          nodeR.properties.models?.[0]?.url === 'https://host/r');
+    const written = [...node.properties.models, ...(nodeR.properties.models || [])].map((m) => m.url);
+    check('D2/D3: no written url carries a credential', !written.some(leaks));
+  });
+
+  // B: the graph changes while apply() awaits the lookup - entries
+  // reordered, or removed outright. Each write must still land on the entry
+  // it was meant for, and a vanished one is skipped, not a TypeError.
+  await withFakeCanvas(async () => {
+    const node = { properties: { models: [
+      { name: 'p.safetensors', url: 'https://h/p?token=T' },
+      { name: 'q.safetensors', url: 'https://h/q?token=U' },
+      { name: 'o.safetensors', url: 'https://h/o?token=V' },
+    ] } };
+    const refP = { node_id: 1, widget_index: 0, original_path: 'p.safetensors', category: 'loras' };
+    const refQ = { node_id: 1, widget_index: 1, original_path: 'q.safetensors', category: 'loras' };
+    const row = (ref) => ({ key: `loras|${ref.original_path}`, name: ref.original_path, category: 'loras',
+      original_path: ref.original_path, url: node.properties.models.find((m) => m.name === ref.original_path).url,
+      sha256: '', present: true, refs: [ref] });
+    const strip = stripRequest();
+    const reorder = makeDialog({ rows: [row(refP), row(refQ)], linker: { liveNodesFor: () => [node] },
+      option: (id) => id === 'properties',
+      request: async (path, body) => { node.properties.models.reverse(); return strip(path, body); } });
+    await reorder.apply();
+    const by = (n) => node.properties.models.find((m) => m.name === n)?.url;
+    check('B: a reordered matched entry gets its own link',
+          by('p.safetensors') === 'https://h/p' && by('q.safetensors') === 'https://h/q');
+    check('B: a reordered orphan gets its own link', by('o.safetensors') === 'https://h/o');
+
+    const gone = { properties: { models: [{ name: 'p.safetensors', url: 'https://h/p?token=T' }, { name: 'o.safetensors', url: 'https://h/o?token=V' }] } };
+    const refG = { node_id: 2, widget_index: 0, original_path: 'p.safetensors', category: 'loras' };
+    const rowG = { key: 'loras|p.safetensors', name: 'p.safetensors', category: 'loras', original_path: 'p.safetensors',
+      url: 'https://h/p?token=T', sha256: '', present: true, refs: [refG] };
+    const removing = makeDialog({ rows: [rowG], linker: { liveNodesFor: () => [gone] }, option: (id) => id === 'properties',
+      request: async (path, body) => { gone.properties.models.splice(0); return strip(path, body); } });
+    let threw = null;
+    try { await removing.apply(); } catch (error) { threw = error; }
+    check('B: an entry removed during the lookup is skipped, not a TypeError', threw === null);
+    check('B: nothing is re-added in its place', gone.properties.models.length === 0);
+  });
+
+  // C: more links than one /export/lookup accepts (500) - batched, with
+  // links[i] still answering models[i] across batches; both from apply()
+  // and from the lookUp() run when the dialog opens.
+  await withFakeCanvas(async () => {
+    const N = 501;
+    const nodes = [];
+    const bigRows = [];
+    for (let i = 0; i < N; i++) {
+      const ref = { node_id: i, widget_index: 0, original_path: `m${i}.safetensors`, category: 'loras' };
+      nodes.push({ properties: {} });
+      bigRows.push({ key: `loras|m${i}.safetensors`, name: `m${i}.safetensors`, category: 'loras', original_path: `m${i}.safetensors`,
+        url: `https://h/m${i}?token=T`, sha256: '', present: false, refs: [ref] });
+    }
+    const calls = [];
+    const dialog = makeDialog({ rows: bigRows, linker: { liveNodesFor: (r) => [nodes[r.node_id]] },
+      option: (id) => id === 'properties', request: stripRequest(calls) });
+    await dialog.apply();
+    check('C: apply batches the lookup within the server cap', calls.length === 2 && calls.every((c) => c.length <= 500));
+    check('C: every node gets its own link across batches',
+          nodes.every((n, i) => n.properties.models?.[0]?.url === `https://h/m${i}`));
+
+    const lookCalls = [];
+    const opened = makeDialog({ rows: bigRows.map((r) => ({ ...r, url: '' })), request: async (path, body) => {
+      lookCalls.push(body);
+      if (body.models.length > 500) throw new Error('too many');
+      return { links: body.models.map((m) => ({ url: `https://found/${m.filename}`, url_source: 'huggingface' })), searched: true };
+    } });
+    opened.element = { querySelector: () => ({ style: {} }) };
+    await opened.lookUp({ manual: true });
+    check('C: lookUp batches too, passing manual on every batch',
+          lookCalls.length === 2 && lookCalls.every((b) => b.models.length <= 500 && b.manual === true));
+    check('C: lookUp answers each row from its own batch',
+          opened.rows[0].url === 'https://found/m0.safetensors' && opened.rows[500].url === 'https://found/m500.safetensors');
   });
 
   // Scenario 7 (item 2b, faithful transcription - LinkerManagerDialog needs a

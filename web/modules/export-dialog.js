@@ -20,6 +20,31 @@ const OPTIONS = [
 ];
 const basename = (path) => (path || "").split(/[\\/]/).pop();
 const SHA256 = /^[0-9a-f]{64}$/i;
+/** /export/lookup takes at most this many models per request (routes_export.MAX_MODELS). */
+export const LOOKUP_BATCH = 500;
+
+/**
+ * Every node of `graph` and of every subgraph definition reachable from it -
+ * through an instance's `subgraph`, or the root's `subgraphs` map, which also
+ * holds definitions with no instance on the canvas.
+ */
+export function allGraphNodes(graph) {
+    const nodes = new Set();
+    const seen = new Set();
+    const visit = (g) => {
+        if (!g || seen.has(g)) return;
+        seen.add(g);
+        for (const node of g._nodes || g.nodes || []) {
+            nodes.add(node);
+            let inner = null;
+            try { inner = node?.subgraph; } catch (e) { /* not a subgraph instance */ }
+            visit(inner);
+        }
+        for (const sub of g.subgraphs?.values?.() ?? []) visit(sub);
+    };
+    visit(graph);
+    return nodes;
+}
 
 /** One row per (folder, file) across missing and present models. Pure. */
 export function exportRows(data) {
@@ -52,7 +77,10 @@ export function lookupPayload(rows) {
         filename: row.name,
         category: row.category,
         sha256: row.sha256 || undefined,
-        existing_url: row.url || undefined,
+        // The browser's own reading of the link, which is what gets written:
+        // `https:\\user:pw@host\a` is https://user:pw@host/a to a browser, but
+        // Python's urlparse finds no host in it and would leave the userinfo
+        existing_url: safeHttpUrl(row.url) || undefined,
     }));
 }
 
@@ -79,6 +107,22 @@ export class ExportDialog {
         const data = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(data?.error || `HTTP ${response.status}`);
         return data;
+    }
+
+    /**
+     * /export/lookup in batches the server accepts. `links[i]` answers
+     * `models[i]` across batches; a short answer counts as no link.
+     */
+    async lookupLinks(models, extra = {}) {
+        const links = [];
+        let searched = false;
+        for (let start = 0; start < models.length; start += LOOKUP_BATCH) {
+            const chunk = models.slice(start, start + LOOKUP_BATCH);
+            const answer = await this.request("/model_linker/export/lookup", { ...extra, models: chunk });
+            chunk.forEach((_, j) => links.push(answer?.links?.[j] ?? null));
+            searched = answer?.searched === true;
+        }
+        return { links, searched };
     }
 
     show(data) {
@@ -156,8 +200,7 @@ export class ExportDialog {
         if (!rows.length) return;
         rows.forEach((row, i) => { if (!row.url) this.setRow(i, "", "Looking for a public link…"); });
         try {
-            const { links, searched } = await this.request("/model_linker/export/lookup",
-                { models: lookupPayload(rows), manual });
+            const { links, searched } = await this.lookupLinks(lookupPayload(rows), { manual });
             if (rows !== this.rows) return;   // the dialog was reopened meanwhile
             rows.forEach((row, i) => {
                 const link = links?.[i];
@@ -223,19 +266,27 @@ export class ExportDialog {
         return at;
     }
 
+    /**
+     * Whatever a browser reads as http(s) - `https:\\host\a` and `https:host/a`
+     * included. Such a link goes to strip_secrets in that reading
+     * (safeHttpUrl's href), never as the raw string.
+     */
     static isHttpUrl(value) {
-        return /^https?:\/\//i.test(value || "");
+        return !!safeHttpUrl(value);
     }
 
     /**
      * A non-http(s) URL (`s3://...`, etc.) that `strip_secrets` never
      * touches server-side (it is a no-op there for any scheme but http(s)):
-     * kept only if it carries no credential-shaped part of its own.
+     * kept only if it carries no credential-shaped part of its own - no
+     * userinfo, query, fragment or `;` path parameter.
      */
     static cleanNonHttpUrl(value) {
+        if (typeof value !== "string") return false;
         try {
             const parsed = new URL(value);
-            return !parsed.username && !parsed.password && !parsed.search && !parsed.hash;
+            return !parsed.username && !parsed.password && !parsed.search && !parsed.hash
+                && !parsed.pathname.includes(";");
         } catch (e) {
             return false;
         }
@@ -258,8 +309,13 @@ export class ExportDialog {
      * - A BRAND-NEW entry (no ref matched anything already there) is only
      *   ever added when the option is on, and only from an https link - the
      *   one scheme ever added fresh. Same restriction for the note.
-     * - ORPHAN (no ref claims it at all): the option has no say over these
-     *   either way - they are only ever scrubbed, never added or replaced.
+     * - ORPHAN (no ref claims it at all - including every entry on a node no
+     *   ref resolves to, anywhere in the graph or its subgraph definitions):
+     *   the option has no say over these either way - they are only ever
+     *   scrubbed, never added or replaced.
+     *
+     * Only the `url` key is scrubbed; any other field an entry carries is
+     * left as the workflow had it.
      */
     async apply() {
         if (this._applying) return;   // ignore a double press
@@ -310,7 +366,8 @@ export class ExportDialog {
                     for (const node of this.linker.liveNodesFor(ref)) {
                         const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
                         const at = matchFor(node, models, ref.original_path);
-                        matches.push({ node, ref, at });
+                        // The entry's name, to find it again after the awaits below
+                        matches.push({ node, ref, at, name: at >= 0 ? models[at]?.name : undefined });
                         if (at >= 0) {
                             if (!touchedByNode.has(node)) touchedByNode.set(node, new Set());
                             touchedByNode.get(node).add(at);
@@ -319,13 +376,19 @@ export class ExportDialog {
                 }
                 matchByRow.set(row, matches);
             }
-            const orphans = [];   // { node, index, url }
-            for (const node of nodeRefs.keys()) {
+            // Every node in the workflow, not only those a reference resolves
+            // to: a widget the analyzer does not recognise, or a subgraph
+            // definition with no instance, still ships its properties.models.
+            // On a node no row touched, every entry is an orphan.
+            const orphans = [];   // { node, index, name, url }
+            for (const node of new Set([...allGraphNodes(graph), ...nodeRefs.keys()])) {
                 const touched = touchedByNode.get(node) ?? new Set();
-                const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
+                const models = Array.isArray(node?.properties?.models) ? node.properties.models : [];
                 models.forEach((entry, index) => {
-                    if (touched.has(index)) return;
-                    if (typeof entry?.url === "string" && entry.url) orphans.push({ node, index, url: entry.url });
+                    if (touched.has(index) || !entry || typeof entry !== "object") return;
+                    // Any url but an empty one: a non-string (array, object)
+                    // cannot be checked, so it resolves to "" and is deleted
+                    if (entry.url !== undefined && entry.url !== "") orphans.push({ node, index, name: entry.name, url: entry.url });
                 });
             }
 
@@ -363,14 +426,18 @@ export class ExportDialog {
                 // plus an orphan's or a matched entry's own current link -
                 // goes through the server's strip_secrets in this one batch.
                 // Never reimplemented here.
+                const scrubItem = (url) => {
+                    const href = safeHttpUrl(url);
+                    return { filename: basename(href) || "model", existing_url: href };
+                };
                 const payload = [
                     ...lookupPayload(candidates),
-                    ...httpOrphans.map((o) => ({ filename: basename(o.url) || "model", existing_url: o.url })),
-                    ...httpSelf.map((s) => ({ filename: basename(s.url) || "model", existing_url: s.url })),
+                    ...httpOrphans.map((o) => scrubItem(o.url)),
+                    ...httpSelf.map((s) => scrubItem(s.url)),
                 ];
                 let links;
                 try {
-                    ({ links } = await this.request("/model_linker/export/lookup", { models: payload }));
+                    ({ links } = await this.lookupLinks(payload));
                 } catch (error) { notifyError("Could not prepare the links", error); return; }
                 if (rows !== this.rows) return;
                 let i = 0;
@@ -444,12 +511,17 @@ export class ExportDialog {
                 // Matched entries: see the three-way rule in the doc comment
                 // above. Adding a brand-new entry is the only part "write
                 // links into the loader nodes" gates for these.
+                // The graph may have changed during the awaits above: find
+                // each entry again by what it was, never by a stored index alone
+                const refind = (models, index, isIt) => (isIt(models[index]) ? index : models.findIndex(isIt));
                 for (const row of rows) {
                     const addUrl = finalUrl(row);
                     const rowResolved = resolvedUrl(row);
                     for (const match of matchByRow.get(row) || []) {
-                        const { node, ref, at } = match;
+                        const { node, ref } = match;
                         const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
+                        const at = match.at < 0 ? -1 : refind(models, match.at, (m) => m?.name === match.name);
+                        if (match.at >= 0 && at < 0) continue;   // gone meanwhile: nothing to scrub, nothing to add
                         if (at >= 0) {
                             let writeUrl;
                             if (!rowResolved) {
@@ -480,13 +552,13 @@ export class ExportDialog {
                 // Orphans: no ref claims these at all, so "write links" has
                 // nothing to say about them - only ever scrubbed.
                 for (const orphan of orphans) {
-                    const { node, index, url } = orphan;
+                    const { node, name, url } = orphan;
                     const models = Array.isArray(node.properties?.models) ? node.properties.models : [];
-                    const entry = models[index];
-                    if (!entry) continue;
+                    const index = refind(models, orphan.index, (m) => m?.name === name && m?.url === url);
+                    if (index < 0) continue;
                     const nextUrl = orphanResolved.get(orphan) || "";
                     if (nextUrl === url) continue;   // unchanged - nothing to write
-                    const { url: _stale, ...rest } = entry;
+                    const { url: _stale, ...rest } = models[index];
                     models[index] = nextUrl ? { ...rest, url: nextUrl } : rest;
                     node.properties = { ...(node.properties || {}), models };
                 }

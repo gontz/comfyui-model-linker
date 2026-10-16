@@ -237,6 +237,7 @@ export class DownloadController {
         else if (action === "search") this.searchAgain(missing);
         else if (action === "similar") this.searchSimilar(missing);
         else if (action === "download-similar") this.startSimilar(missing, Number(button.dataset.mlIndex));
+        else if (action === "cancel-similar") this.cancelSimilar(missing, Number(button.dataset.mlIndex));
     }
 
     async request(path, body) {
@@ -362,6 +363,16 @@ export class DownloadController {
             this.track(key, id, record);
             any = true;
         }
+        // A download this page itself already started (a candidateKey from
+        // a similar-model search is in byFile, but its card's .similar list
+        // did not survive the re-analysis that follows a reopen) must still
+        // get its polling re-armed while it runs, so a toast and the
+        // eventual re-analysis still fire when it finishes - even though no
+        // on-screen card can show its progress any more. This never adopts
+        // anything new; it only continues watching ids this page put there.
+        for (const id of this.byFile.values()) {
+            if (downloadState(null, all[id]).kind === "active") any = true;
+        }
         if (any) this.scheduleProgressPoll();
     }
 
@@ -411,6 +422,20 @@ export class DownloadController {
     }
 
     /**
+     * True when a candidate's own filename collides with an on-screen card's
+     * own exact-file name - this card's or another one's. Downloading it
+     * would save the candidate's bytes under a name the workflow itself
+     * claims (and candidateKey() would then equal that card's fileKey(), so
+     * its progress would drive that card's own Queued/Downloaded block
+     * instead of a row of its own) - exactly what "saved under its own
+     * name" exists to prevent. Never offered for download, by any card.
+     */
+    collidesWithWorkflowName(missing, filename) {
+        const key = candidateKey(missing, filename);
+        return [...this.missing.values()].some((m) => fileKey(m) === key);
+    }
+
+    /**
      * The "search similar" results list for a card: candidates from the
      * bundled index, ComfyUI-Manager's list, HuggingFace and CivitAI, each
      * scored against the missing filename by the server's banded matcher.
@@ -425,7 +450,7 @@ export class DownloadController {
         const slot = refSlot(missing);
         const similar = missing.similar;
         if (!similar) return "";
-        if (similar.loading) return `<div style="opacity:.7; margin-top:4px;">🔎 Searching HuggingFace and CivitAI…</div>`;
+        if (similar.loading) return `<div style="opacity:.7; margin-top:4px;">🔎 Searching…</div>`;
         const errors = (similar.errors || []).map((e) => `<div style="opacity:.6; font-size:11px;">⚠ ${escapeHtml(e)}</div>`).join("");
         if (!similar.candidates?.length) return `<div style="opacity:.7; margin-top:4px;">No similar models found.</div>${errors}`;
         const rows = similar.candidates.map((candidate, index) => {
@@ -433,21 +458,30 @@ export class DownloadController {
             const record = this.records[this.byFile.get(key)];
             const dlState = downloadState(null, record);
             const page = safeHttpUrl(candidate.page_url);
+            const httpsPage = page && page.startsWith("https://") ? page : null;
             const size = typeof candidate.size === "number" ? formatBytes(candidate.size) : (candidate.size || "");
             const tone = candidate.different_model ? "#e05050" : "#e0a030";
             const label = candidate.different_model ? "different model" : "similar";
             const where = SOURCE_LABELS[candidate.url_source] || SOURCE_LABELS[candidate.source] || candidate.source || "";
+            const origin = candidate.repo_id || candidate.name || "";
+            const hint = candidate.different_model
+                ? ` <span style="opacity:.6; font-size:11px;">won't be offered as a match - pick it in the model picker</span>` : "";
             const meta = `<code>${escapeHtml(candidate.filename)}</code>`
                 + `<span style="color:${tone}; font-size:12px;">${escapeHtml(String(candidate.confidence))}% · ${label}</span>`
-                + `<span style="opacity:.6; font-size:12px;">${escapeHtml(where)}${size ? ` · ${escapeHtml(size)}` : ""}</span>`
-                + (page ? `<a href="${escapeHtml(page)}" target="_blank" rel="noopener noreferrer">↗</a>` : "");
+                + `<span style="opacity:.6; font-size:12px;">${escapeHtml(where)}${origin ? ` · ${escapeHtml(origin)}` : ""}${size ? ` · ${escapeHtml(size)}` : ""}</span>`
+                + (httpsPage ? `<a href="${escapeHtml(httpsPage)}" target="_blank" rel="noopener noreferrer">↗</a>` : "")
+                + hint;
             let action;
-            if (dlState.kind === "active") {
-                action = `<progress max="100" value="${Number(record.progress) || 0}" style="width:80px;"></progress>`;
+            if (this.collidesWithWorkflowName(missing, candidate.filename)) {
+                action = `<span style="opacity:.6; font-size:12px;">exact name - use "Find a download" on that card</span>`;
+            } else if (dlState.kind === "active") {
+                action = `<progress max="100" value="${Number(record.progress) || 0}" style="width:80px;"></progress>`
+                    + `<button data-ml-action="cancel-similar" data-ml-slot="${escapeHtml(slot)}" data-ml-index="${index}" class="model-linker-resolve-btn" style="padding:1px 6px;">Cancel</button>`;
             } else if (dlState.kind === "done") {
                 action = `<span style="color:#0aa96e;">✓ Downloaded</span>`;
             } else if (dlState.kind === "error") {
-                action = `<span style="color:#e05050;">✗ ${escapeHtml(record.error || "Failed")}</span>`;
+                action = `<span style="color:#e05050; font-size:12px;">✗ ${escapeHtml(record.error || "Failed")}</span> `
+                    + `<button data-ml-action="download-similar" data-ml-slot="${escapeHtml(slot)}" data-ml-index="${index}" class="model-linker-resolve-btn" style="padding:1px 6px;">Retry</button>`;
             } else {
                 action = `<button data-ml-action="download-similar" data-ml-slot="${escapeHtml(slot)}" data-ml-index="${index}" class="model-linker-resolve-btn" style="padding:1px 6px;">☁ Download</button>`;
             }
@@ -458,14 +492,28 @@ export class DownloadController {
     }
 
     async searchSimilar(missing) {
+        // A double click (or the user re-pressing the button before the
+        // first search has returned) must not fire a second request - the
+        // guard has to run before anything async, synchronously, or two
+        // calls started back to back would both pass it.
+        if (missing.similar?.loading) return;
         missing.similar = { loading: true };
         this.refresh(missing);
+        let result;
         try {
             const { original_path, category } = missing;
-            missing.similar = await this.request("/model_linker/search", { missing: { original_path, category } });
+            result = await this.request("/model_linker/search", { missing: { original_path, category } });
         } catch (error) {
-            missing.similar = { candidates: [], errors: [error.message] };
+            result = { candidates: [], errors: [error.message] };
         }
+        // A search can take long enough for a re-analysis to replace this
+        // card's missing-model object (same slot, a new object) before it
+        // returns. Assigning a stale result onto a discarded object - and
+        // refreshing a DOM id that now belongs to the new object's card -
+        // would overwrite whatever the new card is showing with a stale
+        // answer to a question nobody is asking any more.
+        if (this.missing.get(refSlot(missing)) !== missing) return;
+        missing.similar = result;
         this.refresh(missing);
     }
 
@@ -474,6 +522,11 @@ export class DownloadController {
         if (!candidate) return;
         if (!missing.category || missing.category === "unknown") {
             notifyError("Download did not start", new Error("The node's model folder is unknown"));
+            return;
+        }
+        if (this.collidesWithWorkflowName(missing, candidate.filename)) {
+            notifyError("Download did not start", new Error(
+                'This workflow already uses that file name - use "Find a download" on that card instead'));
             return;
         }
         try {
@@ -486,10 +539,25 @@ export class DownloadController {
                 sha256: /^[0-9a-f]{64}$/i.test(candidate.sha256 || "") ? candidate.sha256 : null,
                 size: typeof candidate.size === "number" ? Math.round(candidate.size) : null,
             });
+            // track() always overwrites the mapping - a retry after a failed
+            // attempt replaces the stale error record with the new attempt's.
             this.track(candidateKey(missing, candidate.filename), data.download_id);
             this.scheduleProgressPoll();
         } catch (error) {
             notifyError("Download did not start", error);
+        }
+    }
+
+    async cancelSimilar(missing, index) {
+        const candidate = missing.similar?.candidates?.[index];
+        if (!candidate) return;
+        const id = this.byFile.get(candidateKey(missing, candidate.filename));
+        if (!id) return;
+        try {
+            const data = await this.request(`/model_linker/cancel/${encodeURIComponent(id)}`, {});
+            if (!data?.success) notifyError("Could not cancel the download", new Error("The server could not cancel it"));
+        } catch (error) {
+            notifyError("Could not cancel the download", error);
         }
     }
 

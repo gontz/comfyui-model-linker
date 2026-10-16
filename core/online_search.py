@@ -17,10 +17,9 @@ from . import settings
 from .categories import canonical_category
 from .matcher import STRONG_MATCH_CONFIDENCE, calculate_filename_confidence
 from .scanner import MODEL_EXTENSIONS
-from .sources import hf_index
+from .sources import hf_index, model_list
 from .sources.civitai import CIVITAI_API_URL
 from .sources.huggingface import HF_API_URL, build_search_queries, get_huggingface_download_url
-from .sources.model_list import search_model_list_multiple
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +51,17 @@ def _get(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
 
 
 def _huggingface_candidates(filename: str) -> List[Dict[str, Any]]:
+    queries = build_search_queries(filename)
     repos: List[str] = []
-    for query in build_search_queries(filename):
-        for model in _get(f'{HF_API_URL}/models', {'search': query, 'limit': MAX_REPOS}) or []:
+    for query in queries:
+        try:
+            models = _get(f'{HF_API_URL}/models', {'search': query, 'limit': MAX_REPOS}) or []
+        except Exception as e:
+            # One query failing (a timeout, a transient 5xx) must not drop
+            # whatever an earlier query in this same call already found.
+            logger.debug(f"Model Linker: HuggingFace search for {query!r} failed: {e}")
+            continue
+        for model in models:
             repo = model.get('id') or model.get('modelId')
             if repo and repo not in repos:
                 repos.append(repo)
@@ -118,7 +125,28 @@ def _index_candidates(filename: str) -> List[Dict[str, Any]]:
 
 
 def _model_list_candidates(filename: str) -> List[Dict[str, Any]]:
-    return search_model_list_multiple(filename, limit=10)
+    """
+    Every ComfyUI-Manager list entry with a URL - local, no network.
+
+    search_model_list_multiple() pre-filters by raw SequenceMatcher similarity
+    (a 40% floor on the normalised name) before a caller ever sees a
+    candidate, which is exactly the "ranks filenames backwards" problem the
+    banded matcher exists to avoid (see core/matcher.py). Every entry is
+    handed to search_candidates() unfiltered instead, so it gets scored by
+    the same calculate_filename_confidence() as every other source - the
+    overall result cap still applies once everything is ranked together.
+    """
+    found = []
+    for entry in model_list._load_model_list():
+        name, url = entry.get('filename', ''), entry.get('url', '')
+        if not name or not url:
+            continue
+        found.append({
+            'source': 'model_list', 'filename': name, 'url': url,
+            'name': entry.get('name', ''), 'directory': entry.get('save_path', ''),
+            'size': entry.get('size', ''),
+        })
+    return found
 
 
 def search_candidates(filename: str, category: str = '', limit: int = 15) -> Dict[str, Any]:

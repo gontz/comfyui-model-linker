@@ -386,6 +386,156 @@ export default async function run() {
     c.stop();
   }
 
+  // 12. A candidate named exactly like the workflow's own file (this card's
+  // or another on-screen card's) must never be downloaded under that name:
+  // it would be saved as a hash-verified near match wearing the exact
+  // filename the workflow expects, and - because candidateKey would then
+  // equal that card's fileKey - would drive the card's own Queued/progress
+  // block, not a row of its own.
+  {
+    const posted = [];
+    api.fetchApi = async (path, opts = {}) => {
+      if (path === '/model_linker/download') { posted.push(opts.body); return reply({ download_id: 'x' }); }
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const cardA = mk(1, 'a.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    const cardB = mk(2, 'b.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(cont, { missing_models: [cardA, cardB] });
+
+    // A candidate on card A's own row named exactly like card A's own file.
+    cardA.similar = { candidates: [
+      { source: 'civitai', filename: 'a.safetensors', url: 'https://civitai.com/api/download/models/1', confidence: 100, different_model: false },
+    ] };
+    await c.startSimilar(cardA, 0);
+    check('a same-name candidate on its own card starts no download', posted.length === 0, JSON.stringify(posted));
+    let htmlA = c.blockHtml(cardA);
+    check('that row offers no download button', !/data-ml-action="download-similar"/.test(htmlA), htmlA);
+    check('that row explains why', /exact name/.test(htmlA) && /Find a download/.test(htmlA), htmlA);
+
+    // A candidate on card A's row named exactly like card B's own file -
+    // the cross-card case.
+    cardA.similar = { candidates: [
+      { source: 'civitai', filename: 'b.safetensors', url: 'https://civitai.com/api/download/models/2', confidence: 80, different_model: false },
+    ] };
+    await c.startSimilar(cardA, 0);
+    check('a candidate matching ANOTHER card\'s name starts no download either', posted.length === 0, JSON.stringify(posted));
+    htmlA = c.blockHtml(cardA);
+    check('and that row is also blocked, not offered', !/data-ml-action="download-similar"/.test(htmlA), htmlA);
+    const htmlB = c.blockHtml(cardB);
+    check('card B\'s own block is unaffected by card A\'s blocked attempt', !/progress|Queued/.test(htmlB), htmlB);
+    c.stop();
+  }
+
+  // 13. A failed similar download can be retried: the error row offers a
+  // button, and starting again overwrites the stale byFile mapping (so the
+  // row reflects the new attempt, not the old failure, forever).
+  {
+    let attempt = 0;
+    const progress = {};
+    api.fetchApi = async (path, opts = {}) => {
+      const body = opts.body ? JSON.parse(opts.body) : undefined;
+      if (path === '/model_linker/download') {
+        attempt++;
+        if (attempt === 1) { progress.bad = { status: 'error', error: 'The server refused the download (500)' }; return reply({ download_id: 'bad' }); }
+        progress.good = { status: 'downloading', progress: 5, filename: body.filename, category: body.category };
+        return reply({ download_id: 'good' });
+      }
+      if (path === '/model_linker/progress') return reply(progress);
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    m.similar = { candidates: [
+      { source: 'civitai', filename: 'candidate.safetensors', url: 'https://civitai.com/api/download/models/9', confidence: 90, different_model: false },
+    ] };
+    c.afterRender(cont, { missing_models: [m] });
+
+    await c.startSimilar(m, 0);
+    await c.pollProgress();  // pulls the server's "error" status into this.records
+    let html = c.blockHtml(m);
+    check('a failed similar download shows its error', /refused the download/.test(html), html);
+    check('and offers a way to retry it', /data-ml-action="download-similar"/.test(html) && /Retry/.test(html), html);
+
+    await c.startSimilar(m, 0);  // the user clicks Retry
+    check('retrying posts a second request', attempt === 2);
+    html = c.blockHtml(m);
+    check('byFile now points at the new attempt, not the old failure',
+          c.byFile.get('loras|candidate.safetensors') === 'good');
+    check('the row reflects the retry, not the stale error', /progress/.test(html) && !/refused the download/.test(html), html);
+    c.stop();
+  }
+
+  // 14. Stale response guard: a slow search in flight when a re-analysis
+  // replaces this card's missing-model object must not clobber whatever the
+  // new object's card is showing when it finally resolves. A second call
+  // started while the first is still loading must not re-fetch either.
+  // Every created request promise is resolved at the end (not just the last
+  // one captured) so this test cannot hang even before the fix, when two
+  // separate fetches - and so two separate pending promises - are made.
+  {
+    let searchCalls = 0;
+    const resolvers = [];
+    api.fetchApi = async (path) => {
+      if (path === '/model_linker/search') {
+        searchCalls++;
+        return new Promise((resolve) => resolvers.push(() => resolve(reply({ candidates: [], errors: ['OLD-MARKER'] }))));
+      }
+      return reply({});
+    };
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const oldMissing = mk(9, 'old.safetensors', 'loras', { lookup_state: 'idle', download_source: null });
+    c.afterRender(cont, { missing_models: [oldMissing] });
+
+    const firstCall = c.searchSimilar(oldMissing);
+    const secondCall = c.searchSimilar(oldMissing);  // double click while loading
+
+    // A re-analysis lands before the slow search resolves - same card slot
+    // (node_id/widget_index 9/0), a different missing-model object.
+    const newMissing = mk(9, 'new.safetensors', 'vae', { lookup_state: 'idle', download_source: null });
+    c.afterRender(cont, { missing_models: [newMissing] });
+    c.refresh(newMissing);
+    const htmlBeforeResolve = cont.els.get(c.blockId(newMissing))?.innerHTML;
+
+    resolvers.forEach((resolve) => resolve());
+    await firstCall;
+    await secondCall;
+    check('a second click while loading does not re-fetch', searchCalls === 1, `searchCalls=${searchCalls}`);
+    const htmlAfterResolve = cont.els.get(c.blockId(newMissing))?.innerHTML;
+    check('the stale search result never overwrites the new card at the same slot',
+          !htmlAfterResolve.includes('OLD-MARKER'), htmlAfterResolve);
+    c.stop();
+  }
+
+  // 15. (M3) On reopen, a download this page itself started under a
+  // candidateKey (so no on-screen card's fileKey matches it) must still get
+  // its polling re-armed if it is still active server-side - but nothing
+  // this page did not start may be adopted.
+  {
+    const progress = { sim9: { status: 'downloading', progress: 10, filename: 'candidate.safetensors', category: 'loras', canonical_category: 'loras' } };
+    api.fetchApi = async (path) => reply(path === '/model_linker/progress' ? progress : {});
+    const c = new DownloadController(fakeDialog());
+    const cont = fakeContainer();
+    const m = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(cont, { missing_models: [m] });
+    // This page itself started the similar download earlier in the session.
+    c.track('loras|candidate.safetensors', 'sim9', { status: 'downloading', progress: 10 });
+    c.stop();  // dialog closed
+
+    // Reopened: a fresh analysis whose missing_models no longer reference
+    // the candidate at all (its .similar search result is gone).
+    const freshMissing = mk(1, 'missing.safetensors', 'loras', { lookup_state: 'not_found', download_source: null });
+    c.afterRender(fakeContainer(), { missing_models: [freshMissing] });
+    await sleep(30);
+    check('polling is re-armed for a download this page already started',
+          c.progressTimer !== null, `progressTimer=${c.progressTimer}`);
+    check('nothing new was adopted into byFile', c.byFile.size === 1, `byFile=${[...c.byFile.keys()]}`);
+    c.stop();
+  }
+
   const similar = src.slice(src.indexOf('similarHtml(missing) {'), src.indexOf('async downloadAll'));
   check('similar results are escaped', /escapeHtml\(candidate\.filename\)/.test(similar));
   check('different models are labelled', /different model/.test(similar));

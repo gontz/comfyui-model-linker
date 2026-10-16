@@ -98,6 +98,7 @@ class SearchTests(unittest.TestCase):
     def test_tokens_go_only_to_their_own_host(self):
         with mock.patch.object(settings, 'get_token', side_effect=lambda p: f'{p}-token'):
             self.search({**HF_ROUTES, **CIVITAI_ROUTE})
+        self.assertTrue(self.sent)  # the assertions below are vacuous if nothing was actually sent
         for url, headers in self.sent:
             auth = headers.get('Authorization', '')
             if url.startswith('https://huggingface.co/'):
@@ -111,3 +112,60 @@ class LocalCandidateTests(unittest.TestCase):
         with mock.patch.object(requests, 'get', side_effect=AssertionError('no network here')):
             found = online_search._index_candidates('flux1-dev-fp8-e4m3fn.safetensors')
         self.assertTrue(any(c['filename'] == 'flux1-dev-fp8.safetensors' for c in found))
+
+
+class ModelListScoringTests(unittest.TestCase):
+    """
+    M5: the ComfyUI-Manager list must be scored by the same banded matcher as
+    every other source, not pre-filtered by raw SequenceMatcher similarity
+    (the old search_model_list_multiple(), which drops anything under 40%
+    normalised similarity before the caller ever gets a chance to score it
+    the same way as a HuggingFace or CivitAI candidate).
+    """
+
+    def test_every_entry_is_handed_to_the_caller_unfiltered(self):
+        from core.sources import model_list
+        models = [
+            {'filename': 'qwen3vl_8b_bf16.safetensors', 'url': 'https://example.com/a'},
+            # Low raw string similarity to the target, but still a real file
+            # with a real URL - search_model_list_multiple's 40% floor would
+            # have dropped this before online_search's own matcher ever ran.
+            {'filename': 'zzz_completely_unrelated_name.safetensors', 'url': 'https://example.com/b'},
+            {'filename': 'no-url-entry.safetensors', 'url': ''},
+        ]
+        with mock.patch.object(model_list, '_load_model_list', return_value=models):
+            found = online_search._model_list_candidates('qwen3vl_8b_int8.safetensors')
+        names = {c['filename'] for c in found}
+        self.assertIn('qwen3vl_8b_bf16.safetensors', names)
+        self.assertIn('zzz_completely_unrelated_name.safetensors', names)
+        self.assertNotIn('no-url-entry.safetensors', names)  # no url - nothing to download
+
+
+class HuggingFaceQueryFailureTests(unittest.TestCase):
+    """M9: one failing search query must not drop every result HuggingFace found."""
+
+    def test_one_failing_query_does_not_drop_the_others(self):
+        calls = []
+
+        def flaky_get(url, params=None, headers=None, timeout=None):
+            calls.append((url, params))
+            if url.endswith('/tree/main'):
+                return FakeResponse([{'type': 'file', 'path': 'foo.safetensors', 'size': 1}])
+            search = (params or {}).get('search')
+            if search == 'foo_fp8':
+                raise requests.ConnectionError('down')
+            return FakeResponse([{'id': 'org/foo'}])
+
+        with mock.patch.object(requests, 'get', flaky_get):
+            found = online_search._huggingface_candidates('foo_fp8.safetensors')
+        self.assertTrue(any(c['filename'] == 'foo.safetensors' for c in found))
+        # Both queries were actually attempted - not short-circuited away
+        searched = [p.get('search') for _, p in calls if p and 'search' in p]
+        self.assertIn('foo_fp8', searched)
+        self.assertIn('foo', searched)
+
+    def test_no_queries_is_handled_without_a_network_call(self):
+        with mock.patch.object(requests, 'get', side_effect=AssertionError('should not be called')), \
+             mock.patch.object(online_search, 'build_search_queries', return_value=[]):
+            found = online_search._huggingface_candidates('x.safetensors')
+        self.assertEqual(found, [])

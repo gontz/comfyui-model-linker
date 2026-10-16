@@ -230,6 +230,14 @@ def calculate_filename_confidence(target_filename: str, candidate_filename: str)
         return 100.0
 
     similarity = calculate_similarity(target_norm, candidate_norm)
+    # Word order carries no meaning in a filename: `convrot_int8` and
+    # `int8_convrot` name the same thing. This only raises raw similarity,
+    # which orders candidates within a band; the family and capacity caps
+    # below still decide which band a candidate lands in.
+    similarity = max(similarity, calculate_similarity(
+        ' '.join(sorted(target_norm.split())),
+        ' '.join(sorted(candidate_norm.split())),
+    ))
 
     target_family = normalize_model_family(target_filename)
     candidate_family = normalize_model_family(candidate_filename)
@@ -251,7 +259,8 @@ def calculate_filename_confidence(target_filename: str, candidate_filename: str)
         if (conflicting_size and target_architecture == candidate_architecture) or conflicting_generation:
             return round(min(similarity, _CAPACITY_CONFLICT_SIMILARITY) * 100, 1)
 
-    if target_family == candidate_family:
+    # A reordered name is the same model, so the family comparison ignores order too
+    if sorted(target_family.split()) == sorted(candidate_family.split()):
         # Identical once precision and quantisation are set aside. Raw
         # similarity only orders candidates within this band, so the closest
         # spelling of the same model comes first.

@@ -145,5 +145,32 @@ class FindMatchesTests(unittest.TestCase):
         self.assertEqual(matches[0]['confidence'], 100.0)
 
 
+class WordOrderTests(unittest.TestCase):
+    """Token order carries no meaning in a model filename."""
+
+    def test_reordered_tokens_score_as_a_strong_match(self):
+        # The case that made upstream and Model-Resolver both add this
+        self.assertGreaterEqual(
+            calculate_filename_confidence('yue2_convrot_int8.safetensors',
+                                          'yue2_3b_int8_convrot.safetensors'),
+            90.0)
+
+    def test_pure_reorder_never_reaches_100(self):
+        score = calculate_filename_confidence('flux1_dev_fp8.safetensors', 'dev_flux1_fp8.safetensors')
+        self.assertGreaterEqual(score, 94.0)
+        self.assertLess(score, 100.0)
+
+    def test_reorder_cannot_lift_a_capacity_conflict(self):
+        # The acceptance case for every matcher change: 4B is not 8B
+        self.assertLess(
+            calculate_filename_confidence('qwen3vl_8b_int8.safetensors', 'int8_qwen3vl_4b.safetensors'),
+            STRONG_MATCH_CONFIDENCE)
+
+    def test_same_model_still_outranks_reordered_other_size(self):
+        pool = candidates('int8_qwen3vl_4b.safetensors', 'qwen3vl_8b_bf16.safetensors')
+        best = find_matches('qwen3vl_8b_int8.safetensors', pool)[0]
+        self.assertEqual(best['filename'], 'qwen3vl_8b_bf16.safetensors')
+
+
 if __name__ == '__main__':
     unittest.main()

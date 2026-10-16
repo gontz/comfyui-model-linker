@@ -13,7 +13,7 @@ import { LinkerManagerDialog } from "./modules/linker-dialog.js";
 import { notifyError } from "./modules/util.js";
 
 // Main extension class
-class ModelLinker {
+export class ModelLinker {
     constructor() {
         this.dialog = null;
         this.notified = new Set();
@@ -53,12 +53,23 @@ class ModelLinker {
         this.loadTimer = setTimeout(() => this.checkLoadedWorkflow(), 500);
     }
 
+    // app.graph.serialize() carries no id for the open tab - LiteGraph's
+    // serialized graph has no such field. ComfyUI's own workflow store does:
+    // every open tab is a ComfyWorkflow keyed by its own (disambiguated) path.
+    workflowKey() {
+        return app.extensionManager?.workflow?.activeWorkflow?.path;
+    }
+
     async checkLoadedWorkflow() {
         // The first workflow can load before setup() has created the dialog
         if (!this.dialog) this.dialog = new LinkerManagerDialog();
         if (this.dialog.isOpen()) return;
         const workflow = this.dialog.getCurrentWorkflow();
         if (!workflow?.nodes?.length) return;
+        // Read together with the workflow: if the user switches tabs while
+        // the request below is in flight, the active workflow by the time it
+        // resolves is not the one this check is about.
+        const workflowKey = this.workflowKey();
         // A slow analysis must not announce stale results once another
         // workflow has loaded in the meantime - the same kind of guard
         // loadWorkflowData uses against a superseded analysis, via a
@@ -72,15 +83,28 @@ class ModelLinker {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({ workflow }),
             });
-            if (!response.ok) return;
+            if (!response.ok) {
+                console.debug("Model Linker: background check failed", response.status);
+                return;
+            }
             data = await response.json();
         } catch (error) {
+            console.debug("Model Linker: background check failed", error);
             return;  // a background courtesy; the dialog reports real errors
         }
         if (generation !== this.loadGeneration) return;
+        this.announce(workflowKey, data);
+    }
+
+    /** Toast or open the dialog for one analysis result, once per workflow+missing-set. */
+    announce(workflowKey, data) {
         const count = data.total_missing || 0;
         if (!count) return;
-        const signature = `${workflow.id || ""}:${(data.missing_models || []).map(m => m.original_path).sort().join("|")}`;
+        const missingKey = (data.missing_models || []).map(m => m.original_path).sort().join("|");
+        // Falls back to the missing-set alone when no workflow identity is
+        // available (e.g. an older frontend with no workflow store), rather
+        // than silently colliding every workflow under the same blank key.
+        const signature = workflowKey ? `${workflowKey}:${missingKey}` : missingKey;
         if (this.notified.has(signature)) return;
         this.notified.add(signature);
 

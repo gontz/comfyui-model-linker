@@ -18,6 +18,9 @@ def _bad(web, message):
 
 
 def register(routes, web) -> None:
+    from . import lm_sidecar
+    downloader.add_completion_hook(lm_sidecar.on_download_complete)
+
     @routes.post("/model_linker/lookups")
     async def lookup_results(request):
         try:
